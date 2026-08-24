@@ -108,7 +108,10 @@ export async function processTelegramWebhook(
       return { kind: "ignored" };
     }
 
-    let lead = await dependencies.repository.findLeadByTelegramChatId(incomingMessage.chat.id);
+    // `New address` is an explicit backend-owned reset boundary. It must not
+    // depend on reading or mapping the prior lead: a damaged historical row
+    // must not prevent a customer from starting a fresh enquiry.
+    let lead: StoredLead | null;
     if (update.message?.text?.trim() === newAddressButtonText) {
       const config = await dependencies.repository.getCurrentAgentConfig();
       lead = await dependencies.repository.startNewAddressLead({
@@ -131,6 +134,8 @@ export async function processTelegramWebhook(
       await dependencies.repository.markTelegramUpdateProcessed(update.update_id);
       return { kind: "processed" };
     }
+
+    lead = await dependencies.repository.findLeadByTelegramChatId(incomingMessage.chat.id);
 
     if (update.callback_query) {
       const callbackAcknowledged = await acknowledgeCallback(dependencies.telegram, update.callback_query.id);
@@ -374,7 +379,7 @@ export async function processTelegramWebhook(
         if (name === "update_client_data") {
           const updateData = updateClientDataSchema.safeParse(argumentsJson);
           if (!updateData.success) return { ok: false, error: "invalid_client_data_patch" };
-          const patch = clientDataPatchSchema.safeParse(dropNullValues(updateData.data.patch));
+          const patch = clientDataPatchSchema.safeParse(normalizeCustomerDatePatch(updateData.data.patch, now));
           if (!patch.success) return { ok: false, error: "invalid_client_data_patch" };
           const nextClientData = mergeClientData(lead.clientData, patch.data, now);
           if (pricingInputsChanged(lead.clientData, nextClientData)) supersedeQuote(lead, now);
@@ -498,10 +503,25 @@ export async function processTelegramWebhook(
     // changes without turning ordinary text into a Trello dependency.
     if (lead.status === "qualified") {
       await enqueueQualifiedTrelloProjection(lead, replyLanguage, now, dependencies);
+    } else if (lead.status === "new_lead" && lead.humanNeeded) {
+      // A first-turn escalation still needs an operational home. It cannot
+      // enter the qualified outbox because that worker lifecycle would move
+      // the card into the wrong Trello list. Keep this best-effort so a
+      // Trello outage cannot rewrite a successfully delivered customer turn.
+      await syncNewLeadHumanNeededProjection(lead, dependencies);
     }
     await dependencies.repository.markTelegramUpdateProcessed(update.update_id);
     return { kind: "processed" };
-  } catch {
+  } catch (error) {
+    // The response must remain safe for Telegram, but production diagnostics
+    // need a non-sensitive reason to distinguish a provider/configuration
+    // failure from a delivery retry. Never log message text, customer data,
+    // headers or credentials here.
+    console.error("Telegram webhook processing failed", {
+      updateId: update.update_id,
+      updateKind: update.callback_query ? "callback" : "message",
+      error: error instanceof Error ? error.message : "unknown_error",
+    });
     await dependencies.repository.markTelegramUpdateFailed(update.update_id, "processing_error");
     return { kind: "failed", failureCode: "processing_error" };
   } finally {
@@ -538,6 +558,8 @@ export function resolveRelativePreferredDate(message: string, now: Date): string
     if (isValidIsoDate(value) && value >= belgradeDate(now)) return value;
     return undefined;
   }
+  const russianNamedDate = resolveRussianNamedDate(normalized, now);
+  if (russianNamedDate) return russianNamedDate;
   const aliases: Array<[RegExp, number]> = [
     [/(?:^|\s)сегодня(?:$|\s|[,.!])/u, 0], [/(?:^|\s)завтра(?:$|\s|[,.!])/u, 1], [/(?:^|\s)послезавтра(?:$|\s|[,.!])/u, 2],
     [/(?:^|\s)today(?:$|\s|[,.!])/u, 0], [/(?:^|\s)tomorrow(?:$|\s|[,.!])/u, 1], [/(?:^|\s)the day after tomorrow(?:$|\s|[,.!])/u, 2],
@@ -553,6 +575,51 @@ export function resolveRelativePreferredDate(message: string, now: Date): string
   const part = (type: string) => Number(parts.find((item) => item.type === type)?.value);
   const base = new Date(Date.UTC(part("year"), part("month") - 1, part("day") + days));
   return base.toISOString().slice(0, 10);
+}
+
+/**
+ * Resolves a customer-facing Russian date such as "26 августа" without
+ * making a customer type an artificial year. An omitted year means the next
+ * occurrence of that calendar date in Belgrade; an explicit past year is not
+ * silently rewritten.
+ */
+function resolveRussianNamedDate(normalized: string, now: Date): string | undefined {
+  const months: Record<string, number> = {
+    января: 1, январь: 1, янв: 1,
+    февраля: 2, февраль: 2, фев: 2,
+    марта: 3, март: 3, мар: 3,
+    апреля: 4, апрель: 4, апр: 4,
+    мая: 5, май: 5,
+    июня: 6, июнь: 6, июн: 6,
+    июля: 7, июль: 7, июл: 7,
+    августа: 8, август: 8, авг: 8,
+    сентября: 9, сентябрь: 9, сент: 9, сен: 9,
+    октября: 10, октябрь: 10, окт: 10,
+    ноября: 11, ноябрь: 11, ноя: 11,
+    декабря: 12, декабрь: 12, дек: 12,
+  };
+  const monthTokens = Object.keys(months).join("|");
+  const match = normalized.match(new RegExp(`(?:^|[^\\p{L}\\d])(\\d{1,2})\\s+(${monthTokens})(?:\\s+(\\d{4})(?:\\s*г(?:ода)?\\.?)?)?(?=$|[^\\p{L}\\d])`, "u"));
+  if (!match) return undefined;
+
+  const [, dayText, monthText, explicitYear] = match;
+  const month = months[monthText];
+  if (!month) return undefined;
+  const today = belgradeDate(now);
+  const currentYear = Number(today.slice(0, 4));
+  let year = explicitYear ? Number(explicitYear) : currentYear;
+  let value = toIsoDate(year, month, Number(dayText));
+  if (!value) return undefined;
+  if (!explicitYear && value < today) {
+    year += 1;
+    value = toIsoDate(year, month, Number(dayText));
+  }
+  return value && value >= today ? value : undefined;
+}
+
+function toIsoDate(year: number, month: number, day: number): string | undefined {
+  const value = `${year.toString().padStart(4, "0")}-${month.toString().padStart(2, "0")}-${day.toString().padStart(2, "0")}`;
+  return isValidIsoDate(value) ? value : undefined;
 }
 
 function relativeDayCount(value: string): number | undefined {
@@ -636,7 +703,7 @@ function isStrictAvailabilityRequest(message: string): boolean {
   if (!text || /\d|\bm\s*²?\b|комнат|сануз|квадрат|kupatil|soba|bathroom|rooms?/iu.test(text)) return false;
   return [
     /^(?:please )?(?:show|see|check|find|what are|any|available|free|nearest)(?: me)? (?:the )?(?:available |free |nearest )?(?:slots?|times?|availability)$/iu,
-    /^(?:покажи|покажите|провер[ья]й|какие|есть|свободные|ближайшие)(?: мне)? (?:свободные |ближайшие )?(?:слоты|время|термины)$/iu,
+    /^(?:покажи|покажите|провер[ья]й|какие|есть|свободн(?:ое|ые)|ближайш(?:ее|ие))(?: мне)? (?:свободн(?:ое|ые) |ближайш(?:ее|ие) )?(?:слоты|время|термины)$/iu,
     /^(?:pokaži|pokazite|proveri|koji su|ima li|slobodn(?:i|e)|najbliži) (?:mi )?(?:slobodn(?:i|e) |najbliži )?(?:termin(?:i|e|a)?|slotovi|vreme)$/iu,
     /^(?:покажи|покажите|провери|који су|има ли|слободн(?:и|е)|најближи) (?:ми )?(?:слободн(?:и|е) |најближи )?(?:термин(?:и|е|а)?|слотови|време)$/iu,
   ].some((pattern) => pattern.test(text));
@@ -777,6 +844,19 @@ async function enqueueQualifiedTrelloProjection(
     replyLanguage,
     now: now.toISOString(),
   });
+}
+
+async function syncNewLeadHumanNeededProjection(
+  lead: StoredLead,
+  dependencies: Stage2Dependencies,
+): Promise<void> {
+  if (!dependencies.trelloSync) return;
+  try {
+    await dependencies.trelloSync.syncLead(lead, "new_lead");
+  } catch {
+    // The customer has already received the escalation reply. Do not turn a
+    // best-effort Trello projection failure into a failed Telegram update.
+  }
 }
 
 async function markReservationDeliveryFailure(
@@ -992,4 +1072,20 @@ function supersedeQuote(lead: StoredLead, now: Date = new Date()): void {
 
 function dropNullValues(value: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(value).filter(([, field]) => field !== null));
+}
+
+/**
+ * The agent receives natural customer text, so it may echo a human date such
+ * as "26 августа" in its strict tool payload. Keep the already-normalised
+ * backend date and the rest of the valid patch instead of rejecting every
+ * supplied detail because of that single presentation-format value.
+ */
+function normalizeCustomerDatePatch(patch: Record<string, unknown>, now: Date): Record<string, unknown> {
+  const normalized = dropNullValues(patch);
+  if (typeof normalized.preferredDate === "string" && !isValidIsoDate(normalized.preferredDate)) {
+    const resolved = resolveRelativePreferredDate(normalized.preferredDate, now);
+    if (resolved) normalized.preferredDate = resolved;
+    else delete normalized.preferredDate;
+  }
+  return normalized;
 }

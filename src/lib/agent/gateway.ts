@@ -108,7 +108,7 @@ export class OpenAiAgentsGateway implements AgentGateway {
     const agent = new Agent({
       name: "Sherlock Cleaning Agent",
       model: this.model,
-      instructions: `${input.systemPrompt}\n\n${languageInstruction}\n\nThe backend derives urgency deterministically from the requested cleaning date in Europe/Belgrade. Do not ask the customer to choose standard versus same-day urgency, and do not send an urgency field in update_client_data.\n\nIf a tool result has error \"tool_step_limit_reached\", do not provide a quote or take further action. Briefly tell the customer that a human will continue the request.`,
+      instructions: `${input.systemPrompt}\n\n${languageInstruction}\n\n${intakeInstruction}\n\n${dateIntakeInstruction}\n\nThe backend derives urgency deterministically from the requested cleaning date in Europe/Belgrade. Do not ask the customer to choose standard versus same-day urgency, and do not send an urgency field in update_client_data.\n\nIf a tool result has error \"tool_step_limit_reached\", do not provide a quote or take further action. Briefly tell the customer that a human will continue the request.`,
       tools: [
         tool({
           name: "update_client_data",
@@ -446,6 +446,10 @@ const replyLanguageInstructions: Record<ReplyLanguage, string> = {
   "sr-Latn": "Reply only in Serbian using the Latin script for this customer turn. Sound like a helpful local coordinator: use one or two short natural sentences, no em or en dashes, no headings, labels, raw Markdown, technical terms, or generic AI filler.",
   "sr-Cyrl": "Reply only in Serbian using the Cyrillic script for this customer turn. Sound like a helpful local coordinator: use one or two short natural sentences, no em or en dashes, no headings, labels, raw Markdown, technical terms, or generic AI filler.",
 };
+
+const intakeInstruction = "Process facts in every customer message regardless of its script. A Cyrillic message may include Latin measurement notation such as m2 or m², a local district such as Vračar, or an ISO date; that does not make it English. Before replying or escalating, call update_client_data with every stated supported fact: cleaning type, area, rooms, bathrooms, pet hair, extras, address or district, and requested date. Use null only for a field that the customer did not state. For renovation, commercial or other human-review work, save the stated facts first, then call mark_human_needed. Never respond that details are missing when the current message already states them.";
+
+const dateIntakeInstruction = "Treat customer-friendly date language as valid: a Russian date without a year such as \"26 августа\", relative phrases such as \"через 2 дня\", and a weekend request. Do not demand DD.MM.YYYY or another rigid format. Use YYYY-MM-DD only when you save a date in update_client_data; the backend may already have normalised the customer date. If a date phrase is genuinely ambiguous, propose one concrete local date and ask whether it works. Never ask about an internal urgency field.";
 
 function serbianText(language: string, latin: string, cyrillic: string): string {
   return isSerbianCyrillic(language) ? cyrillic : latin;

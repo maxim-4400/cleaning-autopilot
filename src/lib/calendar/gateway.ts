@@ -110,8 +110,13 @@ export class ComposioCalendarGateway implements CalendarGateway {
         arguments: {
           calendar_id: calendarId,
           summary: "Cleaning reservation",
-          start_datetime: input.start,
-          end_datetime: input.end,
+          // GOOGLECALENDAR_CREATE_EVENT receives a separate IANA timezone.
+          // It interprets the datetime fields as wall-clock values in that
+          // timezone, so forwarding the UTC storage representation (for
+          // example, 06:00Z for an 08:00 Belgrade slot) shifts the event two
+          // hours earlier in the team calendar.
+          start_datetime: belgradeWallClock(input.start),
+          end_datetime: belgradeWallClock(input.end),
           timezone: "Europe/Belgrade",
           visibility: "private",
           transparency: "opaque",
@@ -129,6 +134,29 @@ export class ComposioCalendarGateway implements CalendarGateway {
       return { kind: "failed", code: "calendar_create_transport_failed", ambiguous: true };
     }
   }
+}
+
+/**
+ * Scheduling and persistence use UTC instants. The pinned Composio create
+ * action instead pairs local wall-clock datetimes with its `timezone` input.
+ * Keep that boundary explicit and DST-safe rather than stripping the `Z`.
+ */
+function belgradeWallClock(value: string): string {
+  const instant = new Date(value);
+  if (Number.isNaN(instant.getTime())) throw new Error("Calendar event time must be a valid ISO instant");
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Belgrade",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(instant)
+    .filter((part) => part.type !== "literal")
+    .map((part) => [part.type, part.value]));
+  return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}`;
 }
 
 export function parseComposioBusyIntervals(result: unknown, calendarId: string): BusyInterval[] {

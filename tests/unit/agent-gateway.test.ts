@@ -97,6 +97,10 @@ describe("OpenAiAgentsGateway", () => {
     expect(firstRequest.instructions).toContain("Test prompt");
     expect(firstRequest.instructions).toContain("Reply only in English for this customer turn.");
     expect(firstRequest.instructions).toContain("backend derives urgency deterministically");
+    expect(firstRequest.instructions).toContain("A Cyrillic message may include Latin measurement notation such as m2 or m²");
+    expect(firstRequest.instructions).toContain("save the stated facts first, then call mark_human_needed");
+    expect(firstRequest.instructions).toContain("a Russian date without a year such as \"26 августа\"");
+    expect(firstRequest.instructions).toContain("Do not demand DD.MM.YYYY or another rigid format");
     expect(firstRequest.instructions).toContain("Do not ask the customer to choose standard versus same-day urgency");
     expect(firstRequest.instructions).not.toContain("Clean my flat");
     expect(firstRequest.tools[0].parameters.required).toEqual(["patch"]);

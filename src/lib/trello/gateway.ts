@@ -19,6 +19,23 @@ export type TrelloCard = {
 
 export type TrelloCardInput = Omit<TrelloCard, "id">;
 
+/**
+ * The deliberately small DTO used by the read-only Demo Console projection.
+ * It intentionally omits provider descriptions, labels and identifiers: the
+ * dashboard is a presentation surface, not another CRM or contact store.
+ */
+export type TrelloBoardProjectionCard = {
+  title: string;
+  lifecycle: TrelloLifecycle;
+  humanNeeded: boolean;
+  directUrl?: string;
+};
+
+/** Read-only board discovery kept separate from the lifecycle write gateway. */
+export interface TrelloBoardReader {
+  listBoardCards(): Promise<TrelloBoardProjectionCard[]>;
+}
+
 export type TrelloReferenceLookup =
   | { kind: "none" }
   | { kind: "one"; card: TrelloCard }
@@ -132,7 +149,7 @@ const cardSchema = z.object({
  * the verified Trello tools/arguments. Provider fields are parsed into a
  * small internal DTO before the rest of the application sees them.
  */
-export class ComposioTrelloGateway implements TrelloGateway {
+export class ComposioTrelloGateway implements TrelloGateway, TrelloBoardReader {
   private readonly executor: ComposioToolExecutor;
   private readonly now: () => number;
   private readonly topologyCacheTtlMs: number;
@@ -176,6 +193,19 @@ export class ComposioTrelloGateway implements TrelloGateway {
   async getCardById(cardId: string): Promise<TrelloCard | null> {
     const topology = await this.topology();
     return this.readCardById(cardId, topology);
+  }
+
+  /**
+   * Reads every card in the canonical five-list board. Unlike the operational
+   * lookup, cards created or moved manually are intentionally retained even
+   * when they do not carry an application business-reference marker.
+   */
+  async listBoardCards(): Promise<TrelloBoardProjectionCard[]> {
+    const topology = await this.topology();
+    const result = await this.execute("TRELLO_GET_BOARDS_CARDS_BY_ID_BOARD", { idBoard: this.environment.boardId });
+    return parseCards(result)
+      .map((card) => this.toProjectionCard(card, topology))
+      .filter((card): card is TrelloBoardProjectionCard => card !== undefined);
   }
 
   async createCard(input: TrelloCardInput): Promise<TrelloWriteResult> {
@@ -308,6 +338,20 @@ export class ComposioTrelloGateway implements TrelloGateway {
       businessReference,
       title: source.name,
       description: source.desc,
+      lifecycle,
+      humanNeeded: source.labelIds.includes(this.environment.humanNeededLabelId),
+      directUrl: canonicalTrelloCardUrl(source.shortUrl) ?? canonicalTrelloCardUrl(source.url),
+    };
+  }
+
+  private toProjectionCard(source: TrelloProviderCard, topology: TrelloTopology): TrelloBoardProjectionCard | undefined {
+    const lifecycle = topology.lifecycleByListId.get(source.idList);
+    if (!lifecycle) return undefined;
+    // Keep arbitrary user-authored Trello titles readable and bounded before
+    // serializing them into the authenticated dashboard response.
+    const title = source.name.replace(/\s+/gu, " ").trim().slice(0, 120) || "Untitled Trello card";
+    return {
+      title,
       lifecycle,
       humanNeeded: source.labelIds.includes(this.environment.humanNeededLabelId),
       directUrl: canonicalTrelloCardUrl(source.shortUrl) ?? canonicalTrelloCardUrl(source.url),

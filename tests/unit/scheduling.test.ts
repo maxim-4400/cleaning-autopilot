@@ -67,6 +67,32 @@ describe("Composio Calendar response contract", () => {
     expect(calls.flatMap((call) => Object.values(call.arguments))).not.toContain("primary");
   });
 
+  it("sends the agreed Europe/Belgrade wall-clock slot to the Calendar create action", async () => {
+    const gateway = new ComposioCalendarGateway({ apiKey: "x", userId: "user", connectedAccountId: "account", toolkitVersion: "202608_01", teamACalendarId: "team-a@group.calendar.google.com", teamBCalendarId: "team-b@group.calendar.google.com" });
+    const calls: Array<{ arguments: Record<string, unknown> }> = [];
+    (gateway as unknown as { composio: { tools: { execute: (_tool: string, input: { arguments: Record<string, unknown> }) => Promise<unknown> } } }).composio = {
+      tools: { execute: async (_tool, input) => { calls.push({ arguments: input.arguments }); return { successful: true, data: { response_data: { id: "event" } } }; } },
+    };
+
+    // 08:00 CEST is stored as 06:00Z. The create tool must receive 08:00
+    // alongside the explicit Europe/Belgrade timezone, not the UTC value.
+    await gateway.createEvent({ team: "team_b", start: "2026-08-26T06:00:00.000Z", end: "2026-08-26T09:00:00.000Z", leadId: "lead", idempotencyKey: "key" });
+    expect(calls[0]?.arguments).toMatchObject({
+      calendar_id: "team-b@group.calendar.google.com",
+      start_datetime: "2026-08-26T08:00:00",
+      end_datetime: "2026-08-26T11:00:00",
+      timezone: "Europe/Belgrade",
+    });
+
+    // Winter uses CET rather than CEST; conversion must remain correct across DST.
+    await gateway.createEvent({ team: "team_a", start: "2026-01-14T07:00:00.000Z", end: "2026-01-14T10:00:00.000Z", leadId: "winter", idempotencyKey: "winter-key" });
+    expect(calls[1]?.arguments).toMatchObject({
+      start_datetime: "2026-01-14T08:00:00",
+      end_datetime: "2026-01-14T11:00:00",
+      timezone: "Europe/Belgrade",
+    });
+  });
+
   it("fails closed before Calendar transport when a team mapping is invalid", async () => {
     const gateway = new ComposioCalendarGateway({ apiKey: "x", userId: "user", connectedAccountId: "account", toolkitVersion: "202608_01", teamACalendarId: "primary", teamBCalendarId: "team-b@group.calendar.google.com" });
     await expect(gateway.createEvent({ team: "team_a", start: "2026-08-24T08:00:00.000Z", end: "2026-08-24T09:00:00.000Z", leadId: "lead", idempotencyKey: "key" }))
@@ -136,6 +162,20 @@ describe("CalendarReservationService", () => {
     expect(calendar.creates).toHaveLength(1);
     expect(calendar.creates[0]).toMatchObject({ end: offered.slots[0].bufferEnd });
     expect(lead.bookedEnd).toBe(offered.slots[0].end);
+  });
+
+  it("keeps a durable Calendar reservation successful when the optional Trello acceleration fails", async () => {
+    const repository = new InMemoryLeadRepository();
+    const calendar = new FakeCalendarGateway();
+    const service = new CalendarReservationService(repository, calendar, engine, () => now);
+    const lead = await qualifiedLead(repository, 501);
+    const offered = await service.offerSlots(lead, "en");
+    if (!offered.ok) throw new Error(offered.error);
+    repository.accelerateTrelloSyncJob = async () => { throw new Error("simulated acceleration RPC failure"); };
+
+    await expect(service.reserveSlot(lead, offered.slots[0]!.token)).resolves.toMatchObject({ ok: true, eventId: "fake-calendar-event-1" });
+    expect(lead.calendarEventId).toBe("fake-calendar-event-1");
+    expect(repository.trelloSyncJobs.get(lead.id)).toMatchObject({ desiredLifecycle: "booked", state: "pending" });
   });
 
   it("invalidates an earlier offer when a requested time window changes", async () => {

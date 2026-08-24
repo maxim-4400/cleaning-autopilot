@@ -2,7 +2,11 @@ import "server-only";
 
 import type { TrelloReconcileCounts } from "@/lib/trello/recovery-service";
 
-const runnerIntervalMilliseconds = 60_000;
+// This is a presentation-facing completion path: after a durable Calendar
+// reservation the customer should normally see the Trello-backed confirmation
+// within seconds, not minutes.  Lease-fenced DB claims still make duplicate
+// process ticks harmless, and retry cadence remains owned by the service.
+const runnerIntervalMilliseconds = 5_000;
 const recoveryBatchSize = 25;
 const runnerStateKey = Symbol.for("cleaning-autopilot.trello-recovery-runner");
 

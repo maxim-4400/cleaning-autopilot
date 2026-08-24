@@ -231,7 +231,14 @@ describe("TrelloRecoveryService", () => {
     if (!offer.ok || !offer.slots[0]) throw new Error("expected fake slot");
     await reservation.reserveSlot(lead, offer.slots[0].token, "en");
     expect(calendar.creates).toHaveLength(1);
-    expect(repository.trelloSyncJobs.get(lead.id)).toMatchObject({ desiredLifecycle: "booked", state: "pending" });
+    expect(repository.trelloSyncJobs.get(lead.id)).toMatchObject({
+      desiredLifecycle: "booked",
+      state: "pending",
+      // The same durable job is now due immediately.  A five-second runner
+      // tick can claim it without another Telegram interaction or Calendar
+      // write.
+      nextAttemptAt: now.toISOString(),
+    });
     // Model a process crash before finalizeReservationBooking: only recovery runs.
     await expect(recovery.reconcileDueJobs(1)).resolves.toMatchObject({ completed: 1 });
     expect(calendar.creates).toHaveLength(1);

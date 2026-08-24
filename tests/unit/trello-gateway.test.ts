@@ -195,6 +195,22 @@ describe("ComposioTrelloGateway", () => {
       .resolves.toEqual({ kind: "duplicate", cardIds: ["marker-card", "marker-card-2"] });
   });
 
+  it("reads a privacy-minimized board projection including manually created Done and Lost cards", async () => {
+    const manualDone = { ...card, id: "manual-done", idList: "list-done", name: "Manual completed cleaning", desc: "Customer-facing notes must not leak", labels: [] };
+    const manualLost = { ...card, id: "manual-lost", idList: "list-lost", name: "Manual lost enquiry", desc: "No application marker", labels: [] };
+    const mock = new MockComposio(normalHandlers({
+      TRELLO_GET_BOARDS_CARDS_BY_ID_BOARD: envelope({ cards: [card, manualDone, manualLost] }),
+    }));
+    const projection = await gateway(mock).listBoardCards();
+    expect(projection).toEqual([
+      { title: card.name, lifecycle: "qualified", humanNeeded: true },
+      { title: "Manual completed cleaning", lifecycle: "done", humanNeeded: false },
+      { title: "Manual lost enquiry", lifecycle: "lost", humanNeeded: false },
+    ]);
+    expect(JSON.stringify(projection)).not.toContain("Customer-facing notes");
+    expect(JSON.stringify(projection)).not.toContain("Business reference");
+  });
+
   it("maps create, update and independent label changes to the verified Trello tool arguments", async () => {
     let directHumanNeeded = true;
     const mock = new MockComposio(normalHandlers({
