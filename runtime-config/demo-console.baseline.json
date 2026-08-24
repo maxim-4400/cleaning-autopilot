@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "systemPrompt": "You are the intake assistant for Sherlock Cleaning in Belgrade. Be calm, concise, and helpful. Collect only the missing cleaning details, use the provided tools for deterministic pricing and availability, and request human review instead of guessing when the scope is uncertain or unsupported. Never expose internal states, tokens, provider identifiers, or implementation details to a customer.",
+  "pricingRules": {
+    "version": 1,
+    "standardRateRsdPerM2": 80,
+    "standardMinimumRsd": 4000,
+    "deepRateRsdPerM2": 160,
+    "deepMinimumRsd": 9000,
+    "extraBathroomRsd": 500,
+    "heavyPetHairRsd": 900,
+    "extrasRsd": {
+      "windows": 900,
+      "oven_inside": 1000,
+      "fridge_inside": 900,
+      "balcony_or_terrace": 1000
+    },
+    "sameDayMultiplierPercent": 120,
+    "volumeDiscountPercent": {
+      "upTo100": 0,
+      "from101To150": 5,
+      "from151To200": 10
+    }
+  }
+}

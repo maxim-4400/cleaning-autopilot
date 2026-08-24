@@ -1,0 +1,49 @@
+{
+  "name": "cleaning-autopilot",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@11.19.0",
+  "engines": {
+    "node": ">=26 <27",
+    "pnpm": ">=11 <12"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "node scripts/clean-standalone-assets.mjs && next build --webpack && node scripts/prepare-standalone.mjs",
+    "start": "node .next/standalone/server.js",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.tests.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "verify:instrumentation-build": "node scripts/verify-instrumentation-build.mjs",
+    "check": "eslint . && npm run typecheck && vitest run && npm run build && npm run verify:instrumentation-build",
+    "supabase": "supabase"
+  },
+  "dependencies": {
+    "@composio/core": "0.17.0",
+    "@openai/agents": "0.17.0",
+    "@supabase/supabase-js": "2.112.3",
+    "next": "16.3.1",
+    "openai": "7.5.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "server-only": "0.0.1",
+    "simple-icons": "16.21.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1",
+    "@tailwindcss/postcss": "4.3.3",
+    "@types/node": "26.2.0",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "eslint": "9.39.1",
+    "eslint-config-next": "16.3.1",
+    "postcss": "8.5.26",
+    "supabase": "2.115.0",
+    "tailwindcss": "4.3.3",
+    "typescript": "5.9.3",
+    "vitest": "4.1.11"
+  }
+}
