@@ -23,6 +23,10 @@ describe("resolveReplyLanguage", () => {
     expect(resolveReplyLanguage("こんにちは")).toBe("en");
   });
 
+  it("keeps a dominant Russian message Russian when local intake notation is Latin", () => {
+    expect(resolveReplyLanguage("Нужна стандартная уборка после ремонта: 55 m², 2 комнаты, 1 санузел, район Vračar")).toBe("ru");
+  });
+
   it("requires at least two non-strong domain signals", () => {
     expect(resolveReplyLanguage("stan")).toBe("en");
     expect(resolveReplyLanguage("стан")).toBe("en");

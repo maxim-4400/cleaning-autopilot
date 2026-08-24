@@ -38,10 +38,83 @@ describe("Telegram webhook", () => {
     const now = new Date("2026-08-24T21:30:00.000Z"); // 23:30 Belgrade, still 24 Aug
     expect(resolveRelativePreferredDate("через 2 дня", now)).toBe("2026-08-26");
     expect(resolveRelativePreferredDate("26.08.26", now)).toBe("2026-08-26");
+    expect(resolveRelativePreferredDate("26 августа", now)).toBe("2026-08-26");
+    expect(resolveRelativePreferredDate("26 августа 2026 года", now)).toBe("2026-08-26");
+    expect(resolveRelativePreferredDate("2 января", now)).toBe("2027-01-02");
     const deps = dependencies();
     await processTelegramWebhook(update(0, "26.08.26"), deps);
     await processTelegramWebhook(update(1, "in two days"), deps);
     expect(deps.repository.getLead(1001)?.clientData.preferredDate).toBe("2026-08-26");
+  });
+
+  it("keeps a natural Russian date after New address, quotes the completed request, then offers slots", async () => {
+    const now = new Date("2026-08-24T10:00:00.000Z");
+    const repository = new InMemoryLeadRepository();
+    const telegram = new FakeTelegramGateway();
+    const calendar = new FakeCalendarGateway();
+    const calendarReservation = new CalendarReservationService(repository, calendar, undefined, () => now);
+    const agent: AgentGateway = {
+      async createConversation() { return { id: "named-russian-date" }; },
+      async runTurn(input) {
+        expect(input.replyLanguage).toBe("ru");
+        // The date was supplied only as natural Russian customer text, so the
+        // backend must resolve it before a model has a chance to omit it.
+        expect(input.knownClientData.preferredDate).toBe("2026-08-26");
+        const saved = await input.executeTool("update_client_data", { patch: {
+          cleaningType: "standard", areaM2: 75, rooms: 3, bathrooms: 2,
+          heavyPetHair: false, extras: [], addressOrDistrict: "Врачар",
+          // Exercise the defensive path for a model that echoes the natural
+          // form rather than the documented ISO storage value.
+          preferredDate: "26 августа",
+        } });
+        expect(saved).toMatchObject({ ok: true, client_data: { preferredDate: "2026-08-26" } });
+        const quote = await input.executeTool("calculate_quote", {});
+        return { reply: "Готово.", toolResults: [], steps: quote.ok === true ? 2 : 1 };
+      },
+    };
+    const deps = { repository, telegram, calendar, agent, calendarReservation, now: () => now };
+
+    await processTelegramWebhook(update(4, "New address"), deps);
+    await expect(processTelegramWebhook(
+      update(5, "Нужна стандартная уборка, 75 m², 3 комнаты, 2 санузла, без сильной шерсти, без дополнительных услуг, район Врачар, 26 августа"),
+      deps,
+    )).resolves.toEqual({ kind: "processed" });
+
+    expect(repository.getLead(1001)).toMatchObject({
+      status: "qualified",
+      firstMessageLanguage: "ru",
+      clientData: {
+        cleaningType: "standard", areaM2: 75, rooms: 3, bathrooms: 2,
+        heavyPetHair: false, extras: [], addressOrDistrict: "Врачар",
+        preferredDate: "2026-08-26", urgency: "standard",
+      },
+    });
+    expect(telegram.messages.at(-1)?.text).toContain("Уборка будет стоить");
+
+    await expect(processTelegramWebhook(update(6, "покажи свободное время"), deps)).resolves.toEqual({ kind: "processed" });
+    expect(calendar.availabilityQueries).toHaveLength(2);
+    expect(telegram.messages.at(-1)?.text).toContain("Ближайшее свободное время");
+  });
+
+  it("starts a new address without reading a malformed prior active lead", async () => {
+    const deps = dependencies();
+    const repository = new Proxy(deps.repository, {
+      get(target, property, receiver) {
+        if (property === "findLeadByTelegramChatId") {
+          return async () => { throw new Error("simulated historical lead mapping failure"); };
+        }
+        const value = Reflect.get(target, property, receiver);
+        // Keep the boundary operation on its real repository instance. Its
+        // own internal bookkeeping is unrelated to the read that the
+        // webhook must deliberately bypass.
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+
+    await expect(processTelegramWebhook(update(7, "New address"), { ...deps, repository })).resolves.toEqual({ kind: "processed" });
+
+    expect(deps.telegram.messages.at(-1)?.text).toContain("New cleaning location");
+    expect(deps.repository.updates.get(7)).toMatchObject({ status: "processed" });
   });
 
   it("keeps a weekend date as an expiring Russian proposal until a confirmation arrives", async () => {
@@ -440,7 +513,7 @@ describe("Telegram webhook", () => {
 
     expect(deps.repository.getLead(1001)).toMatchObject({ humanNeeded: true, humanNeededReason: "after_renovation" });
     expect(deps.repository.getLead(1001)?.quote).toBeUndefined();
-    expect(deps.telegram.messages[0]?.text).toContain("pass the details to our team");
+    expect(deps.telegram.messages[0]?.text).toContain("передам заявку нашей команде");
   });
 
   it("keeps Qualified and records a superseded quote when a later request needs a human", async () => {
@@ -1305,6 +1378,40 @@ describe("Telegram webhook", () => {
     expect(telegram.messages.at(-1)?.text).toBe("New cleaning location");
   });
 
+  it("starts a Russian post-renovation request after New address in Russian and preserves its supplied facts", async () => {
+    const repository = new InMemoryLeadRepository();
+    const telegram = new FakeTelegramGateway();
+    const agent: AgentGateway = {
+      async createConversation() { return { id: "russian-post-renovation" }; },
+      async runTurn(input) {
+        expect(input.replyLanguage).toBe("ru");
+        await input.executeTool("update_client_data", { patch: {
+          cleaningType: "standard", areaM2: 55, rooms: 2, bathrooms: 1,
+          heavyPetHair: false, extras: [], addressOrDistrict: "Vračar", preferredDate: "2026-08-26",
+        } });
+        await input.executeTool("mark_human_needed", { reason: "after_renovation" });
+        return { reply: "Спасибо, я передам детали команде.", toolResults: [], steps: 2 };
+      },
+    };
+
+    await processTelegramWebhook(update(97, "New address"), { repository, telegram, agent });
+    await expect(processTelegramWebhook(
+      update(98, "Нужна стандартная уборка после ремонта: 55 m², 2 комнаты, 1 санузел, без шерсти, без дополнительных услуг, район Vračar, 26.08.2026"),
+      { repository, telegram, agent },
+    )).resolves.toEqual({ kind: "processed" });
+
+    expect(repository.getLead(1001)).toMatchObject({
+      firstMessageLanguage: "ru",
+      humanNeeded: true,
+      humanNeededReason: "after_renovation",
+      clientData: {
+        cleaningType: "standard", areaM2: 55, rooms: 2, bathrooms: 1,
+        heavyPetHair: false, extras: [], addressOrDistrict: "Vračar", preferredDate: "2026-08-26",
+      },
+    });
+    expect(telegram.messages.at(-1)?.text).toContain("передам заявку нашей команде");
+  });
+
   it("does not synchronously mutate Trello for an ordinary text turn", async () => {
     const repository = new InMemoryLeadRepository();
     const telegram = new FakeTelegramGateway();
@@ -1357,15 +1464,34 @@ describe("Telegram webhook", () => {
     expect(telegram.messages.filter((message) => message.text.includes("cleaning is confirmed"))).toHaveLength(1);
   });
 
-  it("does not create a direct Trello card for an unqualified Human Needed lead", async () => {
+  it("creates and labels a New Lead Trello card for an unqualified Human Needed lead", async () => {
     const repository = new InMemoryLeadRepository();
     const telegram = new FakeTelegramGateway();
     const trello = new FakeTrelloGateway();
     const deps = { repository, telegram, agent: new FakeAgentGateway(), trelloSync: new TrelloSyncService(repository, trello) };
 
     await expect(processTelegramWebhook(update(1030, "commercial renovation cleaning"), deps)).resolves.toEqual({ kind: "processed" });
+    const lead = repository.getLead(1001);
+    expect(lead).toMatchObject({ status: "new_lead", humanNeeded: true, humanNeededReason: "after_renovation" });
+    expect(trello.creates).toHaveLength(1);
+    if (!lead) throw new Error("lead missing");
+    await expect(trello.findCardByBusinessReference(lead.businessReference)).resolves.toMatchObject({
+      lifecycle: "new_lead",
+      humanNeeded: true,
+    });
+  });
+
+  it("keeps a delivered Human Needed turn processed when its first Trello projection fails", async () => {
+    const repository = new InMemoryLeadRepository();
+    const telegram = new FakeTelegramGateway();
+    const trello = new FakeTrelloGateway();
+    trello.nextCreateResult = { kind: "failed", code: "trello_unavailable", ambiguous: false };
+    const deps = { repository, telegram, agent: new FakeAgentGateway(), trelloSync: new TrelloSyncService(repository, trello) };
+
+    await expect(processTelegramWebhook(update(1031, "commercial renovation cleaning"), deps)).resolves.toEqual({ kind: "processed" });
     expect(repository.getLead(1001)).toMatchObject({ status: "new_lead", humanNeeded: true, humanNeededReason: "after_renovation" });
-    expect(trello.creates).toHaveLength(0);
+    expect(telegram.messages).toHaveLength(1);
+    expect(trello.creates).toHaveLength(1);
   });
 
   it("requeues an existing Qualified projection when a later turn needs Human Needed", async () => {

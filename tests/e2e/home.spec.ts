@@ -8,9 +8,9 @@ const dashboardFixture = {
     { id: "google_calendar", label: "Google Calendar", readiness: "ready", detail: "Recent operation succeeded" },
     { id: "trello", label: "Trello", readiness: "ready", detail: "Recent operation succeeded" },
   ],
-  latestLead: { businessReference: "DEMO-001", lifecycle: "booked", cleaningType: "standard", areaM2: 75, preferredDate: "2026-09-03", humanNeeded: false, quotedPriceRsd: 6500, assignedTeam: "team_a", bookedStart: "2026-09-03T08:00:00.000Z" },
+  latestLead: { businessReference: "DEMO-001", lifecycle: "booked", cleaningType: "standard", areaM2: 75, preferredDate: "2026-09-03", humanNeeded: false, quotedPriceRsd: 6500, assignedTeam: "team_a", bookedStart: "2026-09-03T08:00:00.000Z", bookingConfirmed: true },
   latestLeadActivity: [{ eventType: "booking_confirmed", occurredAt: "2026-08-23T09:45:00.000Z" }],
-  trelloBoard: { kind: "projection", boardUrl: "https://trello.com/b/demo-board", cards: [{ title: "Standard cleaning · 75 m²", businessReference: "DEMO-001", lifecycle: "booked", humanNeeded: false, updatedAt: "2026-08-23T09:45:00.000Z" }] },
+  trelloBoard: { kind: "projection", freshness: "fresh", observedAt: "2026-08-23T09:45:00.000Z", boardUrl: "https://trello.com/b/demo-board", cards: [{ title: "Standard cleaning · 75 m²", lifecycle: "booked", humanNeeded: false }] },
 };
 
 async function mockAuthenticatedConsole(page: Page, loginPath = "/login") {
@@ -38,10 +38,31 @@ test("shows current evidence before confirmed same-lead history", async ({ page 
   await mockAuthenticatedConsole(page);
   await page.waitForTimeout(4_200);
   await expect(page.getByRole("heading", { name: "Secure sign-in is unavailable." })).toHaveCount(0);
-  await expect(page.getByLabel("Lead proof")).toContainText("Booking confirmed in the application snapshot");
+  await expect(page.getByRole("heading", { name: "Real-time information about the latest lead" })).toBeVisible();
+  await expect(page.getByRole("region", { name: "Real-time information about the latest lead" })).toContainText("Booking confirmed in the application snapshot");
   await expect(page.getByLabel("Latest lead activity")).toContainText("Booking confirmed");
   await expect(page.getByText("Times shown in Europe/Belgrade.")).toBeVisible();
   await expect(page.getByLabel("Read-only Trello lifecycle projection")).toBeVisible();
+  const trelloProjection = page.getByLabel("Read-only Trello lifecycle projection");
+  for (const lifecycle of ["New Lead", "Qualified", "Booked", "Done", "Lost"]) await expect(trelloProjection).toContainText(lifecycle);
+  await expect(page.getByTitle("Team A public calendar")).toHaveAttribute("src", /calendar\.google\.com\/calendar\/embed/);
+  await expect(page.getByTitle("Team B public calendar")).toHaveAttribute("src", /calendar\.google\.com\/calendar\/embed/);
+  await expect(page.getByTitle("Sherlock Cleaning project Miro board")).toHaveAttribute("src", /miro\.com\/app\/board\/uXdemo\/\?share_link_id=104117806222&embed=1/);
+  await expect(page.getByRole("link", { name: "Open Miro ↗" })).toHaveAttribute("href", "https://miro.com/app/board/uXdemo/?share_link_id=104117806222");
+});
+
+test("does not label a pending booked lifecycle as a confirmed booking", async ({ page }) => {
+  const pendingFixture = { ...dashboardFixture, currentStatus: "recovery", currentStatusDetail: "Retrying Trello sync", latestLead: { ...dashboardFixture.latestLead, bookingConfirmed: false } };
+  await page.route("https://auth.test/auth/v1/token?grant_type=password", async (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ access_token: "test-access-token", refresh_token: "test-refresh-token", expires_in: 3600, token_type: "bearer", user: { id: "00000000-0000-4000-8000-000000000001", aud: "authenticated", role: "authenticated", email: "admin@example.test" } }) }));
+  await page.route("**/api/admin/dashboard", async (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify(pendingFixture) }));
+  await page.route("**/api/admin/demo-console-config", async (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ systemPrompt: "Current prompt", pricingRules: { version: 1, standardRateRsdPerM2: 80, standardMinimumRsd: 4000, deepRateRsdPerM2: 160, deepMinimumRsd: 9000, extraBathroomRsd: 500, heavyPetHairRsd: 900, extrasRsd: { windows: 900, oven_inside: 1000, fridge_inside: 900, balcony_or_terrace: 1000 }, sameDayMultiplierPercent: 120, volumeDiscountPercent: { upTo100: 0, from101To150: 5, from151To200: 10 } }, source: "baseline", revision: "fixture-revision" }) }));
+  await page.goto("/login");
+  await page.getByLabel("Email").fill("admin@example.test");
+  await page.getByLabel("Password").fill("not-a-real-password");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByRole("region", { name: "Real-time information about the latest lead" })).toContainText("Retrying Trello sync");
+  await expect(page.getByText("03 Sep, 10:00 · Team A")).toHaveCount(0);
+  await expect(page.getByText("Requested date")).toBeVisible();
 });
 
 test("rejects an external next destination after sign in", async ({ page }) => {
@@ -58,6 +79,16 @@ test("uses an accessible mobile hamburger drawer", async ({ page }) => {
   await expect(page.getByRole("link", { name: "Settings" })).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(page.getByRole("link", { name: "Settings" })).toHaveCount(0);
+});
+
+test("lets a desktop reviewer collapse and reopen the navigation", async ({ page }) => {
+  await mockAuthenticatedConsole(page);
+  await page.getByRole("button", { name: "Collapse navigation" }).click();
+  const open = page.getByRole("button", { name: "Open navigation" });
+  await expect(open).toBeVisible();
+  await open.click();
+  await expect(page.getByRole("complementary", { name: "Console navigation" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Collapse navigation" })).toBeVisible();
 });
 
 test("keeps protected proof and menu usable on a phone", async ({ page }) => {
@@ -120,12 +151,12 @@ test("keeps the last confirmed snapshot visible when dashboard updates fail", as
   await page.getByLabel("Email").fill("admin@example.test");
   await page.getByLabel("Password").fill("not-a-real-password");
   await page.getByRole("button", { name: "Sign in" }).click();
-  await expect(page.getByLabel("Lead proof")).toContainText("Standard cleaning · 75 m²");
+  await expect(page.getByRole("region", { name: "Real-time information about the latest lead" })).toContainText("Standard cleaning · 75 m²");
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await page.waitForTimeout(50);
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
-  await expect(page.getByLabel("Lead proof")).toContainText("Updates paused. The dashboard source is temporarily unavailable.");
-  await expect(page.getByLabel("Lead proof")).toContainText("Standard cleaning · 75 m²");
+  await expect(page.getByRole("region", { name: "Real-time information about the latest lead" })).toContainText("Updates paused. The dashboard source is temporarily unavailable.");
+  await expect(page.getByRole("region", { name: "Real-time information about the latest lead" })).toContainText("Standard cleaning · 75 m²");
 });
 
 test("offers a direct card only when the safe dashboard DTO supplies one", async ({ page }) => {

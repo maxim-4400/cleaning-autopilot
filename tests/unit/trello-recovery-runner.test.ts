@@ -61,7 +61,7 @@ describe("Trello recovery runner", () => {
     expect(clock.timer.setInterval).not.toHaveBeenCalled();
   });
 
-  it("creates one 60-second timer per process and logs an empty batch as aggregate counts", async () => {
+  it("creates one 5-second timer per process and logs an empty batch as aggregate counts", async () => {
     const clock = makeTimer();
     const reconcileDueJobs = vi.fn().mockResolvedValue({ claimed: 0, completed: 0, retried: 0, manual: 0 });
     const logger = { info: vi.fn(), error: vi.fn() };
@@ -74,7 +74,7 @@ describe("Trello recovery runner", () => {
     expect(first.started).toBe(true);
     expect(second).toBe(first);
     expect(clock.timer.setInterval).toHaveBeenCalledTimes(1);
-    expect(clock.timer.setInterval).toHaveBeenCalledWith(expect.any(Function), 60_000);
+    expect(clock.timer.setInterval).toHaveBeenCalledWith(expect.any(Function), 5_000);
     expect(clock.unref).toHaveBeenCalledTimes(1);
     expect(reconcileDueJobs).toHaveBeenCalledWith(25);
     expect(logger.info).toHaveBeenCalledWith("Trello recovery reconciliation completed", { claimed: 0, completed: 0, retried: 0, manual: 0 });

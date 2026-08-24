@@ -151,7 +151,7 @@ export class InMemoryLeadRepository implements LeadRepository {
       existing.desiredLifecycle = "booked";
       existing.replyLanguage = input.replyLanguage;
       existing.state = "pending";
-      existing.nextAttemptAt = new Date(Date.now() + 2 * 60_000).toISOString();
+      existing.nextAttemptAt = new Date().toISOString();
       existing.confirmationKey = input.lead.calendarEventId ? `telegram:booking_confirmed:${input.lead.id}:${input.lead.calendarEventId}` : existing.confirmationKey;
       existing.createdAt = new Date().toISOString();
       existing.attemptCount = 0;
@@ -166,7 +166,7 @@ export class InMemoryLeadRepository implements LeadRepository {
       desiredLifecycle: "booked",
       replyLanguage: input.replyLanguage,
       confirmationKey: input.lead.calendarEventId ? `telegram:booking_confirmed:${input.lead.id}:${input.lead.calendarEventId}` : undefined,
-      now: new Date(Date.now() + 2 * 60_000).toISOString(),
+      now: new Date().toISOString(),
     });
   }
 

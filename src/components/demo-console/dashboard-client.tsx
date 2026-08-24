@@ -36,7 +36,7 @@ function DashboardData({ accessToken, miroBoardUrl, miroEmbedUrl, teamCalendarEm
     window.addEventListener("focus", refresh);
     return () => { active = false; window.clearInterval(interval); window.removeEventListener("focus", refresh); };
   }, [accessToken, router]);
-  return <><ConsoleHeader active="dashboard" />{model ? <CaseStoryConsole miroBoardUrl={miroBoardUrl} miroEmbedUrl={miroEmbedUrl} teamCalendarEmbedUrls={teamCalendarEmbedUrls} pollingState={state} readFailure={readFailure} readModel={model} refreshedAt={lastRefreshed} /> : <main aria-live="polite" className="grid min-h-screen place-items-center bg-slate-50 px-6 text-center text-sm text-slate-600 md:ml-[232px]">{state === "loading" ? "Loading current operational proof…" : `${readFailure ?? "The dashboard could not be read."} Updates are paused; no prior snapshot is available.`}</main>}</>;
+  return <><ConsoleHeader active="dashboard" />{model ? <CaseStoryConsole miroBoardUrl={miroBoardUrl} miroEmbedUrl={miroEmbedUrl} teamCalendarEmbedUrls={teamCalendarEmbedUrls} pollingState={state} readFailure={readFailure} readModel={model} refreshedAt={lastRefreshed} /> : <main aria-live="polite" className="grid min-h-screen place-items-center bg-slate-50 px-6 text-center text-sm text-slate-600 md:ml-[var(--console-sidebar-width)]">{state === "loading" ? "Loading current operational proof…" : `${readFailure ?? "The dashboard could not be read."} Updates are paused; no prior snapshot is available.`}</main>}</>;
 }
 
 function isReadModel(value: unknown): value is ConsoleReadModel {

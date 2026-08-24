@@ -130,6 +130,21 @@ export class CalendarReservationService {
     lead.bookedEnd = slot.end;
     lead.calendarEventId = eventId;
     await this.repository.persistCalendarReservationWithTrelloJob({ lead, replyLanguage });
+    // The durable reservation/outbox boundary remains the source of truth.  As
+    // soon as it commits, make the first Trello reconciliation due instead of
+    // waiting for the legacy recovery fallback.  This is deliberately a
+    // separate, lease-fenced operation: a retry or concurrent worker can only
+    // claim the one persisted job and never create another Calendar event.
+    try {
+      await this.repository.accelerateTrelloSyncJob({
+        leadId: lead.id,
+        now: this.now().toISOString(),
+        replyLanguage,
+      });
+    } catch {
+      // The reservation and durable outbox are already committed. The
+      // recovery runner will claim this job on its regular fallback cadence.
+    }
     await this.onReservationPersisted?.(lead, replyLanguage);
     await this.repository.appendActivity(lead.id, "calendar_reserved_pending_trello", { team: slot.team, calendar_event_id: eventId });
   }
