@@ -184,5 +184,7 @@ retained; no Trello cards, Calendar events, or conversations were deleted.
 Local release checks passed after the final code changes: `pnpm check`
 (24 test files / 232 tests, lint, both typechecks, production build, and
 instrumentation verification), `pnpm test:e2e` (11/11), and `git diff --check`.
-Railway deployment `7a9415c7-6ea1-4279-9e54-85a7a5871a6a` succeeded, and
-`GET /api/health` returned production `ok`.
+Initial Railway deployment `7a9415c7-6ea1-4279-9e54-85a7a5871a6a` succeeded.
+After GitHub PR #3 merged, the exact released source was deployed again as
+`21bcabdc-0328-4730-8fe5-3a55929d1f2d`, also `SUCCESS`; `GET /api/health`
+returned production `ok` after that final deployment.
