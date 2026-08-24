@@ -40,13 +40,17 @@ export function resolveReplyLanguage(message: string): ReplyLanguage {
   if (cyrillicLetters > 0) {
     if (strongSerbianCyrillic && strongRussian) return "en";
     if (strongSerbianCyrillic && scores.ru > 0) return "en";
-    if (strongRussian && scores.srCyrl > 0) return "en";
+    // Some harmless Serbian request words overlap with Russian (for example
+    // "покажи"). Keep a clearly Russian multi-word message Russian rather
+    // than treating that single overlap as a mixed-language turn.
+    if (strongRussian && scores.srCyrl > 0 && scores.ru < scores.srCyrl + 2) return "en";
     if (strongSerbianCyrillic) return "sr-Cyrl";
     if (strongRussian) return "ru";
     if (scores.srCyrl >= 2 && scores.srCyrl >= scores.ru + 1 && scores.srCyrl >= scores.en + 1) return "sr-Cyrl";
     // Common short Russian turns are deliberately recognised. Serbian uses
     // the same alphabet for a few neutral words, so a single ambiguous word
     // still falls back to English unless it is clearly Russian.
+    if (tokens.some((token) => serbianCyrillicClearShortTurns.has(token))) return "sr-Cyrl";
     if ((tokens.some((token) => russianClearShortTurns.has(token)) || scores.ru >= 2) && scores.ru >= scores.srCyrl + 1 && scores.ru >= scores.en + 1) return "ru";
     return "en";
   }
@@ -69,9 +73,10 @@ export function isReplyLanguageConfident(message: string, language: ReplyLanguag
   return /\b(?:hello|hi|thanks|thank you|please|cleaning|apartment|flat|bathroom|room|available|morning|afternoon|evening|today|tomorrow|weekend|yes|no)\b/u.test(normalized);
 }
 
-const serbianCyrillicVocabulary = new Set(["треба", "чишћење", "чишћења", "стан", "стана", "соба", "собе", "купатило", "купатила", "квадрата", "данас", "сутра", "термин", "молим", "хвала"]);
-const russianVocabulary = new Set(["привет", "здравствуйте", "добрый", "день", "нужна", "нужно", "хочу", "заказать", "заказ", "уборка", "уборку", "квартира", "квартиру", "комнат", "комнаты", "санузел", "сегодня", "завтра", "время", "пожалуйста", "спасибо", "после", "ремонта", "первый", "второй", "третий", "вариант", "выходных", "выходные"]);
+const serbianCyrillicVocabulary = new Set(["треба", "чишћење", "чишћења", "стан", "стана", "соба", "собе", "купатило", "купатила", "квадрата", "данас", "сутра", "термин", "термине", "покажи", "слободне", "увече", "поподне", "ујутру", "молим", "хвала"]);
+const russianVocabulary = new Set(["привет", "здравствуйте", "добрый", "день", "нужна", "нужно", "хочу", "заказать", "заказ", "уборка", "уборку", "квартира", "квартиру", "комнат", "комнаты", "санузел", "сегодня", "завтра", "время", "слоты", "свободные", "покажи", "пожалуйста", "спасибо", "после", "ремонта", "первый", "второй", "третий", "вариант", "выходных", "выходные"]);
 const russianClearShortTurns = new Set(["привет", "здравствуйте"]);
+const serbianCyrillicClearShortTurns = new Set(["увече", "поподне", "ујутру"]);
 const serbianLatinVocabulary = new Set(["treba", "ciscenje", "čišćenje", "čišćenja", "stan", "stana", "soba", "sobe", "kupatilo", "kupatila", "kvadrata", "danas", "sutra", "termin", "molim", "hvala"]);
 const englishVocabulary = new Set(["cleaning", "flat", "apartment", "room", "bathroom", "today", "tomorrow", "please", "thanks", "available"]);
 

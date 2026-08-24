@@ -281,18 +281,22 @@ export class InMemoryLeadRepository implements LeadRepository {
 
   async enqueueTrelloSyncJob(input: Omit<StoredTrelloSyncJob, "state" | "createdAt" | "attemptCount" | "humanNeededEscalated" | "nextAttemptAt" | "lastErrorCode" | "leaseToken" | "leaseExpiresAt"> & { now: string }): Promise<void> {
     const existing = this.trelloSyncJobs.get(input.leadId);
-    if (existing?.state === "done" || existing?.state === "manual") return;
+    const preservesBookedJob = existing?.desiredLifecycle === "booked" && input.desiredLifecycle === "qualified";
     this.trelloSyncJobs.set(input.leadId, {
       leadId: input.leadId,
       desiredLifecycle: input.desiredLifecycle === "booked" || existing?.desiredLifecycle === "booked" ? "booked" : "qualified",
       replyLanguage: existing?.desiredLifecycle === "booked" && input.desiredLifecycle === "qualified" ? existing.replyLanguage : input.replyLanguage,
       confirmationKey: input.confirmationKey ?? existing?.confirmationKey,
-      state: existing?.state ?? "pending",
-      createdAt: existing?.createdAt ?? input.now,
-      attemptCount: existing?.attemptCount ?? 0,
-      humanNeededEscalated: existing?.humanNeededEscalated ?? false,
-      nextAttemptAt: input.now,
-      lastErrorCode: existing?.lastErrorCode,
+      state: preservesBookedJob ? existing.state : "pending",
+      createdAt: preservesBookedJob ? existing.createdAt : input.now,
+      attemptCount: preservesBookedJob ? existing.attemptCount : 0,
+      humanNeededEscalated: preservesBookedJob ? existing.humanNeededEscalated : false,
+      nextAttemptAt: preservesBookedJob ? existing.nextAttemptAt : input.now,
+      lastErrorCode: preservesBookedJob ? existing.lastErrorCode : undefined,
+      // Reopening a projection invalidates any worker which claimed its
+      // previous epoch. It must claim again before it can complete the job.
+      leaseToken: preservesBookedJob ? existing.leaseToken : undefined,
+      leaseExpiresAt: preservesBookedJob ? existing.leaseExpiresAt : undefined,
     });
   }
 

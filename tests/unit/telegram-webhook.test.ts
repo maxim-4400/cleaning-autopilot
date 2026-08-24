@@ -5,9 +5,10 @@ import { FakeCalendarGateway } from "@/lib/calendar/gateway";
 import { CalendarReservationService } from "@/lib/calendar/reservation-service";
 import { InMemoryLeadRepository } from "@/lib/leads/in-memory-repository";
 import { FakeTelegramGateway } from "@/lib/telegram/gateway";
+import { resolveReplyLanguage } from "@/lib/telegram/language";
 import { processTelegramWebhook, resolveRelativePreferredDate } from "@/lib/telegram/webhook";
 import { FakeTrelloGateway } from "@/lib/trello/gateway";
-import { bookingConfirmationKey } from "@/lib/trello/recovery-service";
+import { TrelloRecoveryService } from "@/lib/trello/recovery-service";
 import { TrelloSyncService } from "@/lib/trello/sync-service";
 
 const update = (updateId: number, text: string, chatId = 1001) => ({
@@ -28,6 +29,11 @@ function dependencies() {
 }
 
 describe("Telegram webhook", () => {
+  it("recognises standalone Russian and Serbian Cyrillic availability requests", () => {
+    expect(resolveReplyLanguage("Покажи свободные слоты")).toBe("ru");
+    expect(resolveReplyLanguage("Покажи слободне термине")).toBe("sr-Cyrl");
+  });
+
   it("resolves exact and relative Belgrade dates before the agent and replaces an earlier request", async () => {
     const now = new Date("2026-08-24T21:30:00.000Z"); // 23:30 Belgrade, still 24 Aug
     expect(resolveRelativePreferredDate("через 2 дня", now)).toBe("2026-08-26");
@@ -83,6 +89,59 @@ describe("Telegram webhook", () => {
       openAiConversationId: "fake-conversation-1",
     });
     expect(deps.telegram.messages).toHaveLength(2);
+  });
+
+  it.each([
+    ["en", "Please show available slots", "Nearest available times"],
+    ["ru", "Покажи свободные слоты", "Ближайшее свободное время"],
+    ["ru", "вечером", "Ближайшее свободное время"],
+    ["ru", "а вечером?", "Ближайшее свободное время"],
+    ["ru", "а в середине дня есть?", "Ближайшее свободное время"],
+    ["en", "What about evening?", "Nearest available times"],
+    ["sr-Latn", "Pokaži slobodne termine", "Najbliži slobodni termini"],
+    ["sr-Latn", "A uveče?", "Najbliži slobodni termini"],
+    ["sr-Cyrl", "Покажи слободне термине", "Најближи слободни термини"],
+    ["sr-Cyrl", "А увече?", "Најближи слободни термини"],
+  ] as const)("serves a strict %s availability request without an agent or Trello turn", async (_language, request, expectedReply) => {
+    const repository = new InMemoryLeadRepository();
+    const telegram = new FakeTelegramGateway();
+    const calendar = new FakeCalendarGateway();
+    let agentTurns = 0;
+    const agent: AgentGateway = {
+      async createConversation() { return { id: "availability-fast-path" }; },
+      async runTurn(input) {
+        agentTurns += 1;
+        if (agentTurns > 1) throw new Error("availability request must not reach agent");
+        await input.executeTool("update_client_data", { patch: {
+          cleaningType: "standard", areaM2: 75, rooms: 3, bathrooms: 2,
+          heavyPetHair: false, extras: [], addressOrDistrict: "Vracar", preferredDate: "2026-09-03",
+        } });
+        await input.executeTool("calculate_quote", {});
+        return { reply: "quote", toolResults: [], steps: 2 };
+      },
+    };
+    const deps = { repository, telegram, calendar, agent, calendarReservation: new CalendarReservationService(repository, calendar) };
+
+    await processTelegramWebhook(update(1500, "Full cleaning fixture"), deps);
+    if (_language === "ru") {
+      const lead = repository.getLead(1001);
+      if (!lead) throw new Error("lead missing");
+      lead.firstMessageLanguage = "ru";
+      await repository.saveLead(lead);
+    }
+    await expect(processTelegramWebhook(update(1501, request), deps)).resolves.toEqual({ kind: "processed" });
+
+    expect(agentTurns).toBe(1);
+    expect(telegram.messages.at(-1)?.text).toContain(expectedReply);
+    expect(repository.trelloSyncJobs.get(repository.getLead(1001)?.id ?? "missing")).toMatchObject({ desiredLifecycle: "qualified" });
+  });
+
+  it.each(["show slots, 1 bathroom", "вечером, 2 санузла"])("does not fast-path availability wording mixed with new cleaning details: %s", async (message) => {
+    const deps = dependencies();
+    const runTurn = vi.spyOn(deps.agent, "runTurn");
+    await processTelegramWebhook(update(1510, "standard cleaning, 75 m2, 3 rooms, 2 bathrooms, no pet hair, no extras, district: Vracar, 2026-09-03"), deps);
+    await processTelegramWebhook(update(1511, message), deps);
+    expect(runTurn).toHaveBeenCalledTimes(2);
   });
 
   it("derives standard urgency from a future preferred date even when the model sends null", async () => {
@@ -804,17 +863,18 @@ describe("Telegram webhook", () => {
     }));
   });
 
-  it("confirms a fresh callback exactly once after creating one Calendar event", async () => {
+  it("acknowledges a fresh callback after Calendar persistence and leaves final confirmation to the worker", async () => {
     const repository = new InMemoryLeadRepository();
     const telegram = new FakeTelegramGateway();
     const calendar = new FakeCalendarGateway();
     const trello = new FakeTrelloGateway();
+    const trelloSync = new TrelloSyncService(repository, trello);
     const deps = {
       repository,
       telegram,
       agent: new FakeAgentGateway(),
       calendarReservation: new CalendarReservationService(repository, calendar),
-      trelloSync: new TrelloSyncService(repository, trello),
+      trelloSync,
     };
     await processTelegramWebhook(
       update(832, "standard cleaning, 100 m2, 3 rooms, 1 bathrooms, no pet hair, no extras, district: Vracar, 2026-08-24"),
@@ -828,6 +888,14 @@ describe("Telegram webhook", () => {
     await expect(processTelegramWebhook(callback(834, "callback-fresh", callbackData), deps)).resolves.toEqual({ kind: "processed" });
 
     expect(calendar.creates).toHaveLength(1);
+    expect(repository.getLead(1001)).toMatchObject({ status: "qualified", calendarEventId: "fake-calendar-event-1", humanNeeded: false });
+    expect(repository.trelloSyncJobs.get(repository.getLead(1001)?.id ?? "missing")).toMatchObject({ desiredLifecycle: "booked" });
+    expect(trello.creates).toHaveLength(0);
+    expect(telegram.messages.at(-1)?.text).toContain("<b>Your time is reserved.</b>");
+    expect(repository.updates.get(834)).toMatchObject({ status: "processed" });
+
+    await repository.accelerateTrelloSyncJob({ leadId: repository.getLead(1001)?.id ?? "missing", now: new Date().toISOString(), replyLanguage: "en" });
+    await new TrelloRecoveryService(repository, trelloSync, telegram).reconcileDueJobs(1);
     expect(repository.getLead(1001)).toMatchObject({ status: "booked", humanNeeded: false });
     expect(telegram.messages.at(-1)?.text).toContain("<b>Your cleaning is confirmed.</b>");
   });
@@ -852,16 +920,13 @@ describe("Telegram webhook", () => {
     const markup = telegram.messages.at(-1)?.replyMarkup;
     const originalCallback = markup && "inline_keyboard" in markup ? markup.inline_keyboard[0]?.[0]?.callback_data : undefined;
     if (!originalCallback) throw new Error("slot callback missing");
-    trello.nextUpdateResult = { kind: "failed", code: "trello_update_failed", ambiguous: false };
+    trello.nextCreateResult = { kind: "failed", code: "trello_create_failed", ambiguous: false };
 
-    await expect(processTelegramWebhook(callback(837, "callback-first-reservation", originalCallback), deps)).resolves.toEqual({
-      kind: "failed",
-      failureCode: "trello_pending_recovery",
-    });
+    await expect(processTelegramWebhook(callback(837, "callback-first-reservation", originalCallback), deps)).resolves.toEqual({ kind: "processed" });
     expect(calendar.creates).toHaveLength(1);
     expect(repository.getLead(1001)).toMatchObject({ status: "qualified", calendarEventId: "fake-calendar-event-1" });
 
-    trello.nextUpdateResult = undefined;
+    trello.nextCreateResult = undefined;
     const trelloWritesBeforeTypedRetry = { creates: trello.creates.length, updates: trello.updates.length, labels: trello.labelUpdates.length };
     await expect(processTelegramWebhook(update(838, "1"), deps)).resolves.toEqual({ kind: "processed" });
     expect(repository.getLead(1001)).toMatchObject({ status: "qualified", calendarEventId: "fake-calendar-event-1" });
@@ -870,8 +935,8 @@ describe("Telegram webhook", () => {
     await expect(processTelegramWebhook(callback(839, "callback-recover-original", originalCallback), deps)).resolves.toEqual({ kind: "processed" });
 
     expect(calendar.creates).toHaveLength(1);
-    expect(repository.getLead(1001)).toMatchObject({ status: "booked" });
-    expect(telegram.messages.at(-1)?.text).toContain("<b>Your cleaning is confirmed.</b>");
+    expect(repository.getLead(1001)).toMatchObject({ status: "qualified", calendarEventId: "fake-calendar-event-1" });
+    expect(telegram.messages.at(-1)?.text).toContain("<b>Your time is reserved.</b>");
   });
 
   it("recovers the original callback after Calendar create succeeds but atomic reservation persistence fails once", async () => {
@@ -931,8 +996,8 @@ describe("Telegram webhook", () => {
 
     await expect(processTelegramWebhook(callback(873, "callback-persist-failure", callbackData), deps)).resolves.toEqual({ kind: "processed" });
     expect(calendar.creates).toHaveLength(1);
-    expect(repository.getLead(1001)).toMatchObject({ status: "booked", calendarEventId: "fake-calendar-event-1" });
-    expect(telegram.messages.at(-1)?.text).toContain("<b>Your cleaning is confirmed.</b>");
+    expect(repository.getLead(1001)).toMatchObject({ status: "qualified", calendarEventId: "fake-calendar-event-1" });
+    expect(telegram.messages.at(-1)?.text).toContain("<b>Your time is reserved.</b>");
   });
 
   it("contains a syntactically valid token from a different lead before any Trello or booking work", async () => {
@@ -1240,253 +1305,85 @@ describe("Telegram webhook", () => {
     expect(telegram.messages.at(-1)?.text).toBe("New cleaning location");
   });
 
-  it("creates a Trello card only for a meaningful message and confirms a booking after the Trello move", async () => {
+  it("does not synchronously mutate Trello for an ordinary text turn", async () => {
     const repository = new InMemoryLeadRepository();
     const telegram = new FakeTelegramGateway();
-    const calendar = new FakeCalendarGateway();
     const trello = new FakeTrelloGateway();
-    const deps = {
-      repository,
-      telegram,
-      agent: new FakeAgentGateway(),
-      calendarReservation: new CalendarReservationService(repository, calendar),
-      trelloSync: new TrelloSyncService(repository, trello),
-    };
+    const deps = { repository, telegram, agent: new FakeAgentGateway(), trelloSync: new TrelloSyncService(repository, trello) };
 
-    await processTelegramWebhook(update(1001, "New address"), deps);
-    expect(trello.creates).toHaveLength(0);
     await processTelegramWebhook(
       update(1002, "standard cleaning, 100 m2, 3 rooms, 1 bathrooms, no pet hair, no extras, district: Vracar, 2026-08-24"),
       deps,
     );
-    await processTelegramWebhook(update(1003, "Please show available slots"), deps);
-    await expect(processTelegramWebhook(update(1004, "1"), deps)).resolves.toEqual({ kind: "processed" });
 
-    const lead = repository.getLead(1001);
-    expect(calendar.creates).toHaveLength(1);
-    expect(lead).toMatchObject({ status: "booked", trelloCardId: "fake-trello-card-1", humanNeeded: false });
-    expect(telegram.messages.at(-1)?.text).toContain("<b>Your cleaning is confirmed.</b>");
-    await expect(trello.findCardByBusinessReference(lead?.businessReference ?? "missing")).resolves.toMatchObject({
-      lifecycle: "booked",
-      humanNeeded: false,
-    });
+    expect(trello.creates).toHaveLength(0);
+    expect(trello.updates).toHaveLength(0);
+    expect(repository.trelloSyncJobs.get(repository.getLead(1001)?.id ?? "missing")).toMatchObject({ desiredLifecycle: "qualified", state: "pending" });
   });
 
-  it("keeps the reservation pending when Trello fails, then recovers without a second Calendar event", async () => {
+  it("keeps booking pending through a Trello worker failure, then confirms once without another Calendar event", async () => {
     const repository = new InMemoryLeadRepository();
     const telegram = new FakeTelegramGateway();
     const calendar = new FakeCalendarGateway();
     const trello = new FakeTrelloGateway();
-    const deps = {
-      repository,
-      telegram,
-      agent: new FakeAgentGateway(),
-      calendarReservation: new CalendarReservationService(repository, calendar),
-      trelloSync: new TrelloSyncService(repository, trello),
-    };
+    const trelloSync = new TrelloSyncService(repository, trello);
+    const deps = { repository, telegram, agent: new FakeAgentGateway(), calendarReservation: new CalendarReservationService(repository, calendar), trelloSync };
 
-    await processTelegramWebhook(
-      update(1010, "standard cleaning, 100 m2, 3 rooms, 1 bathrooms, no pet hair, no extras, district: Vracar, 2026-08-24"),
-      deps,
-    );
+    await processTelegramWebhook(update(1010, "standard cleaning, 100 m2, 3 rooms, 1 bathrooms, no pet hair, no extras, district: Vracar, 2026-08-24"), deps);
     await processTelegramWebhook(update(1011, "Please show available slots"), deps);
     const markup = telegram.messages.at(-1)?.replyMarkup;
     const callbackData = markup && "inline_keyboard" in markup ? markup.inline_keyboard[0]?.[0]?.callback_data : undefined;
     if (!callbackData) throw new Error("slot callback missing");
-    trello.nextUpdateResult = { kind: "failed", code: "trello_update_failed", ambiguous: false };
-    await expect(processTelegramWebhook(callback(1012, "callback-pending-recovery", callbackData), deps)).resolves.toEqual({
-      kind: "failed",
-      failureCode: "trello_pending_recovery",
-    });
 
-    expect(calendar.creates).toHaveLength(1);
-    expect(repository.getLead(1001)).toMatchObject({
-      status: "qualified",
-      calendarEventId: "fake-calendar-event-1",
-      humanNeeded: false,
-      humanNeededReason: undefined,
-    });
-    expect(telegram.messages.at(-1)?.text).toContain("<b>Your time is reserved.</b>");
-    expect(repository.operations.get("telegram:reservation_pending:1012")?.status).toBe("succeeded");
-    expect(repository.updates.get(1012)).toMatchObject({ status: "failed" });
-
-    trello.nextUpdateResult = undefined;
     await expect(processTelegramWebhook(callback(1012, "callback-pending-recovery", callbackData), deps)).resolves.toEqual({ kind: "processed" });
     expect(calendar.creates).toHaveLength(1);
-    expect(repository.getLead(1001)).toMatchObject({ status: "booked" });
-    expect(telegram.messages.at(-1)?.text).toContain("<b>Your cleaning is confirmed.</b>");
-    const bookedLead = repository.getLead(1001);
-    expect(bookedLead).not.toBeNull();
-    expect(repository.operations.get(bookingConfirmationKey(bookedLead!))?.status).toBe("succeeded");
-  });
+    expect(telegram.messages.at(-1)?.text).toContain("<b>Your time is reserved.</b>");
+    expect(repository.updates.get(1012)).toMatchObject({ status: "processed" });
 
-  it("recovers a booking label failure without moving a Trello Booked card back to Qualified", async () => {
-    const repository = new InMemoryLeadRepository();
-    const telegram = new FakeTelegramGateway();
-    const calendar = new FakeCalendarGateway();
-    const trello = new FakeTrelloGateway();
-    const deps = {
-      repository,
-      telegram,
-      agent: new FakeAgentGateway(),
-      calendarReservation: new CalendarReservationService(repository, calendar),
-      trelloSync: new TrelloSyncService(repository, trello),
-    };
-    await processTelegramWebhook(
-      update(1015, "standard cleaning, 100 m2, 3 rooms, 1 bathrooms, no pet hair, no extras, district: Vracar, 2026-08-24"),
-      deps,
-    );
-    await processTelegramWebhook(update(1016, "Please show available slots"), deps);
-    const markup = telegram.messages.at(-1)?.replyMarkup;
-    const callbackData = markup && "inline_keyboard" in markup ? markup.inline_keyboard[0]?.[0]?.callback_data : undefined;
-    if (!callbackData) throw new Error("slot callback missing");
-    const lead = repository.getLead(1001);
-    if (!lead?.trelloCardId) throw new Error("Trello card missing");
-    trello.setCardHumanNeeded(lead.trelloCardId, true);
-    trello.nextLabelResult = { kind: "failed", code: "trello_label_failed", ambiguous: false };
-
-    await expect(processTelegramWebhook(callback(1017, "callback-label-recovery", callbackData), deps)).resolves.toEqual({
-      kind: "failed",
-      failureCode: "trello_pending_recovery",
-    });
-    expect(calendar.creates).toHaveLength(1);
-    await expect(trello.getCardById(lead.trelloCardId)).resolves.toMatchObject({ lifecycle: "booked", humanNeeded: true });
-
-    trello.nextLabelResult = undefined;
-    await expect(processTelegramWebhook(callback(1017, "callback-label-recovery", callbackData), deps)).resolves.toEqual({ kind: "processed" });
-    expect(calendar.creates).toHaveLength(1);
-    await expect(trello.getCardById(lead.trelloCardId)).resolves.toMatchObject({ lifecycle: "booked", humanNeeded: false });
-    expect(repository.getLead(1001)).toMatchObject({ status: "booked" });
-  });
-
-  it.each(["done", "lost"] as const)("preserves a manually %s Trello card before Calendar create", async (terminalLifecycle) => {
-    const repository = new InMemoryLeadRepository();
-    const telegram = new FakeTelegramGateway();
-    const calendar = new FakeCalendarGateway();
-    const trello = new FakeTrelloGateway();
-    const deps = {
-      repository,
-      telegram,
-      agent: new FakeAgentGateway(),
-      calendarReservation: new CalendarReservationService(repository, calendar),
-      trelloSync: new TrelloSyncService(repository, trello),
-    };
-
-    await processTelegramWebhook(
-      update(1020, "standard cleaning, 100 m2, 3 rooms, 1 bathrooms, no pet hair, no extras, district: Vracar, 2026-08-24"),
-      deps,
-    );
-    await processTelegramWebhook(update(1021, "Please show available slots"), deps);
     const lead = repository.getLead(1001);
     if (!lead) throw new Error("lead missing");
-    trello.setCardLifecycle(lead.trelloCardId ?? "missing", terminalLifecycle);
+    await repository.accelerateTrelloSyncJob({ leadId: lead.id, now: new Date().toISOString(), replyLanguage: "en" });
+    trello.nextCreateResult = { kind: "failed", code: "trello_create_failed", ambiguous: false };
+    const recovery = new TrelloRecoveryService(repository, trelloSync, telegram);
+    await expect(recovery.reconcileDueJobs(1)).resolves.toMatchObject({ claimed: 1, retried: 1 });
+    expect(repository.getLead(1001)).toMatchObject({ status: "qualified", calendarEventId: "fake-calendar-event-1" });
+    expect(telegram.messages.filter((message) => message.text.includes("cleaning is confirmed"))).toHaveLength(0);
 
-    await expect(processTelegramWebhook(update(1022, "1"), deps)).resolves.toEqual({ kind: "processed" });
-    expect(calendar.creates).toHaveLength(0);
-    expect(repository.getLead(1001)).toMatchObject({ status: terminalLifecycle });
-    expect(telegram.messages.at(-1)?.text).toContain("manual review");
-    await expect(trello.findCardByBusinessReference(lead.businessReference)).resolves.toMatchObject({ lifecycle: terminalLifecycle });
+    trello.nextCreateResult = undefined;
+    await repository.accelerateTrelloSyncJob({ leadId: lead.id, now: new Date().toISOString(), replyLanguage: "en" });
+    await expect(recovery.reconcileDueJobs(1)).resolves.toMatchObject({ claimed: 1, completed: 1 });
+    expect(calendar.creates).toHaveLength(1);
+    expect(repository.getLead(1001)).toMatchObject({ status: "booked" });
+    expect(telegram.messages.filter((message) => message.text.includes("cleaning is confirmed"))).toHaveLength(1);
   });
 
-  it("processes a normal message against a terminal card once without replaying its delivery", async () => {
+  it("does not create a direct Trello card for an unqualified Human Needed lead", async () => {
     const repository = new InMemoryLeadRepository();
     const telegram = new FakeTelegramGateway();
     const trello = new FakeTrelloGateway();
     const deps = { repository, telegram, agent: new FakeAgentGateway(), trelloSync: new TrelloSyncService(repository, trello) };
-    await processTelegramWebhook(
-      update(1025, "standard cleaning, 100 m2, 3 rooms, 1 bathrooms, no pet hair, no extras, district: Vracar, 2026-08-24"),
-      deps,
-    );
-    const lead = repository.getLead(1001);
-    if (!lead) throw new Error("lead missing");
-    trello.setCardLifecycle(lead.trelloCardId ?? "missing", "lost");
-    const terminalUpdate = update(1026, "Can you change the date?");
-
-    await expect(processTelegramWebhook(terminalUpdate, deps)).resolves.toEqual({ kind: "processed" });
-    expect(repository.updates.get(1026)).toMatchObject({ status: "processed" });
-    const messageCount = telegram.messages.length;
-    await expect(processTelegramWebhook(terminalUpdate, deps)).resolves.toEqual({ kind: "duplicate" });
-    expect(telegram.messages).toHaveLength(messageCount);
-    expect(repository.getLead(1001)).toMatchObject({ status: "lost" });
-  });
-
-  it.each(["done", "lost"] as const)("does not deliver a quote or re-qualify when Trello moves to %s during an agent turn", async (terminalLifecycle) => {
-    const repository = new InMemoryLeadRepository();
-    const telegram = new FakeTelegramGateway();
-    const trello = new FakeTrelloGateway();
-    const initialDependencies = { repository, telegram, agent: new FakeAgentGateway(), trelloSync: new TrelloSyncService(repository, trello) };
-    await processTelegramWebhook(
-      update(1027, "standard cleaning, 100 m2, 3 rooms, 1 bathrooms, no pet hair, no extras, district: Vracar, 2026-08-24"),
-      initialDependencies,
-    );
-    const lead = repository.getLead(1001);
-    if (!lead?.trelloCardId) throw new Error("Trello card missing");
-    const quoteDeliveredBefore = repository.activities.filter((activity) => activity.eventType === "quote_delivered").length;
-    const trelloWritesBefore = trello.updates.length;
-    const racingAgent: AgentGateway = {
-      async createConversation() { throw new Error("existing conversation must be reused"); },
-      async runTurn(input) {
-        trello.setCardLifecycle(lead.trelloCardId!, terminalLifecycle);
-        await input.executeTool("calculate_quote", {});
-        return { reply: "Your updated quote is ready.", toolResults: [], steps: 1 };
-      },
-    };
-
-    await expect(processTelegramWebhook(
-      update(1028, "Can you confirm the same details?"),
-      { repository, telegram, agent: racingAgent, trelloSync: new TrelloSyncService(repository, trello) },
-    )).resolves.toEqual({ kind: "processed" });
-
-    expect(repository.getLead(1001)).toMatchObject({ status: terminalLifecycle });
-    expect(repository.activities.filter((activity) => activity.eventType === "quote_delivered")).toHaveLength(quoteDeliveredBefore);
-    expect(trello.updates).toHaveLength(trelloWritesBefore);
-    expect(telegram.messages.at(-1)?.text).toContain("manual review");
-    expect(telegram.messages.at(-1)?.text).not.toContain("Quote:");
-  });
-
-  it("escalates out-of-scope work with no quote on a New Lead card and an independent Human Needed label", async () => {
-    const repository = new InMemoryLeadRepository();
-    const telegram = new FakeTelegramGateway();
-    const trello = new FakeTrelloGateway();
-    const deps = {
-      repository,
-      telegram,
-      agent: new FakeAgentGateway(),
-      trelloSync: new TrelloSyncService(repository, trello),
-    };
 
     await expect(processTelegramWebhook(update(1030, "commercial renovation cleaning"), deps)).resolves.toEqual({ kind: "processed" });
-    const lead = repository.getLead(1001);
-    if (!lead) throw new Error("lead missing");
-    expect(lead).toMatchObject({ status: "new_lead", humanNeeded: true, humanNeededReason: "after_renovation" });
-    expect(lead.quote).toBeUndefined();
-    await expect(trello.findCardByBusinessReference(lead.businessReference)).resolves.toMatchObject({
-      lifecycle: "new_lead",
-      humanNeeded: true,
-    });
-    expect(trello.labelUpdates.at(-1)).toMatchObject({ cardId: lead.trelloCardId, enabled: true });
-    expect(trello.updates.at(-1)?.description).toContain("Human Needed: after renovation");
+    expect(repository.getLead(1001)).toMatchObject({ status: "new_lead", humanNeeded: true, humanNeededReason: "after_renovation" });
+    expect(trello.creates).toHaveLength(0);
   });
 
-  it("keeps a Qualified card in its list while a later escalation turns on Human Needed", async () => {
+  it("requeues an existing Qualified projection when a later turn needs Human Needed", async () => {
     const repository = new InMemoryLeadRepository();
     const telegram = new FakeTelegramGateway();
     const trello = new FakeTrelloGateway();
-    const deps = { repository, telegram, agent: new FakeAgentGateway(), trelloSync: new TrelloSyncService(repository, trello) };
+    const trelloSync = new TrelloSyncService(repository, trello);
+    const deps = { repository, telegram, agent: new FakeAgentGateway(), trelloSync };
+    const recovery = new TrelloRecoveryService(repository, trelloSync, telegram);
 
-    await processTelegramWebhook(
-      update(1040, "standard cleaning, 100 m2, 3 rooms, 1 bathrooms, no pet hair, no extras, district: Vracar, 2026-08-24"),
-      deps,
-    );
-    await processTelegramWebhook(update(1041, "commercial renovation cleaning"), deps);
+    await processTelegramWebhook(update(1040, "standard cleaning, 100 m2, 3 rooms, 1 bathrooms, no pet hair, no extras, district: Vracar, 2026-08-24"), deps);
     const lead = repository.getLead(1001);
     if (!lead) throw new Error("lead missing");
+    await recovery.reconcileDueJobs(1);
+    await processTelegramWebhook(update(1041, "commercial renovation cleaning"), deps);
+    await recovery.reconcileDueJobs(1);
 
-    expect(lead).toMatchObject({ status: "qualified", humanNeeded: true, humanNeededReason: "after_renovation" });
-    await expect(trello.findCardByBusinessReference(lead.businessReference)).resolves.toMatchObject({
-      lifecycle: "qualified",
-      humanNeeded: true,
-    });
-    expect(trello.labelUpdates.at(-1)).toMatchObject({ enabled: true });
+    expect(repository.getLead(1001)).toMatchObject({ status: "qualified", humanNeeded: true, humanNeededReason: "after_renovation" });
+    await expect(trello.findCardByBusinessReference(lead.businessReference)).resolves.toMatchObject({ lifecycle: "qualified", humanNeeded: true });
   });
 });
