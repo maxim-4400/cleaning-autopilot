@@ -60,4 +60,98 @@ describe("InMemoryLeadRepository Telegram claims", () => {
 
     await expect(repository.claimTelegramUpdate(update(400))).resolves.toBe("claimed");
   });
+
+  it("fences an older Trello worker when a later webhook turn reopens its projection", async () => {
+    const repository = new InMemoryLeadRepository();
+    const lead = await repository.createLead({ telegramChatId: 5001, firstMessageLanguage: "en", agentConfigVersion: 5 });
+    const firstNow = "2026-08-24T12:00:00.000Z";
+    await repository.enqueueTrelloSyncJob({ leadId: lead.id, desiredLifecycle: "qualified", replyLanguage: "en", now: firstNow });
+    const firstClaim = await repository.claimDueTrelloSyncJobs({
+      now: firstNow,
+      limit: 1,
+      leaseToken: "worker-old",
+      leaseSeconds: 300,
+    });
+    expect(firstClaim).toHaveLength(1);
+
+    const reopenedNow = "2026-08-24T12:00:01.000Z";
+    await repository.enqueueTrelloSyncJob({ leadId: lead.id, desiredLifecycle: "qualified", replyLanguage: "ru", now: reopenedNow });
+    expect(repository.trelloSyncJobs.get(lead.id)).toMatchObject({
+      state: "pending",
+      replyLanguage: "ru",
+      createdAt: reopenedNow,
+      attemptCount: 0,
+      humanNeededEscalated: false,
+      lastErrorCode: undefined,
+      leaseToken: undefined,
+      leaseExpiresAt: undefined,
+    });
+    await expect(repository.completeTrelloSyncJob({ leadId: lead.id, leaseToken: "worker-old" })).rejects.toThrow(/lease lost/i);
+
+    const freshClaim = await repository.claimDueTrelloSyncJobs({
+      now: reopenedNow,
+      limit: 1,
+      leaseToken: "worker-new",
+      leaseSeconds: 300,
+    });
+    expect(freshClaim).toHaveLength(1);
+    await expect(repository.completeTrelloSyncJob({ leadId: lead.id, leaseToken: "worker-new" })).resolves.toBeUndefined();
+  });
+
+  it.each(["done", "manual"] as const)("reopens a %s qualified projection as a fresh worker epoch", async (state) => {
+    const repository = new InMemoryLeadRepository();
+    const lead = await repository.createLead({ telegramChatId: 5002, firstMessageLanguage: "en", agentConfigVersion: 5 });
+    await repository.enqueueTrelloSyncJob({ leadId: lead.id, desiredLifecycle: "qualified", replyLanguage: "en", now: "2026-08-24T12:00:00.000Z" });
+    const stale = repository.trelloSyncJobs.get(lead.id);
+    if (!stale) throw new Error("job missing");
+    Object.assign(stale, {
+      state,
+      attemptCount: 4,
+      humanNeededEscalated: true,
+      lastErrorCode: "old_failure",
+      leaseToken: "old-lease",
+      leaseExpiresAt: "2026-08-24T12:05:00.000Z",
+    });
+
+    const reopenedNow = "2026-08-24T12:10:00.000Z";
+    await repository.enqueueTrelloSyncJob({ leadId: lead.id, desiredLifecycle: "qualified", replyLanguage: "ru", now: reopenedNow });
+    expect(repository.trelloSyncJobs.get(lead.id)).toMatchObject({
+      desiredLifecycle: "qualified",
+      replyLanguage: "ru",
+      state: "pending",
+      createdAt: reopenedNow,
+      attemptCount: 0,
+      humanNeededEscalated: false,
+      lastErrorCode: undefined,
+      leaseToken: undefined,
+      leaseExpiresAt: undefined,
+    });
+  });
+
+  it("does not downgrade or reset an existing booked job when qualified is requeued", async () => {
+    const repository = new InMemoryLeadRepository();
+    const lead = await repository.createLead({ telegramChatId: 5003, firstMessageLanguage: "en", agentConfigVersion: 5 });
+    await repository.enqueueTrelloSyncJob({
+      leadId: lead.id,
+      desiredLifecycle: "booked",
+      replyLanguage: "sr-Cyrl",
+      confirmationKey: "telegram:booking_confirmed:kept",
+      now: "2026-08-24T12:00:00.000Z",
+    });
+    const booked = repository.trelloSyncJobs.get(lead.id);
+    if (!booked) throw new Error("job missing");
+    Object.assign(booked, {
+      state: "confirmation_pending" as const,
+      attemptCount: 3,
+      humanNeededEscalated: true,
+      nextAttemptAt: "2026-08-24T12:30:00.000Z",
+      lastErrorCode: "telegram_confirmation_retryable",
+      leaseToken: "booked-worker",
+      leaseExpiresAt: "2026-08-24T12:35:00.000Z",
+    });
+    const snapshot = structuredClone(booked);
+
+    await repository.enqueueTrelloSyncJob({ leadId: lead.id, desiredLifecycle: "qualified", replyLanguage: "ru", now: "2026-08-24T12:10:00.000Z" });
+    expect(repository.trelloSyncJobs.get(lead.id)).toEqual(snapshot);
+  });
 });

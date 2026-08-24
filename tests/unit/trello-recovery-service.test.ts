@@ -164,6 +164,41 @@ describe("TrelloRecoveryService", () => {
     });
   });
 
+  it.each(["done", "manual"] as const)("reopens a qualified %s job and lets a new worker sync and complete it", async (state) => {
+    const now = new Date("2026-08-24T12:10:00.000Z");
+    const repository = new InMemoryLeadRepository();
+    const lead = await repository.createLead({ telegramChatId: 9013, firstMessageLanguage: "en", agentConfigVersion: 5 });
+    Object.assign(lead, {
+      status: "qualified" as const,
+      quoteValidity: "active" as const,
+      quote: { amountRsd: 6500, baseRsd: 6500, volumeDiscountPercent: 0, bathroomSurchargeRsd: 0, petHairSurchargeRsd: 0, extrasSurchargeRsd: 0, sameDayApplied: false, pricingRulesVersion: 1 },
+    });
+    await repository.saveLead(lead);
+    await repository.enqueueTrelloSyncJob({ leadId: lead.id, desiredLifecycle: "qualified", replyLanguage: "en", now: "2026-08-24T12:00:00.000Z" });
+    const stale = repository.trelloSyncJobs.get(lead.id);
+    if (!stale) throw new Error("job missing");
+    Object.assign(stale, {
+      state,
+      attemptCount: 4,
+      humanNeededEscalated: true,
+      lastErrorCode: "old_failure",
+      leaseToken: "old-lease",
+      leaseExpiresAt: "2026-08-24T12:05:00.000Z",
+    });
+
+    await repository.enqueueTrelloSyncJob({ leadId: lead.id, desiredLifecycle: "qualified", replyLanguage: "ru", now: now.toISOString() });
+    expect(repository.trelloSyncJobs.get(lead.id)).toMatchObject({
+      state: "pending", createdAt: now.toISOString(), attemptCount: 0, humanNeededEscalated: false,
+      lastErrorCode: undefined, leaseToken: undefined, leaseExpiresAt: undefined,
+    });
+
+    const trello = new FakeTrelloGateway();
+    const recovery = new TrelloRecoveryService(repository, new TrelloSyncService(repository, trello), new FakeTelegramGateway(), () => now);
+    await expect(recovery.reconcileDueJobs(1)).resolves.toEqual({ claimed: 1, completed: 1, retried: 0, manual: 0 });
+    expect(trello.creates).toHaveLength(1);
+    expect(repository.trelloSyncJobs.get(lead.id)).toMatchObject({ state: "done" });
+  });
+
   it.each(["pending", "done", "manual"] as const)("leaves existing booked %s job byte-for-byte unchanged", async (state) => {
     const repository = new InMemoryLeadRepository();
     const lead = await repository.createLead({ telegramChatId: 9012, firstMessageLanguage: "en", agentConfigVersion: 5 });

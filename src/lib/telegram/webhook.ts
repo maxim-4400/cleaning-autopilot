@@ -15,8 +15,6 @@ import {
   renderNewAddressDivider,
   renderNoAvailabilityReply,
   renderQuoteReply,
-  renderBookingConfirmedReply,
-  renderBookingManualReviewReply,
   renderReservationPendingReply,
   renderSlotOfferReply,
   renderStaleSlotReply,
@@ -24,7 +22,7 @@ import {
 } from "@/lib/telegram/renderer";
 import { isReplyLanguageConfident, isRussianLanguage, isSerbianCyrillic, isSerbianLanguage, resolveReplyLanguage, type ReplyLanguage } from "@/lib/telegram/language";
 import { TrelloSyncService } from "@/lib/trello/sync-service";
-import { bookingConfirmationKey, TrelloRecoveryService } from "@/lib/trello/recovery-service";
+import { TrelloRecoveryService } from "@/lib/trello/recovery-service";
 
 const telegramMessageSchema = z.object({
   message_id: z.number().int().nonnegative(),
@@ -278,10 +276,26 @@ export async function processTelegramWebhook(
     }
     config = await getEffectiveAgentConfig(config);
 
-    // A time-window request is backend-owned scheduling intent. It always
-    // creates a new bounded offer instead of re-labelling old earliest slots.
-    if (requestedTimeWindow && dependencies.calendarReservation && lead.status === "qualified" && lead.quote && lead.quoteValidity === "active") {
+    // Availability is a backend-owned scheduling intent. Keep an unambiguous,
+    // qualified availability-only request out of the OpenAI and Trello paths:
+    // neither provider is needed to calculate the next offered slots.
+    if ((isStrictTimeWindowRequest(messageText) || isStrictAvailabilityRequest(messageText)) && dependencies.calendarReservation && isEligibleForSlotReservation(lead) && !lead.calendarEventId) {
       const offer = await dependencies.calendarReservation.offerSlots(lead, replyLanguage);
+      if (!offer.ok && (
+        offer.error === "duration_exceeds_workday" ||
+        offer.error === "calendar_availability_failed" ||
+        offer.error === "calendar_slot_offer_persist_failed"
+      )) {
+        lead.humanNeeded = true;
+        lead.humanNeededReason = "calendar_unavailable";
+        await dependencies.repository.saveLead(lead);
+        await dependencies.repository.appendActivity(lead.id, "calendar_availability_failed", { error_code: offer.error });
+      } else if (!offer.ok && offer.error === "no_available_slots") {
+        lead.humanNeeded = true;
+        lead.humanNeededReason = "calendar_unavailable";
+        await dependencies.repository.saveLead(lead);
+        await dependencies.repository.appendActivity(lead.id, "calendar_no_availability", { error_code: offer.error });
+      }
       const response = offer.ok
         ? renderSlotOfferReply(replyLanguage, offer.slots)
         : offer.error === "no_available_slots"
@@ -291,15 +305,6 @@ export async function processTelegramWebhook(
       if (delivered !== "succeeded") { await dependencies.repository.markTelegramUpdateFailed(update.update_id, "telegram_delivery_failed"); return { kind: "failed", failureCode: "telegram_delivery_failed" }; }
       await dependencies.repository.markTelegramUpdateProcessed(update.update_id);
       return { kind: "processed" };
-    }
-
-    const initialTrelloSync = await syncTrelloLead(lead, dependencies);
-    if (!initialTrelloSync.ok) {
-      await recordTrelloSyncFailure(lead, initialTrelloSync, dependencies, replyLanguage);
-    } else if (initialTrelloSync.terminalLifecycle) {
-      const terminalReply = await deliverTerminalManualReply(update.update_id, lead, replyLanguage, dependencies);
-      if (terminalReply.kind === "processed") await dependencies.repository.markTelegramUpdateProcessed(update.update_id);
-      return terminalReply;
     }
 
     let conversation = await dependencies.repository.getConversation(lead.id);
@@ -447,18 +452,6 @@ export async function processTelegramWebhook(
     }
     await dependencies.repository.saveLead(lead);
 
-    const currentTrelloSync = await syncTrelloLead(lead, dependencies);
-    if (!currentTrelloSync.ok) {
-      await recordTrelloSyncFailure(lead, currentTrelloSync, dependencies, replyLanguage);
-    } else if (currentTrelloSync.terminalLifecycle) {
-      // A human can move the card to Done/Lost while the agent turn is in
-      // flight. That manual lifecycle is authoritative: do not deliver a
-      // quote or slot offer, and never temporarily re-qualify the lead.
-      const terminalReply = await deliverTerminalManualReply(update.update_id, lead, replyLanguage, dependencies);
-      if (terminalReply.kind === "processed") await dependencies.repository.markTelegramUpdateProcessed(update.update_id);
-      return terminalReply;
-    }
-
     // Lead completeness, not whether the model happened to call a pricing
     // tool, is authoritative. The model may persist a partial patch and then
     // emit generic prose; every non-terminal turn must still say exactly what
@@ -499,10 +492,12 @@ export async function processTelegramWebhook(
       lead.status = "qualified";
       await dependencies.repository.saveLead(lead);
       await dependencies.repository.appendActivity(lead.id, "quote_delivered", { amount_rsd: quote.amountRsd });
-      const qualifiedTrelloSync = await syncTrelloLead(lead, dependencies);
-      if (!qualifiedTrelloSync.ok) {
-        await recordTrelloSyncFailure(lead, qualifiedTrelloSync, dependencies, replyLanguage);
-      }
+    }
+    // The customer-facing reply is complete before a non-booked operational
+    // projection is queued. Re-queueing also captures later Human Needed
+    // changes without turning ordinary text into a Trello dependency.
+    if (lead.status === "qualified") {
+      await enqueueQualifiedTrelloProjection(lead, replyLanguage, now, dependencies);
     }
     await dependencies.repository.markTelegramUpdateProcessed(update.update_id);
     return { kind: "processed" };
@@ -617,6 +612,36 @@ function resolveTimeWindow(message: string): "morning" | "midday" | "evening" | 
   return undefined;
 }
 
+function isStrictTimeWindowRequest(message: string): boolean {
+  const text = message.normalize("NFKC").trim().toLocaleLowerCase().replace(/[!?.,]+/gu, " ").replace(/\s+/gu, " ").trim();
+  // This is intentionally a whole-message recognizer. Natural short follow-up
+  // questions may use a small conversational wrapper, but cleaning details
+  // (for example, "вечером, 2 санузла") remain on the normal agent path.
+  if (!text || /\d|\bm\s*²?\b|комнат|сануз|квадрат|kupatil|soba|bathroom|rooms?/iu.test(text)) return false;
+  return [
+    /^(?:(?:and|what about|how about|is there(?: anything)?(?: available)?|any(?:thing)?) )?(?:morning|noon|afternoon|evening|in the morning|at noon|in the afternoon|in the evening)$/u,
+    /^(?:(?:а|а как насч[её]т|есть ли(?: что[- ]?то)?|будет ли(?: что[- ]?то)?) )?(?:утром|дн[её]м|в середине дня|вечером)(?: есть)?$/u,
+    /^(?:(?:a|a šta je sa|ima li(?: nešto)?|da li ima(?: nešto)?) )?(?:ujutru|popodne|oko podne|uveče|uvece)(?: ima)?$/u,
+    /^(?:(?:а|а шта је са|има ли(?: нешто)?|да ли има(?: нешто)?) )?(?:ујутру|поподне|око подне|увече)(?: има)?$/u,
+  ].some((pattern) => pattern.test(text));
+}
+
+/**
+ * Fast-path only a standalone request to see availability. Messages that
+ * include booking/pricing details deliberately stay on the normal agent path
+ * so data collection remains deterministic.
+ */
+function isStrictAvailabilityRequest(message: string): boolean {
+  const text = message.normalize("NFKC").trim().toLocaleLowerCase().replace(/[!?.,]+/gu, " ").replace(/\s+/gu, " ");
+  if (!text || /\d|\bm\s*²?\b|комнат|сануз|квадрат|kupatil|soba|bathroom|rooms?/iu.test(text)) return false;
+  return [
+    /^(?:please )?(?:show|see|check|find|what are|any|available|free|nearest)(?: me)? (?:the )?(?:available |free |nearest )?(?:slots?|times?|availability)$/iu,
+    /^(?:покажи|покажите|провер[ья]й|какие|есть|свободные|ближайшие)(?: мне)? (?:свободные |ближайшие )?(?:слоты|время|термины)$/iu,
+    /^(?:pokaži|pokazite|proveri|koji su|ima li|slobodn(?:i|e)|najbliži) (?:mi )?(?:slobodn(?:i|e) |najbliži )?(?:termin(?:i|e|a)?|slotovi|vreme)$/iu,
+    /^(?:покажи|покажите|провери|који су|има ли|слободн(?:и|е)|најближи) (?:ми )?(?:слободн(?:и|е) |најближи )?(?:термин(?:и|е|а)?|слотови|време)$/iu,
+  ].some((pattern) => pattern.test(text));
+}
+
 function missingDetailsReply(data: ClientData, pricingRules: StoredAgentConfig["pricingRules"], language: ReplyLanguage, didSaveData: boolean): TelegramRenderedReply | undefined {
   const decision = calculatePricingDecision(data, pricingRules);
   if (decision.kind !== "missing_data") return undefined;
@@ -695,16 +720,6 @@ async function reserveSelectedSlot(input: {
     return "stale";
   }
 
-  const preCalendarTrelloSync = input.dependencies.trelloSync
-    ? await input.dependencies.trelloSync.syncLead(input.lead, "qualified")
-    : undefined;
-  if (preCalendarTrelloSync?.ok && preCalendarTrelloSync.terminalLifecycle) {
-    return deliverTerminalManualReply(input.updateId, input.lead, input.replyLanguage, input.dependencies);
-  }
-  if (preCalendarTrelloSync && !preCalendarTrelloSync.ok) {
-    await recordTrelloSyncFailure(input.lead, preCalendarTrelloSync, input.dependencies, input.replyLanguage);
-  }
-
   const reservation = await input.dependencies.calendarReservation.reserveSlot(input.lead, selectedSlot.token, input.replyLanguage);
   if (!reservation.ok) {
     if (isStaleSlotReservationError(reservation.error)) return "stale";
@@ -733,91 +748,14 @@ async function finalizeReservationBooking(input: {
   dependencies: Stage2Dependencies;
   now?: Date;
 }): Promise<TelegramWebhookResult> {
-  if (!input.dependencies.trelloSync) {
-    const pendingDelivery = await deliverReply({
-      updateId: input.updateId,
-      lead: input.lead,
-      reply: renderReservationPendingReply(input.replyLanguage),
-      kind: "reservation_pending",
-      dependencies: input.dependencies,
-    });
-    if (pendingDelivery === "succeeded") return { kind: "processed" };
-    await markReservationDeliveryFailure(input.lead, pendingDelivery, input.dependencies);
-    return { kind: "failed", failureCode: "telegram_delivery_failed" };
-  }
-  if (input.lead.humanNeededReason === "trello_unavailable" || input.lead.humanNeededReason === "trello_ambiguous") {
-    input.lead.humanNeeded = false;
-    input.lead.humanNeededReason = undefined;
-    await input.dependencies.repository.saveLead(input.lead);
-  }
-  const trelloResult = await input.dependencies.trelloSync.syncLead(input.lead, "booked");
-  if (!trelloResult.ok) {
-    await markTrelloNeeded(input.lead, trelloResult, input.dependencies);
-    await input.dependencies.repository.accelerateTrelloSyncJob({ leadId: input.lead.id, now: (input.now ?? input.dependencies.now?.() ?? new Date()).toISOString(), replyLanguage: input.replyLanguage });
-    const pendingDelivery = await deliverReply({
-      updateId: input.updateId,
-      lead: input.lead,
-      reply: renderReservationPendingReply(input.replyLanguage),
-      kind: "reservation_pending",
-      dependencies: input.dependencies,
-    });
-    if (pendingDelivery === "succeeded") return { kind: "failed", failureCode: "trello_pending_recovery" };
-    await markReservationDeliveryFailure(input.lead, pendingDelivery, input.dependencies);
-    return { kind: "failed", failureCode: "telegram_delivery_failed" };
-  }
-
-  if (trelloResult.terminalLifecycle) {
-    input.lead.status = trelloResult.terminalLifecycle;
-    input.lead.humanNeeded = true;
-    input.lead.humanNeededReason = "trello_terminal";
-    await input.dependencies.repository.saveLead(input.lead);
-    await input.dependencies.repository.appendActivity(input.lead.id, "booking_preserved_trello_terminal", {
-      trello_card_id: trelloResult.cardId,
-      lifecycle: trelloResult.terminalLifecycle,
-    });
-    const pendingDelivery = await deliverReply({
-      updateId: input.updateId,
-      lead: input.lead,
-      reply: renderReservationPendingReply(input.replyLanguage),
-      kind: "reservation_pending",
-      dependencies: input.dependencies,
-    });
-    if (pendingDelivery === "succeeded") return { kind: "processed" };
-    await markReservationDeliveryFailure(input.lead, pendingDelivery, input.dependencies);
-    return { kind: "failed", failureCode: "telegram_delivery_failed" };
-  }
-
-  if (!input.lead.assignedTeam || !input.lead.bookedStart || !input.lead.quote) {
-    input.lead.humanNeeded = true;
-    input.lead.humanNeededReason = "missing_required_data";
-    await input.dependencies.repository.saveLead(input.lead);
-    await input.dependencies.repository.appendActivity(input.lead.id, "booking_confirmation_data_missing");
-    const manualDelivery = await deliverReply({
-      updateId: input.updateId,
-      lead: input.lead,
-      reply: renderBookingManualReviewReply(input.replyLanguage),
-      kind: "reservation_manual",
-      dependencies: input.dependencies,
-    });
-    if (manualDelivery === "succeeded") return { kind: "failed", failureCode: "booking_confirmation_data_missing" };
-    await markReservationDeliveryFailure(input.lead, manualDelivery, input.dependencies);
-    return { kind: "failed", failureCode: "telegram_delivery_failed" };
-  }
-
-  input.lead.status = "booked";
-  await input.dependencies.repository.saveLead(input.lead);
-  await input.dependencies.repository.appendActivity(input.lead.id, "booking_confirmed", { trello_card_id: trelloResult.cardId });
+  // CalendarReservationService atomically persists the Calendar event and a
+  // Booked outbox job. The webhook acknowledges only that durable boundary;
+  // the recovery worker alone moves Trello and sends final confirmation.
   const delivered = await deliverReply({
     updateId: input.updateId,
     lead: input.lead,
-    reply: renderBookingConfirmedReply({
-      language: input.replyLanguage,
-      team: input.lead.assignedTeam,
-      start: input.lead.bookedStart,
-      quoteAmountRsd: input.lead.quote.amountRsd,
-    }),
-    kind: "booking_confirmed",
-    idempotencyKey: bookingConfirmationKey(input.lead),
+    reply: renderReservationPendingReply(input.replyLanguage),
+    kind: "reservation_pending",
     dependencies: input.dependencies,
   });
   if (delivered !== "succeeded") {
@@ -827,59 +765,18 @@ async function finalizeReservationBooking(input: {
   return { kind: "processed" };
 }
 
-async function syncTrelloLead(
-  lead: StoredLead,
-  dependencies: Stage2Dependencies,
-): Promise<{ ok: true; cardId: string; terminalLifecycle?: "done" | "lost" } | { ok: false; code: string; ambiguous: boolean }> {
-  if (!dependencies.trelloSync) return { ok: true, cardId: lead.trelloCardId ?? "not-configured-for-legacy-dependency" };
-  if (lead.status !== "new_lead" && lead.status !== "qualified" && lead.status !== "booked") {
-    return { ok: true, cardId: lead.trelloCardId ?? "not-syncable" };
-  }
-  return dependencies.trelloSync.syncLead(lead, lead.status);
-}
-
-async function markTrelloNeeded(
-  lead: StoredLead,
-  result: { ok: false; code: string; ambiguous: boolean },
-  dependencies: Stage2Dependencies,
-): Promise<void> {
-  await dependencies.repository.appendActivity(lead.id, "trello_sync_failed", { error_code: result.code, ambiguous: result.ambiguous });
-  // The persistent outbox escalates to Human Needed after 15 minutes; doing
-  // it immediately would present a transient provider failure as a manual
-  // customer case and makes the label race the recovery sync.
-}
-
-async function recordTrelloSyncFailure(inputLead: StoredLead,
-  result: { ok: false; code: string; ambiguous: boolean },
-  dependencies: Stage2Dependencies,
-  replyLanguage: ReplyLanguage,
-): Promise<void> {
-  await dependencies.repository.appendActivity(inputLead.id, "trello_sync_failed", { error_code: result.code, ambiguous: result.ambiguous });
-  if ((inputLead.status === "qualified" || inputLead.status === "booked") && dependencies.trelloRecovery) {
-    await dependencies.trelloRecovery.enqueueLeadRecovery({
-      lead: inputLead,
-      desiredLifecycle: inputLead.status,
-      replyLanguage,
-    });
-  }
-}
-
-async function deliverTerminalManualReply(
-  updateId: number,
+async function enqueueQualifiedTrelloProjection(
   lead: StoredLead,
   replyLanguage: ReplyLanguage,
+  now: Date,
   dependencies: Stage2Dependencies,
-): Promise<TelegramWebhookResult> {
-  const delivered = await deliverReply({
-    updateId,
-    lead,
-    reply: renderBookingManualReviewReply(replyLanguage),
-    kind: "reservation_manual",
-    dependencies,
+): Promise<void> {
+  await dependencies.repository.enqueueTrelloSyncJob({
+    leadId: lead.id,
+    desiredLifecycle: "qualified",
+    replyLanguage,
+    now: now.toISOString(),
   });
-  if (delivered === "succeeded") return { kind: "processed" };
-  await dependencies.repository.markTelegramUpdateFailed(updateId, "telegram_delivery_failed");
-  return { kind: "failed", failureCode: "telegram_delivery_failed" };
 }
 
 async function markReservationDeliveryFailure(
