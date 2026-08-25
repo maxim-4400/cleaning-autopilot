@@ -11,6 +11,7 @@ export const DEMO_CALENDAR_SEED_ID: string;
 export const DEMO_EVENT_DESCRIPTION: string;
 export const DEMO_CALENDAR_EVENTS: DemoCalendarEntry[];
 export function demoEventArguments(entry: DemoCalendarEntry, calendarId: string): Record<string, unknown>;
+export function demoEventUpdateArguments(entry: DemoCalendarEntry, calendarId: string, eventId: string): Record<string, unknown>;
 export function assertDedicatedTeamCalendars(calendarIds: { team_a?: string; team_b?: string }): { team_a: string; team_b: string };
 export type CorrectionMetadata = { summary: string; description?: string | null; visibility: "default" | "public" | "private" | "confidential"; transparency: "opaque" | "transparent"; extended_properties: { private?: Record<string, string>; shared?: Record<string, string> } | null };
 export type CalendarCorrection = { team: "team_a" | "team_b"; eventId: string; startDatetime: string; endDatetime: string; metadata?: CorrectionMetadata };

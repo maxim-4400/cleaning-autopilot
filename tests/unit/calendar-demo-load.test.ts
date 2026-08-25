@@ -6,6 +6,7 @@ import {
   DEMO_EVENT_DESCRIPTION,
   correctionUpdateArguments,
   demoEventArguments,
+  demoEventUpdateArguments,
   assertDedicatedTeamCalendars,
   parseCli,
   parseCorrectionArgument,
@@ -47,7 +48,7 @@ describe("calendar demo load seed", () => {
     expect(demoEvents.some((entry) => entry.startDatetime === "2026-08-25T11:30:00" && entry.team === "team_b")).toBe(true);
   });
 
-  it("marks create payloads as owned, public, synthetic, attendee-free, and non-notifying", () => {
+  it("marks create payloads as owned, public, synthetic, attendee-free, non-notifying, and organizer-excluding", () => {
     const input = demoEventArguments(demoEvents[0]!, "team-a@group.calendar.google.com");
     expect(input).toMatchObject({
       calendar_id: "team-a@group.calendar.google.com",
@@ -57,9 +58,31 @@ describe("calendar demo load seed", () => {
       transparency: "opaque",
       attendees: [],
       send_updates: "none",
+      exclude_organizer: true,
       create_meeting_room: false,
       extended_properties: { private: { sherlockDemoSeed: DEMO_CALENDAR_SEED_ID } },
     });
+  });
+
+  it("preserves the ordinary demo-event replacement payload while omitting the create-only organizer exclusion", () => {
+    const entry = demoEvents[0]!;
+    const input = demoEventUpdateArguments(entry, "team-a@group.calendar.google.com", "existing-demo-event");
+    expect(input).toMatchObject({
+      calendar_id: "team-a@group.calendar.google.com",
+      event_id: "existing-demo-event",
+      summary: entry.summary,
+      description: DEMO_EVENT_DESCRIPTION,
+      start_datetime: entry.startDatetime,
+      end_datetime: entry.endDatetime,
+      timezone: "Europe/Belgrade",
+      visibility: "public",
+      transparency: "opaque",
+      attendees: [],
+      send_updates: "none",
+      create_meeting_room: false,
+      extended_properties: { private: { sherlockDemoSeed: DEMO_CALENDAR_SEED_ID } },
+    });
+    expect(input).not.toHaveProperty("exclude_organizer");
   });
 
   it("uses the same strict, distinct dedicated group-calendar guard as runtime routing", () => {
@@ -132,6 +155,7 @@ describe("calendar demo load seed", () => {
       end_datetime: "2026-08-26T11:00:00",
       timezone: "Europe/Belgrade",
     });
+    expect(arguments_).not.toHaveProperty("exclude_organizer");
   });
 
   it("builds a full reservation restore only from an exact reconciled event, lead, and operation key", () => {

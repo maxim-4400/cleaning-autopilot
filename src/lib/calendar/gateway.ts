@@ -120,10 +120,12 @@ export class ComposioCalendarGateway implements CalendarGateway {
           timezone: "Europe/Belgrade",
           visibility: "private",
           transparency: "opaque",
-          // Never invite anyone or let Google materialize an attendee copy in
-          // a primary calendar. Reservations exist only in Team A/B calendars.
+          // Calendar ownership must remain with the Team A/B target. This
+          // triple prevents invitations, notifications, or an organizer copy
+          // from materializing an event in the operator's primary calendar.
           attendees: [],
           send_updates: "none",
+          exclude_organizer: true,
           create_meeting_room: false,
           extended_properties: { private: { cleaningLeadId: input.leadId, idempotencyKey: input.idempotencyKey } },
         },

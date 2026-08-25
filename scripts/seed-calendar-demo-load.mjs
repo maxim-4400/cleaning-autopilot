@@ -83,11 +83,12 @@ export function demoEventArguments(entry, calendarId) {
     timezone: BELGRADE_TIMEZONE,
     visibility: "public",
     transparency: "opaque",
-    // The pinned Composio create schema accepts the enum value "none" here.
-    // Keep both fields explicit so a synthetic event can never invite or copy
-    // itself into an attendee's primary calendar through an implicit list.
+    // Keep the full create-only ownership triple explicit. It prevents an
+    // invitation, notification, or organizer shadow copy from materializing
+    // this synthetic Team A/B event in the operator's primary calendar.
     attendees: [],
     send_updates: "none",
+    exclude_organizer: true,
     create_meeting_room: false,
     extended_properties: {
       private: {
@@ -96,6 +97,16 @@ export function demoEventArguments(entry, calendarId) {
       },
     },
   };
+}
+
+/**
+ * Existing synthetic events are updated with the same full replacement
+ * payload as create, except for the create-only organizer exclusion field.
+ */
+export function demoEventUpdateArguments(entry, calendarId, eventId) {
+  const arguments_ = demoEventArguments(entry, calendarId);
+  delete arguments_.exclude_organizer;
+  return { ...arguments_, event_id: eventId };
 }
 
 /**
@@ -404,9 +415,7 @@ export async function runDemoCalendarSeed({ argv = process.argv.slice(2), env = 
     } else if (isSameDemoEvent(existing, entry)) {
       result.unchanged += 1;
     } else {
-      await execute(composio, environment, "GOOGLECALENDAR_UPDATE_EVENT", {
-        ...demoEventArguments(entry, environment.calendarIds[entry.team]), event_id: existing.id,
-      });
+      await execute(composio, environment, "GOOGLECALENDAR_UPDATE_EVENT", demoEventUpdateArguments(entry, environment.calendarIds[entry.team], existing.id));
       result.updated += 1;
     }
   }

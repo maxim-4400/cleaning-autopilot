@@ -66,9 +66,9 @@ describe("Composio Calendar response contract", () => {
     await gateway.createEvent({ team: "team_b", start: "2026-08-24T10:00:00.000Z", end: "2026-08-24T11:00:00.000Z", leadId: "lead-b", idempotencyKey: "key-b" });
     expect(calls.map((call) => call.arguments.calendar_id)).toEqual(["team-a@group.calendar.google.com", "team-b@group.calendar.google.com"]);
     expect(calls.flatMap((call) => Object.values(call.arguments))).not.toContain("primary");
-    expect(calls.map((call) => ({ attendees: call.arguments.attendees, sendUpdates: call.arguments.send_updates }))).toEqual([
-      { attendees: [], sendUpdates: "none" },
-      { attendees: [], sendUpdates: "none" },
+    expect(calls.map((call) => ({ attendees: call.arguments.attendees, sendUpdates: call.arguments.send_updates, excludeOrganizer: call.arguments.exclude_organizer }))).toEqual([
+      { attendees: [], sendUpdates: "none", excludeOrganizer: true },
+      { attendees: [], sendUpdates: "none", excludeOrganizer: true },
     ]);
   });
 
