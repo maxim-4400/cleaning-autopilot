@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "target": {
+    "calendarId": "primary"
+  },
+  "teamCalendars": {
+    "teamA": "team-a@group.calendar.google.com",
+    "teamB": "team-b@group.calendar.google.com"
+  },
+  "window": {
+    "timeMin": "2026-08-24T00:00:00+02:00",
+    "timeMax": "2026-10-01T00:00:00+02:00"
+  },
+  "candidates": [
+    {
+      "primaryEventId": "replace-with-exact-primary-copy-id",
+      "team": "team_a",
+      "originalEventId": "replace-with-exact-team-a-original-id",
+      "iCalUID": "replace-with-the-shared-ical-uid"
+    }
+  ]
+}

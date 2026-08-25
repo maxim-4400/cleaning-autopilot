@@ -105,6 +105,22 @@
 
 Не удаляй и не изменяй реальные внешние данные без явного подтверждения.
 
+## Google Calendar isolation
+
+Для будущего подключения Composio Google Calendar используй выделенный
+операционный Google account, а не личный owner account. `TEAM_A_CALENDAR_ID` и
+`TEAM_B_CALENDAR_ID` должны быть двумя разными dedicated group calendars;
+литерал `primary`, default/personal aliases и личные calendar IDs никогда не
+являются target или fallback. Создаваемые события не получают attendees и не
+рассылают updates без явно согласованной продуктовой причины.
+
+Перед удалением shadow copies из `primary` составь exact local manifest с
+парами primary event ↔ original Team A/B event и общим `iCalUID`. Сначала
+выполни dry-run, зафиксируй SHA-256 именно проверенного manifest и получи
+подтверждение пользователя на apply. После apply сделай readback: copies в
+`primary` отсутствуют, а каждый original в Team A/B остался без изменений.
+Не коммить manifest, provider IDs, customer data или secrets.
+
 ## Database safety
 
 По возможности изменяй структуру базы без удаления или потери существующих данных.

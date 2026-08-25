@@ -109,6 +109,8 @@ export interface LeadRepository {
   persistCalendarReservationWithTrelloJob(input: { lead: StoredLead; replyLanguage: "en" | "ru" | "sr-Latn" | "sr-Cyrl" }): Promise<void>;
   getConversation(leadId: string): Promise<StoredConversation | null>;
   saveConversation(conversation: StoredConversation): Promise<void>;
+  /** Removes only the local mapping after an ambiguous provider turn. */
+  invalidateConversation(leadId: string): Promise<void>;
   getCurrentAgentConfig(): Promise<StoredAgentConfig>;
   getAgentConfig(version: number): Promise<StoredAgentConfig>;
   appendActivity(leadId: string, eventType: string, payload?: Record<string, unknown>): Promise<void>;

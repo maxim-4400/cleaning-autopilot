@@ -17,6 +17,26 @@ describe("CachedLiveTrelloProjectionReader", () => {
     await expect(reader.read()).resolves.toMatchObject({ state: "fresh", cards: boardCards });
   });
 
+  it("uses a 10-second refresh window by default", async () => {
+    let now = 0;
+    let calls = 0;
+    const reader = new CachedLiveTrelloProjectionReader({
+      async listBoardCards() {
+        calls += 1;
+        return boardCards;
+      },
+    }, () => now);
+
+    await reader.read();
+    now = 9_999;
+    await reader.read();
+    expect(calls).toBe(1);
+
+    now = 10_000;
+    await reader.read();
+    expect(calls).toBe(2);
+  });
+
   it("single-flights simultaneous refreshes and reuses a successful snapshot within the TTL", async () => {
     let now = 0;
     let resolveRead: ((cards: typeof boardCards) => void) | undefined;

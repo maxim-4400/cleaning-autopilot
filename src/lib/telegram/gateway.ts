@@ -1,11 +1,12 @@
 export type TelegramSendResult = { messageId: string };
+export type TelegramTransportProvenance = "agent" | "template";
 
 export type TelegramReplyMarkup = { keyboard: Array<Array<{ text: string }>>; resize_keyboard: true; is_persistent: true };
 export type TelegramInlineKeyboardMarkup = { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
 export type TelegramAnyReplyMarkup = TelegramReplyMarkup | TelegramInlineKeyboardMarkup;
 
 export interface TelegramGateway {
-  sendMessage(input: { chatId: number; text: string; replyMarkup?: TelegramAnyReplyMarkup }): Promise<TelegramSendResult>;
+  sendMessage(input: { chatId: number; text: string; replyMarkup?: TelegramAnyReplyMarkup; provenance?: TelegramTransportProvenance }): Promise<TelegramSendResult>;
   sendTyping(chatId: number): Promise<void>;
   answerCallbackQuery(callbackQueryId: string): Promise<void>;
 }
@@ -20,7 +21,7 @@ export class TelegramDeliveryError extends Error {
 export class TelegramApiGateway implements TelegramGateway {
   constructor(private readonly botToken: string) {}
 
-  async sendMessage(input: { chatId: number; text: string; replyMarkup?: TelegramAnyReplyMarkup }): Promise<TelegramSendResult> {
+  async sendMessage(input: { chatId: number; text: string; replyMarkup?: TelegramAnyReplyMarkup; provenance?: TelegramTransportProvenance }): Promise<TelegramSendResult> {
     let response: Response;
     try {
       response = await fetch(`https://api.telegram.org/bot${this.botToken}/sendMessage`, {
@@ -75,7 +76,7 @@ function isTelegramAuxiliarySuccess(payload: unknown): payload is { ok: true } {
 }
 
 export class FakeTelegramGateway implements TelegramGateway {
-  readonly messages: Array<{ chatId: number; text: string; parseMode: "HTML"; replyMarkup?: TelegramAnyReplyMarkup }> = [];
+  readonly messages: Array<{ chatId: number; text: string; parseMode: "HTML"; replyMarkup?: TelegramAnyReplyMarkup; provenance?: TelegramTransportProvenance }> = [];
   readonly typingChatIds: number[] = [];
   readonly answeredCallbackQueryIds: string[] = [];
   shouldFail = false;
@@ -83,7 +84,7 @@ export class FakeTelegramGateway implements TelegramGateway {
   shouldFailTyping = false;
   shouldFailCallbackAnswer = false;
 
-  async sendMessage(input: { chatId: number; text: string; replyMarkup?: TelegramAnyReplyMarkup }): Promise<TelegramSendResult> {
+  async sendMessage(input: { chatId: number; text: string; replyMarkup?: TelegramAnyReplyMarkup; provenance?: TelegramTransportProvenance }): Promise<TelegramSendResult> {
     if (this.shouldFail) throw new TelegramDeliveryError(this.failureOutcome, "Fake Telegram delivery failure");
     this.messages.push({ ...input, parseMode: "HTML" });
     return { messageId: String(this.messages.length) };

@@ -26,7 +26,7 @@ export class CachedLiveTrelloProjectionReader implements LiveTrelloProjectionRea
   constructor(
     private readonly reader: TrelloBoardReader,
     private readonly now: () => number = Date.now,
-    private readonly ttlMs = 30_000,
+    private readonly ttlMs = 10_000,
   ) {}
 
   async read(): Promise<LiveTrelloProjection> {

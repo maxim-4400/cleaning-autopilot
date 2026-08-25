@@ -1,9 +1,9 @@
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
 
-import type { AgentGateway } from "@/lib/agent/gateway";
+import { AgentTurnTechnicalError, type AgentGateway } from "@/lib/agent/gateway";
 import { CalendarReservationService } from "@/lib/calendar/reservation-service";
-import { clientDataPatchSchema, humanNeededReasons, type AgentTurn, type AvailabilitySlot, type ClientData, type HumanNeededReason, type Quote } from "@/lib/contracts/domain";
+import { clientDataPatchSchema, humanNeededReasons, type AgentToolName, type AgentTurn, type AvailabilitySlot, type ClientData, type HumanNeededReason, type PricingRules, type Quote } from "@/lib/contracts/domain";
 import type { LeadRepository, StoredAgentConfig, StoredLead } from "@/lib/leads/repository";
 import { calculatePricingDecision } from "@/lib/pricing/engine";
 import { getEffectiveAgentConfig } from "@/lib/runtime-config/effective-agent-config";
@@ -12,15 +12,20 @@ import {
   renderAgentReply,
   renderCalendarReservationFailedReply,
   renderHumanNeededReply,
+  renderHumanNeededAlreadyHandedOffReply,
+  renderHumanNeededUpdateReply,
+  renderReservedAcknowledgementReply,
   renderNewAddressDivider,
   renderNoAvailabilityReply,
   renderQuoteReply,
   renderReservationPendingReply,
   renderSlotOfferReply,
   renderStaleSlotReply,
+  renderTechnicalResendReply,
   type TelegramRenderedReply,
 } from "@/lib/telegram/renderer";
 import { isReplyLanguageConfident, isRussianLanguage, isSerbianCyrillic, isSerbianLanguage, resolveReplyLanguage, type ReplyLanguage } from "@/lib/telegram/language";
+import { isFocusedModelIntakeFollowup } from "@/lib/telegram/intake-focus";
 import { TrelloSyncService } from "@/lib/trello/sync-service";
 import { TrelloRecoveryService } from "@/lib/trello/recovery-service";
 
@@ -171,7 +176,16 @@ export async function processTelegramWebhook(
     const messageText = incomingMessage.text?.trim() ?? "";
     const selectedSlot = parseSlotSelection(messageText);
     let replyLanguage = selectedSlot?.replyLanguage ?? resolveReplyLanguage(messageText);
+    if (lead && selectedSlot && !selectedSlot.replyLanguage && isReplyLocale(lead.firstMessageLanguage)) {
+      replyLanguage = lead.firstMessageLanguage;
+    }
     if (lead && selectedSlot !== undefined && dependencies.calendarReservation) {
+      if (lead.calendarEventId) {
+        const delivered = await deliverReply({ updateId: update.update_id, lead, reply: renderReservedAcknowledgementReply(replyLanguage), dependencies });
+        if (delivered !== "succeeded") { await dependencies.repository.markTelegramUpdateFailed(update.update_id, "telegram_delivery_failed"); return { kind: "failed", failureCode: "telegram_delivery_failed" }; }
+        await dependencies.repository.markTelegramUpdateProcessed(update.update_id);
+        return { kind: "processed" };
+      }
       const activeSlots = await dependencies.repository.listActiveCalendarSlotTokens({
         leadId: lead.id,
         now: turnNow.toISOString(),
@@ -232,14 +246,69 @@ export async function processTelegramWebhook(
     if ((!isReplyLanguageConfident(messageText, replyLanguage) || isAmbiguousMessage(messageText)) && isReplyLocale(lead.firstMessageLanguage)) {
       replyLanguage = lead.firstMessageLanguage;
     }
+    if (lead.calendarEventId) {
+      const delivered = await deliverReply({ updateId: update.update_id, lead, reply: renderReservedAcknowledgementReply(replyLanguage), dependencies });
+      if (delivered !== "succeeded") { await dependencies.repository.markTelegramUpdateFailed(update.update_id, "telegram_delivery_failed"); return { kind: "failed", failureCode: "telegram_delivery_failed" }; }
+      await dependencies.repository.markTelegramUpdateProcessed(update.update_id);
+      return { kind: "processed" };
+    }
     const now = turnNow;
-    const weekendDate = weekendProposalDate(messageText, now);
-    const relativePreferredDate = resolveRelativePreferredDate(messageText, now);
+    // Incidental time words in an unrelated question (for example, "what is
+    // the weather today?") are not booking intent. Once the conversation has
+    // established cleaning context, a short follow-up such as "tomorrow" is
+    // still a valid date answer.
+    const dateContext = hasCleaningOrSchedulingContext(messageText, lead);
+    const weekendDate = dateContext ? weekendProposalDate(messageText, now) : undefined;
+    const resolvedDateCandidate = resolveRelativePreferredDate(messageText, now);
+    const relativePreferredDate = (dateContext || hasStandaloneSchedulingDateIntent(messageText)) && !isIncidentalTimeQuestion(messageText)
+      ? resolvedDateCandidate
+      : undefined;
+    // A named service district is a small, deterministic customer fact.  Once
+    // a request has already been handed to a person, retain it before any
+    // provider turn so the operator sees it even if that turn later fails.
+    // This is deliberately limited to a known canonical district, not a
+    // best-effort address parser.
+    let backendHandoffLocationPersisted = false;
+    const knownHandoffDistrict = resolveKnownHandoffDistrict(messageText);
+    if (lead.humanNeeded && knownHandoffDistrict && lead.clientData.addressOrDistrict !== knownHandoffDistrict) {
+      lead.clientData = { ...lead.clientData, addressOrDistrict: knownHandoffDistrict };
+      backendHandoffLocationPersisted = true;
+      await dependencies.repository.saveLead(lead);
+      await dependencies.repository.appendActivity(lead.id, "handoff_location_recorded", { district: knownHandoffDistrict });
+    }
     const requestedTimeWindow = resolveTimeWindow(messageText);
     if (requestedTimeWindow && lead.clientData.preferredTimeWindow !== requestedTimeWindow) {
       lead.clientData = { ...lead.clientData, preferredTimeWindow: requestedTimeWindow };
       await dependencies.repository.saveLead(lead);
       await dependencies.repository.appendActivity(lead.id, "time_window_requested", { window: requestedTimeWindow });
+    }
+    const hasActiveDateProposal = Boolean(lead.pendingPreferredDate && lead.dateProposalExpiresAt && new Date(lead.dateProposalExpiresAt).getTime() > now.getTime());
+    if (hasActiveDateProposal && prefersSunday(messageText)) {
+      // Sunday is not a working day. Keep a single persisted, confirmable
+      // Saturday candidate rather than asking the customer to formulate it.
+      const saturday = nearestSaturday(now);
+      lead.pendingPreferredDate = saturday;
+      lead.dateProposalExpiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString();
+      lead.dateProposalVersion = randomUUID().replaceAll("-", "");
+      lead.dateProposalLocale = replyLanguage;
+      await dependencies.repository.saveLead(lead);
+      await dependencies.repository.appendActivity(lead.id, "date_proposed", { candidate: saturday, version: lead.dateProposalVersion, sunday_unavailable: true });
+      const delivered = await deliverReply({ updateId: update.update_id, lead, reply: renderWeekendProposal(replyLanguage, saturday, true), dependencies });
+      if (delivered !== "succeeded") { await dependencies.repository.markTelegramUpdateFailed(update.update_id, "telegram_delivery_failed"); return { kind: "failed", failureCode: "telegram_delivery_failed" }; }
+      await dependencies.repository.markTelegramUpdateProcessed(update.update_id);
+      return { kind: "processed" };
+    }
+    if (lead.pendingPreferredDate && lead.dateProposalExpiresAt && new Date(lead.dateProposalExpiresAt).getTime() > now.getTime() && isProposalConfirmation(messageText)) {
+      const nextClientData = mergeClientData(lead.clientData, { preferredDate: lead.pendingPreferredDate }, now);
+      if (pricingInputsChanged(lead.clientData, nextClientData)) supersedeQuote(lead, now);
+      lead.clientData = nextClientData;
+      clearDateProposal(lead);
+      await dependencies.repository.saveLead(lead);
+      await dependencies.repository.appendActivity(lead.id, "date_proposal_confirmed", { preferred_date: nextClientData.preferredDate });
+      const delivered = await deliverReply({ updateId: update.update_id, lead, reply: renderWeekendConfirmation(replyLanguage, nextClientData.preferredDate!), dependencies });
+      if (delivered !== "succeeded") { await dependencies.repository.markTelegramUpdateFailed(update.update_id, "telegram_delivery_failed"); return { kind: "failed", failureCode: "telegram_delivery_failed" }; }
+      await dependencies.repository.markTelegramUpdateProcessed(update.update_id);
+      return { kind: "processed" };
     }
     if (relativePreferredDate) {
       const nextClientData = mergeClientData(lead.clientData, { preferredDate: relativePreferredDate }, now);
@@ -262,19 +331,12 @@ export async function processTelegramWebhook(
       lead.dateProposalLocale = replyLanguage;
       await dependencies.repository.saveLead(lead);
       await dependencies.repository.appendActivity(lead.id, "date_proposed", { candidate: weekendDate, version: lead.dateProposalVersion });
-      const delivered = await deliverReply({ updateId: update.update_id, lead, reply: renderWeekendProposal(replyLanguage, weekendDate), dependencies });
+      const delivered = await deliverReply({ updateId: update.update_id, lead, reply: renderWeekendProposal(replyLanguage, weekendDate, prefersSunday(messageText)), dependencies });
       if (delivered !== "succeeded") { await dependencies.repository.markTelegramUpdateFailed(update.update_id, "telegram_delivery_failed"); return { kind: "failed", failureCode: "telegram_delivery_failed" }; }
       await dependencies.repository.markTelegramUpdateProcessed(update.update_id);
       return { kind: "processed" };
     }
-    if (lead.pendingPreferredDate && lead.dateProposalExpiresAt && new Date(lead.dateProposalExpiresAt).getTime() > now.getTime() && isProposalConfirmation(messageText)) {
-      const nextClientData = mergeClientData(lead.clientData, { preferredDate: lead.pendingPreferredDate }, now);
-      if (pricingInputsChanged(lead.clientData, nextClientData)) supersedeQuote(lead, now);
-      lead.clientData = nextClientData;
-      clearDateProposal(lead);
-      await dependencies.repository.saveLead(lead);
-      await dependencies.repository.appendActivity(lead.id, "date_proposal_confirmed", { preferred_date: nextClientData.preferredDate });
-    } else if (lead.pendingPreferredDate && (isProposalDecline(messageText) || (lead.dateProposalExpiresAt && new Date(lead.dateProposalExpiresAt).getTime() <= now.getTime()))) {
+    if (lead.pendingPreferredDate && (isProposalDecline(messageText) || (lead.dateProposalExpiresAt && new Date(lead.dateProposalExpiresAt).getTime() <= now.getTime()))) {
       clearDateProposal(lead);
       await dependencies.repository.saveLead(lead);
       await dependencies.repository.appendActivity(lead.id, "date_proposal_cleared");
@@ -284,7 +346,9 @@ export async function processTelegramWebhook(
     // Availability is a backend-owned scheduling intent. Keep an unambiguous,
     // qualified availability-only request out of the OpenAI and Trello paths:
     // neither provider is needed to calculate the next offered slots.
-    if ((isStrictTimeWindowRequest(messageText) || isStrictAvailabilityRequest(messageText)) && dependencies.calendarReservation && isEligibleForSlotReservation(lead) && !lead.calendarEventId) {
+    const strictSchedulingIntent = isStrictTimeWindowRequest(messageText) || isStrictAvailabilityRequest(messageText);
+    const explicitSchedulingIntent = strictSchedulingIntent || hasExplicitSchedulingIntent(messageText);
+    if (strictSchedulingIntent && dependencies.calendarReservation && isEligibleForSlotReservation(lead) && !lead.calendarEventId) {
       const offer = await dependencies.calendarReservation.offerSlots(lead, replyLanguage);
       if (!offer.ok && (
         offer.error === "duration_exceeds_workday" ||
@@ -314,7 +378,13 @@ export async function processTelegramWebhook(
 
     let conversation = await dependencies.repository.getConversation(lead.id);
     if (!conversation) {
-      const idempotencyKey = `openai:conversation:${lead.id}`;
+      // Each invalidated provider Conversation gets one new, durable creation
+      // operation. Reusing the original succeeded idempotency key would put
+      // the poisoned external id straight back into the next Runner turn.
+      const recoveryOperation = await dependencies.repository.getIntegrationOperation(`openai:conversation_recovery:${lead.id}`);
+      const idempotencyKey = recoveryOperation?.status === "succeeded"
+        ? `openai:conversation:${lead.id}:recovery:${update.update_id}`
+        : `openai:conversation:${lead.id}:initial`;
       const operation = await dependencies.repository.createIntegrationOperation({
         leadId: lead.id,
         idempotencyKey,
@@ -337,7 +407,19 @@ export async function processTelegramWebhook(
           openAiConversationId = created.id;
           await dependencies.repository.completeIntegrationOperation(idempotencyKey, created.id);
         } catch (error) {
+          // Evaluator limits are terminal control flow, not a disposable
+          // provider Conversation. Preserve their exact typed fence for the
+          // harness before any recovery/delivery side effect.
+          if (isEvaluatorControlFence(error)) throw error;
           await dependencies.repository.failIntegrationOperation(idempotencyKey, "openai_conversation_create_failed", "ambiguous");
+          if (isConversationTechnicalFailure(error)) {
+            return recoverTechnicalConversationFailure({
+              updateId: update.update_id,
+              lead,
+              replyLanguage,
+              dependencies,
+            });
+          }
           throw error;
         }
       }
@@ -349,8 +431,35 @@ export async function processTelegramWebhook(
       await dependencies.repository.saveConversation(conversation);
     }
 
+    // A quote calculated by this model turn is deliberately not sufficient to
+    // open Calendar availability. The customer must see the quote first and
+    // later make an explicit scheduling request. This protects the sequence
+    // even if a model tries to call both tools in one turn.
+    const hadActiveQuoteBeforeTurn = isEligibleForSlotReservation(lead);
+    const wasHumanNeededBeforeTurn = lead.humanNeeded;
+    // Supplying a date after an already active base quote changes scheduling
+    // readiness, not the price or booking state. Let the model save an
+    // additional valid fact if needed, but keep quote/availability/handoff
+    // tools out of this date-only turn.
+    const isDateOnlyQuoteFollowup = hadActiveQuoteBeforeTurn && Boolean(relativePreferredDate) && !explicitSchedulingIntent;
+    const allowedTools: AgentToolName[] = wasHumanNeededBeforeTurn
+      ? hasHandoffFollowupFact(messageText, relativePreferredDate)
+        ? ["update_client_data"]
+        : []
+      : isDateOnlyQuoteFollowup
+      ? ["update_client_data"]
+      : ["update_client_data", "mark_human_needed", "calculate_quote", ...(hadActiveQuoteBeforeTurn && explicitSchedulingIntent && !lead.calendarEventId ? ["request_available_slots" as const] : [])];
+    // A provider error can occur after a semantic tool has returned. Restore
+    // this exact snapshot before persisting recovery so partial quote/lifecycle
+    // or Human Needed mutations never become a later customer fact.
+    const persistedLeadBeforeTurn = structuredClone(lead);
     let quote: Quote | undefined;
     let humanNeededReason: HumanNeededReason | undefined;
+    let updateClientDataCalls = 0;
+    // Customer-facing Human Needed copy may claim a specific detail was saved
+    // only after this turn has proved a persisted data change. A raw message
+    // by itself is not such proof.
+    let persistedHandoffFact = wasHumanNeededBeforeTurn && (backendHandoffLocationPersisted || (Boolean(relativePreferredDate) && lead.clientData.preferredDate === relativePreferredDate));
     let calendarFailure = false;
     let noAvailableSlots = false;
     let offeredSlots: AvailabilitySlot[] | undefined;
@@ -362,12 +471,14 @@ export async function processTelegramWebhook(
       operationType: "run_turn",
     });
     if (!agentTurnOperation.isNew && agentTurnOperation.status !== "succeeded") {
-      lead.humanNeeded = true;
-      lead.humanNeededReason = "conversation_ambiguous";
-      await dependencies.repository.saveLead(lead);
-      throw new Error("OpenAI agent turn requires manual recovery");
+      // A failed or ambiguous technical turn is not a customer-supported
+      // escalation reason. Do not reuse its server-managed Conversation and do
+      // not manufacture a Human Needed label; recovery must start from a
+      // separately diagnosed technical boundary.
+      throw new Error("OpenAI agent turn is not reusable after technical failure");
     }
     let turn: AgentTurn;
+    let quoteCalculatedThisTurn = false;
     try {
       turn = await dependencies.agent.runTurn({
       conversationId: conversation.openAiConversationId,
@@ -375,15 +486,27 @@ export async function processTelegramWebhook(
       replyLanguage,
       message: messageText,
       knownClientData: lead.clientData,
+      pricingRules: config.pricingRules,
+      allowedTools,
       executeTool: async (name, argumentsJson) => {
+        if (quoteCalculatedThisTurn) {
+          return { ok: false, error: "quote_is_terminal_for_customer_turn" };
+        }
+        if (!allowedTools.includes(name)) return { ok: false, error: "tool_not_available_for_customer_turn" };
         if (name === "update_client_data") {
+          if (updateClientDataCalls >= 1) return { ok: false, error: "client_data_update_limit_reached" };
+          updateClientDataCalls += 1;
           const updateData = updateClientDataSchema.safeParse(argumentsJson);
           if (!updateData.success) return { ok: false, error: "invalid_client_data_patch" };
           const patch = clientDataPatchSchema.safeParse(normalizeCustomerDatePatch(updateData.data.patch, now));
           if (!patch.success) return { ok: false, error: "invalid_client_data_patch" };
+          const previousClientData = lead.clientData;
           const nextClientData = mergeClientData(lead.clientData, patch.data, now);
           if (pricingInputsChanged(lead.clientData, nextClientData)) supersedeQuote(lead, now);
           lead.clientData = nextClientData;
+          if (wasHumanNeededBeforeTurn && JSON.stringify(previousClientData) !== JSON.stringify(nextClientData)) {
+            persistedHandoffFact = true;
+          }
           return { ok: true, client_data: lead.clientData };
         }
 
@@ -396,6 +519,9 @@ export async function processTelegramWebhook(
 
         if (name === "request_available_slots") {
           if (!dependencies.calendarReservation) return { ok: false, error: "calendar_not_configured" };
+          if (!hadActiveQuoteBeforeTurn || !explicitSchedulingIntent || lead.calendarEventId) {
+            return { ok: false, error: "availability_requires_prior_active_quote_and_explicit_scheduling_intent" };
+          }
           const result = await dependencies.calendarReservation.offerSlots(lead, replyLanguage);
           if (!result.ok && (
             result.error === "duration_exceeds_workday" ||
@@ -424,6 +550,7 @@ export async function processTelegramWebhook(
         const decision = calculatePricingDecision(lead.clientData, config.pricingRules);
         if (decision.kind === "quote") {
           quote = decision.quote;
+          quoteCalculatedThisTurn = true;
           return { ok: true, kind: "quote", quote: { amountRsd: quote.amountRsd } };
         }
         if (decision.kind === "human_needed") {
@@ -435,8 +562,32 @@ export async function processTelegramWebhook(
       });
       await dependencies.repository.completeIntegrationOperation(agentTurnOperation.idempotencyKey);
     } catch (error) {
+      if (isEvaluatorControlFence(error)) throw error;
       await dependencies.repository.failIntegrationOperation(agentTurnOperation.idempotencyKey, "openai_agent_turn_failed", "ambiguous");
+      Object.assign(lead, persistedLeadBeforeTurn);
+      await dependencies.repository.saveLead(lead);
+      if (isConversationTechnicalFailure(error)) {
+        return recoverTechnicalConversationFailure({ updateId: update.update_id, lead, replyLanguage, dependencies });
+      }
       throw error;
+    }
+
+    // A validated oversized area is a backend-owned boundary, independent of
+    // whether the model chose to calculate a quote or ask for a handoff.
+    // This runs only after a successful turn, so failed-turn rollback remains
+    // authoritative.
+    const backendPricingDecision = calculatePricingDecision(lead.clientData, config.pricingRules);
+    if (backendPricingDecision.kind === "human_needed") {
+      humanNeededReason = backendPricingDecision.reason;
+      quote = undefined;
+    }
+
+    const recoveryMarker = await dependencies.repository.getIntegrationOperation(`openai:conversation_recovery:${lead.id}`);
+    if (recoveryMarker?.status === "succeeded") {
+      // Existing durable operations provide the recovery fence without a new
+      // schema field. A successful fresh turn resets the consecutive-failure
+      // marker for a later independent incident.
+      await dependencies.repository.failIntegrationOperation(recoveryMarker.idempotencyKey, "conversation_recovered", "failed");
     }
 
     if (humanNeededReason) {
@@ -457,24 +608,33 @@ export async function processTelegramWebhook(
     }
     await dependencies.repository.saveLead(lead);
 
-    // Lead completeness, not whether the model happened to call a pricing
-    // tool, is authoritative. The model may persist a partial patch and then
-    // emit generic prose; every non-terminal turn must still say exactly what
-    // remains before a quote can be calculated.
-    const deterministicMissingReply = !offeredSlots && !noAvailableSlots && !quote && !humanNeededReason
-      ? missingDetailsReply(lead.clientData, config.pricingRules, replyLanguage, true)
+    // Pricing and side effects remain backend-owned, but ordinary intake must
+    // stay conversational. Previously every incomplete turn was overwritten
+    // with a full missing-field checklist, even when the agent had already
+    // answered the customer's actual question. Use a deterministic prompt only
+    // when model prose is absent, unsafe, or in the wrong locale.
+    const conversationalReply = !wasHumanNeededBeforeTurn && !offeredSlots && !noAvailableSlots && !quote && !humanNeededReason
+      ? normalIntakeReply(turn.reply, lead.clientData, config.pricingRules, replyLanguage)
       : undefined;
     const reply = offeredSlots
       ? renderSlotOfferReply(replyLanguage, offeredSlots)
       : noAvailableSlots
       ? renderNoAvailabilityReply(replyLanguage)
       : quote && !humanNeededReason
-      ? renderQuoteReply(replyLanguage, quote.amountRsd)
+      ? renderQuoteReply(replyLanguage, quote.amountRsd, quoteReplyOptions(lead.clientData, config.pricingRules))
+      : wasHumanNeededBeforeTurn
+      ? isHumanHandoffQuestion(messageText)
+        ? renderHumanNeededAlreadyHandedOffReply(replyLanguage)
+        : renderHumanNeededUpdateReply(
+          replyLanguage,
+          humanNeededFollowupDetail(messageText, replyLanguage, relativePreferredDate),
+          persistedHandoffFact,
+        )
       : humanNeededReason
       ? calendarFailure
         ? renderCalendarReservationFailedReply(replyLanguage)
         : renderHumanNeededReply(replyLanguage)
-      : deterministicMissingReply
+      : conversationalReply
       ?? renderAgentReply(turn.reply, replyLanguage);
     const deliveryOutcome = await deliverReply({
       updateId: update.update_id,
@@ -513,6 +673,10 @@ export async function processTelegramWebhook(
     await dependencies.repository.markTelegramUpdateProcessed(update.update_id);
     return { kind: "processed" };
   } catch (error) {
+    // The local paid-evaluation harness has a typed resource fence. Do not
+    // relabel a refused request as a Telegram processing error: the evaluator
+    // must retain its checkpoint and mark the suite `incomplete`.
+    if (isEvaluatorControlFence(error)) throw error;
     // The response must remain safe for Telegram, but production diagnostics
     // need a non-sensitive reason to distinguish a provider/configuration
     // failure from a delivery retry. Never log message text, customer data,
@@ -558,8 +722,10 @@ export function resolveRelativePreferredDate(message: string, now: Date): string
     if (isValidIsoDate(value) && value >= belgradeDate(now)) return value;
     return undefined;
   }
-  const russianNamedDate = resolveRussianNamedDate(normalized, now);
-  if (russianNamedDate) return russianNamedDate;
+  const namedDate = resolveNamedDate(normalized, now);
+  if (namedDate) return namedDate;
+  const weekdayDate = resolveWeekdayDate(normalized, now);
+  if (weekdayDate) return weekdayDate;
   const aliases: Array<[RegExp, number]> = [
     [/(?:^|\s)сегодня(?:$|\s|[,.!])/u, 0], [/(?:^|\s)завтра(?:$|\s|[,.!])/u, 1], [/(?:^|\s)послезавтра(?:$|\s|[,.!])/u, 2],
     [/(?:^|\s)today(?:$|\s|[,.!])/u, 0], [/(?:^|\s)tomorrow(?:$|\s|[,.!])/u, 1], [/(?:^|\s)the day after tomorrow(?:$|\s|[,.!])/u, 2],
@@ -577,13 +743,33 @@ export function resolveRelativePreferredDate(message: string, now: Date): string
   return base.toISOString().slice(0, 10);
 }
 
+/** Resolve a named weekday to its next occurrence in Belgrade. */
+function resolveWeekdayDate(normalized: string, now: Date): string | undefined {
+  const weekdays: Array<[RegExp, number]> = [
+    [/(?:^|\s)thursday(?:$|\s|[,.!])/u, 4], [/(?:^|\s)четверг(?:$|\s|[,.!])/u, 4], [/(?:^|\s)četvrtak(?:$|\s|[,.!])/u, 4], [/(?:^|\s)четвртак(?:$|\s|[,.!])/u, 4],
+    [/(?:^|\s)monday(?:$|\s|[,.!])/u, 1], [/(?:^|\s)понедельник(?:$|\s|[,.!])/u, 1], [/(?:^|\s)ponedeljak(?:$|\s|[,.!])/u, 1],
+    [/(?:^|\s)tuesday(?:$|\s|[,.!])/u, 2], [/(?:^|\s)вторник(?:$|\s|[,.!])/u, 2], [/(?:^|\s)utorak(?:$|\s|[,.!])/u, 2],
+    [/(?:^|\s)wednesday(?:$|\s|[,.!])/u, 3], [/(?:^|\s)среда(?:$|\s|[,.!])/u, 3], [/(?:^|\s)sreda(?:$|\s|[,.!])/u, 3],
+    [/(?:^|\s)friday(?:$|\s|[,.!])/u, 5], [/(?:^|\s)пятница(?:$|\s|[,.!])/u, 5], [/(?:^|\s)petak(?:$|\s|[,.!])/u, 5],
+    [/(?:^|\s)saturday(?:$|\s|[,.!])/u, 6], [/(?:^|\s)суббота(?:$|\s|[,.!])/u, 6], [/(?:^|\s)subota(?:$|\s|[,.!])/u, 6],
+  ];
+  const target = weekdays.find(([pattern]) => pattern.test(normalized))?.[1];
+  if (target === undefined) return undefined;
+  const today = belgradeDate(now);
+  const date = new Date(`${today}T00:00:00.000Z`);
+  const delta = (target - date.getUTCDay() + 7) % 7;
+  date.setUTCDate(date.getUTCDate() + delta);
+  return date.toISOString().slice(0, 10);
+}
+
 /**
- * Resolves a customer-facing Russian date such as "26 августа" without
+ * Resolves a customer-facing Russian or Serbian date such as "26 августа"
+ * or "26. avgusta" without
  * making a customer type an artificial year. An omitted year means the next
  * occurrence of that calendar date in Belgrade; an explicit past year is not
  * silently rewritten.
  */
-function resolveRussianNamedDate(normalized: string, now: Date): string | undefined {
+function resolveNamedDate(normalized: string, now: Date): string | undefined {
   const months: Record<string, number> = {
     января: 1, январь: 1, янв: 1,
     февраля: 2, февраль: 2, фев: 2,
@@ -597,12 +783,30 @@ function resolveRussianNamedDate(normalized: string, now: Date): string | undefi
     октября: 10, октябрь: 10, окт: 10,
     ноября: 11, ноябрь: 11, ноя: 11,
     декабря: 12, декабрь: 12, дек: 12,
+    januar: 1, januara: 1, јануар: 1, јануара: 1,
+    februar: 2, februara: 2, фебруар: 2, фебруара: 2,
+    mart: 3, marta: 3,
+    april: 4, aprila: 4, април: 4, априла: 4,
+    maj: 5, maja: 5, мај: 5, маја: 5,
+    jun: 6, juna: 6, јун: 6, јуна: 6,
+    jul: 7, jula: 7, јул: 7, јула: 7,
+    avgust: 8, avgusta: 8,
+    septembar: 9, septembra: 9, септембар: 9, септембра: 9,
+    oktobar: 10, oktobra: 10, октобар: 10, октобра: 10,
+    novembar: 11, novembra: 11, новембар: 11, новембра: 11,
+    decembar: 12, decembra: 12, децембар: 12, децембра: 12,
+    january: 1, february: 2, march: 3, may: 5, june: 6,
+    july: 7, august: 8, september: 9, october: 10, november: 11, december: 12,
   };
   const monthTokens = Object.keys(months).join("|");
-  const match = normalized.match(new RegExp(`(?:^|[^\\p{L}\\d])(\\d{1,2})\\s+(${monthTokens})(?:\\s+(\\d{4})(?:\\s*г(?:ода)?\\.?)?)?(?=$|[^\\p{L}\\d])`, "u"));
-  if (!match) return undefined;
+  const dayMonth = normalized.match(new RegExp(`(?:^|[^\\p{L}\\d])(\\d{1,2})\\.?\\s+(${monthTokens})(?:[,.]?\\s+(\\d{4})(?:\\s*г(?:ода)?\\.?)?)?(?=$|[^\\p{L}\\d])`, "u"));
+  const monthDay = normalized.match(new RegExp(`(?:^|[^\\p{L}\\d])(${monthTokens})\\s+(\\d{1,2})(?:,?\\s+(\\d{4}))?(?=$|[^\\p{L}\\d])`, "u"));
+  if (!dayMonth && !monthDay) return undefined;
 
-  const [, dayText, monthText, explicitYear] = match;
+  const dayText = dayMonth?.[1] ?? monthDay?.[2];
+  const monthText = dayMonth?.[2] ?? monthDay?.[1];
+  const explicitYear = dayMonth?.[3] ?? monthDay?.[3];
+  if (!dayText || !monthText) return undefined;
   const month = months[monthText];
   if (!month) return undefined;
   const today = belgradeDate(now);
@@ -641,6 +845,10 @@ function isAmbiguousMessage(value: string): boolean {
 function weekendProposalDate(message: string, now: Date): string | undefined {
   const normalized = message.normalize("NFKC").toLocaleLowerCase();
   if (!/(?:на\s+выходных|weekend|za\s+vikend|за\s+викенд|за\s+викенд)/u.test(normalized)) return undefined;
+  return nearestSaturday(now);
+}
+
+function nearestSaturday(now: Date): string {
   const today = belgradeDate(now);
   const date = new Date(`${today}T00:00:00.000Z`);
   const day = date.getUTCDay();
@@ -650,7 +858,10 @@ function weekendProposalDate(message: string, now: Date): string | undefined {
 }
 
 function isProposalConfirmation(message: string): boolean {
-  return /^(?:yes|yeah|yep|да|ага|подходит|подойдет|može|moze|da|може|да)$/iu.test(message.trim());
+  const normalized = message.normalize("NFKC").toLocaleLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").replace(/\s+/gu, " ").trim();
+  if (/^(?:yes|yeah|yep|да|ага|подходит|подойдет|može|moze|da|може)$/iu.test(normalized)) return true;
+  return /(?:^|\s)(?:да|ага|yes|yeah|yep|da|može|moze|може)(?:\s|$)/iu.test(normalized) &&
+    /(?:подходит|подойдет|works?|odgovara|подходи)/iu.test(normalized);
 }
 
 function isProposalDecline(message: string): boolean {
@@ -664,11 +875,24 @@ function clearDateProposal(lead: StoredLead): void {
   lead.dateProposalLocale = undefined;
 }
 
-function renderWeekendProposal(language: ReplyLanguage, date: string): TelegramRenderedReply {
-  const formatted = new Intl.DateTimeFormat(isRussianLanguage(language) ? "ru-RU" : isSerbianLanguage(language) ? "sr-Latn-RS" : "en-GB", { timeZone: "Europe/Belgrade", weekday: "long", day: "numeric", month: "long" }).format(new Date(`${date}T12:00:00.000Z`));
-  if (isRussianLanguage(language)) return { text: `Ближайшая суббота, ${formatted}. Вам подойдет эта дата?` };
-  if (isSerbianLanguage(language)) return { text: `Najbliža subota je ${formatted}. Da li vam odgovara?` };
-  return { text: `The nearest Saturday is ${formatted}. Would that work for you?` };
+function renderWeekendProposal(language: ReplyLanguage, date: string, sundayUnavailable = false): TelegramRenderedReply {
+  const locale = isRussianLanguage(language) ? "ru-RU" : isSerbianLanguage(language) ? "sr-Latn-RS" : "en-GB";
+  const formatted = new Intl.DateTimeFormat(locale, { timeZone: "Europe/Belgrade", day: "numeric", month: "long" }).format(new Date(`${date}T12:00:00.000Z`));
+  if (isRussianLanguage(language)) return { text: `${sundayUnavailable ? "В воскресенье мы не работаем. " : ""}Ближайшая суббота, ${formatted}. Вам подойдет эта дата?`, provenance: "template" };
+  if (isSerbianLanguage(language)) return { text: `${sundayUnavailable ? "Nedeljom ne radimo. " : ""}Najbliža subota je ${formatted}. Da li vam odgovara?`, provenance: "template" };
+  return { text: `${sundayUnavailable ? "We do not work on Sundays. " : ""}The nearest Saturday is ${formatted}. Would that work for you?`, provenance: "template" };
+}
+
+function renderWeekendConfirmation(language: ReplyLanguage, date: string): TelegramRenderedReply {
+  const locale = isRussianLanguage(language) ? "ru-RU" : isSerbianLanguage(language) ? "sr-Latn-RS" : "en-GB";
+  const formatted = new Intl.DateTimeFormat(locale, { timeZone: "Europe/Belgrade", day: "numeric", month: "long" }).format(new Date(`${date}T12:00:00.000Z`));
+  if (isRussianLanguage(language)) return { text: `Записал уборку на субботу, ${formatted}. Когда будете готовы, можно будет подобрать свободное время.`, provenance: "template" };
+  if (isSerbianLanguage(language)) return { text: `Zabeležio sam čišćenje za subotu, ${formatted}. Kada budete spremni, možemo izabrati slobodan termin.`, provenance: "template" };
+  return { text: `I have noted the cleaning for ${formatted}. When you are ready, we can choose a free time.`, provenance: "template" };
+}
+
+function prefersSunday(message: string): boolean {
+  return /(?:воскресень|sunday|nedelj|недељ)/iu.test(message);
 }
 
 function resolveTimeWindow(message: string): "morning" | "midday" | "evening" | undefined {
@@ -699,43 +923,95 @@ function isStrictTimeWindowRequest(message: string): boolean {
  * so data collection remains deterministic.
  */
 function isStrictAvailabilityRequest(message: string): boolean {
-  const text = message.normalize("NFKC").trim().toLocaleLowerCase().replace(/[!?.,]+/gu, " ").replace(/\s+/gu, " ");
+  const text = message.normalize("NFKC").trim().toLocaleLowerCase().replace(/[!?.,]+/gu, " ").replace(/\s+/gu, " ").trim();
   if (!text || /\d|\bm\s*²?\b|комнат|сануз|квадрат|kupatil|soba|bathroom|rooms?/iu.test(text)) return false;
   return [
-    /^(?:please )?(?:show|see|check|find|what are|any|available|free|nearest)(?: me)? (?:the )?(?:available |free |nearest )?(?:slots?|times?|availability)$/iu,
+    // A brief "yes" is a natural acceptance of the immediately preceding
+    // quote. Keep it in the backend-only path when the rest is an otherwise
+    // standalone availability request, so a customer does not need to repeat
+    // their booking details just to proceed.
+    /^(?:(?:yes|sure),? )?(?:please )?(?:show|see|check|find|what are|any|available|free|nearest)(?: me)? (?:the )?(?:available |free |nearest )?(?:slots?|times?|availability)(?: again)?$/iu,
     /^(?:покажи|покажите|провер[ья]й|какие|есть|свободн(?:ое|ые)|ближайш(?:ее|ие))(?: мне)? (?:свободн(?:ое|ые) |ближайш(?:ее|ие) )?(?:слоты|время|термины)$/iu,
     /^(?:pokaži|pokazite|proveri|koji su|ima li|slobodn(?:i|e)|najbliži) (?:mi )?(?:slobodn(?:i|e) |najbliži )?(?:termin(?:i|e|a)?|slotovi|vreme)$/iu,
     /^(?:покажи|покажите|провери|који су|има ли|слободн(?:и|е)|најближи) (?:ми )?(?:слободн(?:и|е) |најближи )?(?:термин(?:и|е|а)?|слотови|време)$/iu,
   ].some((pattern) => pattern.test(text));
 }
 
-function missingDetailsReply(data: ClientData, pricingRules: StoredAgentConfig["pricingRules"], language: ReplyLanguage, didSaveData: boolean): TelegramRenderedReply | undefined {
+/** A clear scheduling request may use a natural phrase that is too rich for the fast path. */
+function hasExplicitSchedulingIntent(message: string): boolean {
+  const text = message.normalize("NFKC").toLocaleLowerCase();
+  return /(?:\b(?:slot|slots|availability|available time|free time|show .*time|schedule|book(?:ing)?|term(?:in|ini|ine|ina)?|termin|slobodno vreme|zakaz)\b|время|термин|слот|заброн|расписан)/iu.test(text)
+    || /(?:утром|дн[её]м|вечером|morning|midday|afternoon|evening|ujutru|popodne|uveče|увече|поподне)/iu.test(text);
+}
+
+function normalIntakeReply(
+  agentReply: string,
+  data: ClientData,
+  pricingRules: StoredAgentConfig["pricingRules"],
+  language: ReplyLanguage,
+): TelegramRenderedReply {
+  if (isUsableAgentReply(agentReply, language)) return renderAgentReply(agentReply, language);
+  return nextMissingDetailsReply(data, pricingRules, language);
+}
+
+function isUsableAgentReply(reply: string, language: ReplyLanguage): boolean {
+  const normalized = reply.trim();
+  if (normalized.length === 0 || normalized.length > 1_000 || !/[\p{L}]/u.test(normalized)) return false;
+  // The renderer can safely strip isolated Markdown, HTML, UUIDs and internal
+  // words while preserving useful prose. A stock acknowledgement, however,
+  // makes the conversation feel like a form and has no customer value.
+  if (/^(?:thanks|thank you|(?<!\p{L})спасибо(?!\p{L})|(?<!\p{L})хвала(?!\p{L})|hvala)/iu.test(normalized)) return false;
+  const cyrillicLetters = (normalized.match(/[\u0400-\u052f]/g) ?? []).length;
+  const latinLetters = (normalized.match(/[A-Za-zČĆŠŽĐčćšžđ]/g) ?? []).length;
+  if (language === "en" || language === "sr-Latn") {
+    if (cyrillicLetters > 0) return false;
+  } else if (latinLetters > 0 && cyrillicLetters === 0) return false;
+  return isFocusedModelIntakeFollowup(normalized);
+}
+
+function nextMissingDetailsReply(data: ClientData, pricingRules: StoredAgentConfig["pricingRules"], language: ReplyLanguage): TelegramRenderedReply {
   const decision = calculatePricingDecision(data, pricingRules);
-  if (decision.kind !== "missing_data") return undefined;
-  const fields = decision.missingFields.map((field) => missingFieldLabel(field, language));
-  const requested = joinNatural(fields, language);
-  if (isRussianLanguage(language)) return { text: `${didSaveData ? "Спасибо, я это отметил. " : ""}Ещё нужны ${requested}.` };
-  if (isSerbianLanguage(language)) return { text: serbianMissingDetails(language, didSaveData, requested) };
-  return { text: `${didSaveData ? "Thanks, I’ve noted that. " : ""}I still need ${requested}.` };
-}
-
-function missingFieldLabel(field: string, language: ReplyLanguage): string {
-  const ru: Record<string, string> = { cleaningType: "тип уборки", areaM2: "площадь в м²", rooms: "количество комнат", bathrooms: "количество санузлов", addressOrDistrict: "адрес или район", preferredDate: "подходящая дата", heavyPetHair: "есть ли сильная шерсть животных", extras: "нужны ли дополнительные услуги" };
-  const srLatin: Record<string, string> = { cleaningType: "vrsta čišćenja", areaM2: "površina u m²", rooms: "broj soba", bathrooms: "broj kupatila", addressOrDistrict: "adresa ili kraj", preferredDate: "željeni datum", heavyPetHair: "da li ima mnogo dlaka kućnih ljubimaca", extras: "dodatne usluge" };
-  const srCyrl: Record<string, string> = { cleaningType: "врста чишћења", areaM2: "површина у м²", rooms: "број соба", bathrooms: "број купатила", addressOrDistrict: "адреса или крај", preferredDate: "жељени датум", heavyPetHair: "да ли има много длака кућних љубимаца", extras: "додатне услуге" };
-  const en: Record<string, string> = { cleaningType: "the cleaning type", areaM2: "the area in m²", rooms: "the number of rooms", bathrooms: "the number of bathrooms", addressOrDistrict: "the address or district", preferredDate: "a preferred date", heavyPetHair: "whether there is heavy pet hair", extras: "any extra services" };
-  return (isRussianLanguage(language) ? ru : isSerbianCyrillic(language) ? srCyrl : isSerbianLanguage(language) ? srLatin : en)[field] ?? field;
-}
-
-function joinNatural(values: string[], language: ReplyLanguage): string {
-  if (values.length <= 1) return values[0] ?? "details";
-  const conjunction = isRussianLanguage(language) ? "и" : isSerbianLanguage(language) ? "i" : "and";
-  return values.length === 2 ? `${values[0]} ${conjunction} ${values[1]}` : `${values.slice(0, -1).join(", ")} ${conjunction} ${values.at(-1)}`;
-}
-
-function serbianMissingDetails(language: ReplyLanguage, didSaveData: boolean, requested: string): string {
-  if (isSerbianCyrillic(language)) return `${didSaveData ? "Хвала, забележио сам то. " : ""}Још су ми потребни ${requested}.`;
-  return `${didSaveData ? "Hvala, zabeležio sam to. " : ""}Još su mi potrebni ${requested}.`;
+  if (decision.kind !== "missing_data") return renderAgentReply("Could you tell me a little more about the cleaning?", language);
+  const missing = new Set<string>(decision.missingFields);
+  const has = (field: string) => missing.has(field);
+  if (isSerbianLanguage(language)) {
+    const text = has("cleaningType") && has("areaM2")
+      ? ["Da li vam treba standardno ili detaljno čišćenje, i kolika je približno površina?", "Да ли вам треба стандардно или детаљно чишћење, и колика је приближно површина?"]
+      : has("cleaningType")
+      ? ["Koja vrsta čišćenja vam treba?", "Која врста чишћења вам треба?"]
+      : has("areaM2")
+      ? ["Kolika je približno površina stana?", "Колика је приближно површина стана?"]
+      : has("rooms") && has("bathrooms")
+      ? ["Koliko soba i kupatila ima stan?", "Колико соба и купатила има стан?"]
+      : has("rooms")
+      ? ["Koliko soba ima stan?", "Колико соба има стан?"]
+      : has("bathrooms")
+      ? ["Koliko kupatila ima stan?", "Колико купатила има стан?"]
+      : has("heavyPetHair") && has("extras")
+      ? ["Da li ima mnogo dlaka kućnih ljubimaca ili su potrebne dodatne usluge?", "Да ли има много длака кућних љубимаца или су потребне додатне услуге?"]
+      : has("heavyPetHair")
+      ? ["Da li ima mnogo dlaka kućnih ljubimaca?", "Да ли има много длака кућних љубимаца?"]
+      : has("extras")
+      ? ["Da li su potrebne dodatne usluge?", "Да ли су потребне додатне услуге?"]
+      : has("addressOrDistrict") && has("preferredDate")
+      ? ["U kom delu grada je stan i koji datum bi vam odgovarao?", "У ком делу града је стан и који датум би вам одговарао?"]
+      : has("addressOrDistrict")
+      ? ["U kom delu grada je stan?", "У ком делу града је стан?"]
+      : ["Koji datum bi vam odgovarao?", "Који датум би вам одговарао?"];
+    return { text: isSerbianCyrillic(language) ? text[1] : text[0], provenance: "template" };
+  }
+  if (has("cleaningType") && has("areaM2")) return { text: isRussianLanguage(language) ? "Какой тип уборки нужен и какая примерно площадь?" : "What type of cleaning do you need, and roughly how large is the place?", provenance: "template" };
+  if (has("cleaningType")) return { text: isRussianLanguage(language) ? "Какой тип уборки нужен?" : "What type of cleaning do you need?", provenance: "template" };
+  if (has("areaM2")) return { text: isRussianLanguage(language) ? "Какая примерно площадь квартиры?" : "Roughly how large is the place?", provenance: "template" };
+  if (has("rooms") && has("bathrooms")) return { text: isRussianLanguage(language) ? "Сколько комнат и санузлов в квартире?" : "How many rooms and bathrooms are there?", provenance: "template" };
+  if (has("rooms")) return { text: isRussianLanguage(language) ? "Сколько комнат в квартире?" : "How many rooms are there?", provenance: "template" };
+  if (has("bathrooms")) return { text: isRussianLanguage(language) ? "Сколько санузлов в квартире?" : "How many bathrooms are there?", provenance: "template" };
+  if (has("heavyPetHair") && has("extras")) return { text: isRussianLanguage(language) ? "Есть ли сильная шерсть животных или нужны дополнительные услуги?" : "Is there heavy pet hair, or would you like any extra services?", provenance: "template" };
+  if (has("heavyPetHair")) return { text: isRussianLanguage(language) ? "Есть ли сильная шерсть животных?" : "Is there heavy pet hair?", provenance: "template" };
+  if (has("extras")) return { text: isRussianLanguage(language) ? "Нужны дополнительные услуги?" : "Would you like any extra services?", provenance: "template" };
+  if (has("addressOrDistrict") && has("preferredDate")) return { text: isRussianLanguage(language) ? "В каком районе квартира и на какую дату вам удобно запланировать уборку?" : "Which district is it in, and what date would suit you for the cleaning?", provenance: "template" };
+  if (has("addressOrDistrict")) return { text: isRussianLanguage(language) ? "В каком районе квартира?" : "Which district is the apartment in?", provenance: "template" };
+  return { text: isRussianLanguage(language) ? "На какую дату вам удобно запланировать уборку?" : "What date would suit you for the cleaning?", provenance: "template" };
 }
 
 async function reserveSelectedSlot(input: {
@@ -821,7 +1097,9 @@ async function finalizeReservationBooking(input: {
   const delivered = await deliverReply({
     updateId: input.updateId,
     lead: input.lead,
-    reply: renderReservationPendingReply(input.replyLanguage),
+    reply: renderReservationPendingReply(input.replyLanguage, input.lead.assignedTeam && input.lead.bookedStart && input.lead.quote
+      ? { team: input.lead.assignedTeam, start: input.lead.bookedStart, quoteAmountRsd: input.lead.quote.amountRsd }
+      : undefined),
     kind: "reservation_pending",
     dependencies: input.dependencies,
   });
@@ -870,11 +1148,14 @@ async function markReservationDeliveryFailure(
   await dependencies.repository.appendActivity(lead.id, "calendar_reservation_delivery_failed", { outcome });
 }
 
-function parseSlotSelection(message: string): { index: number; replyLanguage: ReplyLanguage } | undefined {
+function parseSlotSelection(message: string): { index: number; replyLanguage?: ReplyLanguage } | undefined {
   const normalized = message.trim().toLowerCase();
-  if (/^(?:1|one|first|option 1)$/.test(normalized)) return { index: 0, replyLanguage: "en" };
-  if (/^(?:2|two|second|option 2)$/.test(normalized)) return { index: 1, replyLanguage: "en" };
-  if (/^(?:3|three|third|option 3)$/.test(normalized)) return { index: 2, replyLanguage: "en" };
+  if (/^1$/.test(normalized)) return { index: 0 };
+  if (/^2$/.test(normalized)) return { index: 1 };
+  if (/^3$/.test(normalized)) return { index: 2 };
+  if (/^(?:one|first|option 1)$/.test(normalized)) return { index: 0, replyLanguage: "en" };
+  if (/^(?:two|second|option 2)$/.test(normalized)) return { index: 1, replyLanguage: "en" };
+  if (/^(?:three|third|option 3)$/.test(normalized)) return { index: 2, replyLanguage: "en" };
   if (/^(?:первый|первая|первую|первый вариант|вариант 1)$/.test(normalized)) return { index: 0, replyLanguage: "ru" };
   if (/^(?:второй|вторая|вторую|второй вариант|вариант 2)$/.test(normalized)) return { index: 1, replyLanguage: "ru" };
   if (/^(?:третий|третья|третью|третий вариант|вариант 3)$/.test(normalized)) return { index: 2, replyLanguage: "ru" };
@@ -988,6 +1269,7 @@ async function deliverReply(input: {
       chatId: input.lead.telegramChatId,
       text: input.reply.text,
       replyMarkup: input.reply.replyMarkup ?? newAddressKeyboard,
+      provenance: input.reply.provenance,
     });
     await input.dependencies.repository.completeIntegrationOperation(idempotencyKey, sent.messageId);
     return "succeeded";
@@ -1011,13 +1293,22 @@ function mergeClientData(current: ClientData, patch: ClientData, now: Date): Cli
 }
 
 function normalizeUrgency(data: ClientData, now: Date): ClientData {
-  if (!data.preferredDate || !isValidIsoDate(data.preferredDate)) return data;
+  if (!data.preferredDate || !isValidIsoDate(data.preferredDate)) {
+    const withoutUrgency = { ...data };
+    delete withoutUrgency.urgency;
+    return withoutUrgency;
+  }
+  if (data.preferredDate !== belgradeDate(now)) {
+    const withoutUrgency = { ...data };
+    delete withoutUrgency.urgency;
+    return withoutUrgency;
+  }
   return {
     ...data,
     // The date is the only source of truth. This also repairs older leads
     // whose model patch left urgency empty and overwrites an outdated value
     // whenever the customer changes the requested date.
-    urgency: data.preferredDate === belgradeDate(now) ? "same_day" : "standard",
+    urgency: "same_day",
   };
 }
 
@@ -1046,7 +1337,104 @@ function isEligibleForSlotReservation(lead: StoredLead): boolean {
   return lead.status === "qualified" &&
     lead.quote !== undefined &&
     lead.quoteValidity === "active" &&
-    !lead.humanNeeded;
+    !lead.humanNeeded &&
+    typeof lead.clientData.preferredDate === "string";
+}
+
+function isHumanHandoffQuestion(message: string): boolean {
+  return /(?:человек|команд[ае]|переда[йт]|(?<!\p{L})(?:human|person|someone|team|osob[au]|tim)(?!\p{L}))/iu.test(message);
+}
+
+function hasCleaningOrSchedulingContext(message: string, lead: StoredLead): boolean {
+  if (lead.clientData.cleaningType || lead.clientData.areaM2 || lead.clientData.addressOrDistrict || lead.clientData.rooms || lead.clientData.bathrooms || lead.quote) return true;
+  return /(?:уборк|clean(?:ing)?|čišćen|ciscen|чи[шш]ћењ|чишћ|booking|book|schedule|termin|zakaz|слот|термин|время|дата)/iu.test(message);
+}
+
+function isIncidentalTimeQuestion(message: string): boolean {
+  return /(?:погод|weather|vreme|време)/iu.test(message) && /(?:сегодня|today|danas|данас)/iu.test(message);
+}
+
+function hasStandaloneSchedulingDateIntent(message: string): boolean {
+  return /(?:\b\d{1,2}\.\d{1,2}\.\d{2,4}\b|\b(?:in\s+(?:\d+|one|two|three)\s+days?|thursday)\b|через\s+(?:\d+|один|одну|два|две|три)\s+дн|\d{1,2}\.?\s+(?:январ|феврал|март|апрел|мая|июн|июл|август|сентябр|октябр|ноябр|декабр|avgust|septembar|january|february|march|april|may|june|july|august|september|october|november|december)|(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2})/iu.test(message);
+}
+
+/** A Human Needed follow-up may update one concrete fact, never run tools for a pure question. */
+function hasHandoffFollowupFact(message: string, resolvedDate: string | undefined): boolean {
+  if (resolvedDate) return true;
+  if (/[0-9]+\s*(?:m2|m²|м²|метр|kvadrat)/iu.test(message)) return true;
+  if (isLikelyPunctuationlessQuestion(message)) return false;
+  return /(?:комнат|сануз|площад|район|адрес|окн|духовк|балкон|террас|шерст|after renovation|office|commercial|sofa|carpet|stains?|wool|staff kitchen|rooms?|bathrooms?|area|district|window|oven|balcony|pet hair|soba|kupatil|površin|dodatn|dlak)/iu.test(message) && !/\?\s*$/u.test(message.trim());
+}
+
+function resolveKnownHandoffDistrict(message: string): "New Belgrade" | undefined {
+  return /(?:\bnew\s+belgrade\b|нов(?:ый|ом)\s+белград(?:у|а)?)/iu.test(message)
+    ? "New Belgrade"
+    : undefined;
+}
+
+/** Customer questions often omit a question mark in chat; do not expose an update tool for them. */
+function isLikelyPunctuationlessQuestion(message: string): boolean {
+  const normalized = message.normalize("NFKC").trim().toLocaleLowerCase();
+  return /^(?:can|could|do|does|is|are|what|which|how)\b/u.test(normalized)
+    || /^(?:можете|можешь|есть\s+ли|нужны\s+ли|какой|какие|сколько|подскажите|будет\s+ли)/u.test(normalized)
+    || /^(?:da\s+li|možete|mozes|imate\s+li|koji|koliko)/u.test(normalized);
+}
+
+function humanNeededFollowupDetail(message: string, language: ReplyLanguage, resolvedDate: string | undefined): string | undefined {
+  const lower = message.toLocaleLowerCase();
+  const russian = isRussianLanguage(language);
+  const serbian = isSerbianLanguage(language);
+  if (/(?:цен|стоим|price|cost|cena|цена)/u.test(lower)) {
+    return russian ? "Автоматически точную цену для такой заявки не считаю, команда подготовит её вручную"
+      : serbian ? "Automatski obračun nije dostupan za ovakav zahtev; tim će pripremiti cenu ručno"
+      : "An automatic price is not available for this request; our team will prepare it manually";
+  }
+  if (resolvedDate || /(?:август|сентябр|январ|феврал|март|апрел|мая|июн|июл|октябр|ноябр|декабр|avgust|septembar|januar|februar|mart|april|maj|jun|jul|oktobar|novembar|decembar)/u.test(lower)) {
+    return russian ? "Желаемую дату записал в заявку"
+      : serbian ? "Željeni datum sam zabeležio uz zahtev"
+      : "I have recorded the requested date on your request";
+  }
+  if (resolveKnownHandoffDistrict(message)) {
+    return russian ? "Район Новый Белград добавил к заявке"
+      : serbian ? "Novi Beograd sam dodao uz zahtev"
+      : "I have added New Belgrade to your request";
+  }
+  if (/(?:sofa|диван|stains?|пятн)/u.test(lower) && !/(?:carpet|ков[её]р|wool|шерстян)/u.test(lower)) {
+    return russian ? "Состояние дивана и пятна добавил к заявке"
+      : serbian ? "Stanje sofe i fleke sam dodao uz zahtev"
+      : "I have added the sofa condition and stains to your request";
+  }
+  if (/(?:carpet|ков[её]р|wool|шерстян)/u.test(lower) && !/(?:sofa|диван|stains?|пятн)/u.test(lower)) {
+    return russian ? "Материал ковра добавил к заявке"
+      : serbian ? "Materijal tepiha sam dodao uz zahtev"
+      : "I have added the carpet material to your request";
+  }
+  if (/(?:sofa|carpet|диван|ков[её]р)/u.test(lower)) {
+    return russian ? "Состояние дивана и ковра добавил к заявке"
+      : serbian ? "Stanje sofe i tepiha sam dodao uz zahtev"
+      : "I have added the sofa and carpet condition to your request";
+  }
+  if (/(?:staff kitchen|office|commercial|офис|коммерческ|кухн(?:я|и) для сотрудников)/u.test(lower)) {
+    return russian ? "Детали коммерческого помещения добавил к заявке"
+      : serbian ? "Detalje poslovnog prostora sam dodao uz zahtev"
+      : "I have added the commercial space details to your request";
+  }
+  if (/(?:комнат|сануз|rooms?|bathrooms?|soba|kupatil)/u.test(lower)) {
+    return russian ? "Количество комнат и санузлов добавил к заявке"
+      : serbian ? "Broj soba i kupatila sam dodao uz zahtev"
+      : "I have added the room and bathroom details to your request";
+  }
+  if (/(?:окн|духовк|балкон|террас|шерст|window|oven|balcony|pet hair|dodatn|dlak)/u.test(lower)) {
+    return russian ? "Дополнительные услуги и особенности уборки добавил к заявке"
+      : serbian ? "Dodatne usluge i posebnosti čišćenja sam dodao uz zahtev"
+      : "I have added the extra services and cleaning details to your request";
+  }
+  if (/(?:площад|район|адрес|area|district|address|površin|deo grada|kraj grada)/u.test(lower)) {
+    return russian ? "Площадь и адрес добавил к заявке"
+      : serbian ? "Površinu i lokaciju sam dodao uz zahtev"
+      : "I have added the area and location to your request";
+  }
+  return undefined;
 }
 
 function pricingInputsChanged(current: ClientData, next: ClientData): boolean {
@@ -1056,6 +1444,78 @@ function pricingInputsChanged(current: ClientData, next: ClientData): boolean {
     current.heavyPetHair !== next.heavyPetHair ||
     current.urgency !== next.urgency ||
     !sameExtras(current.extras, next.extras);
+}
+
+/** A date-less quote is a standard-price estimate, not a scheduling offer. */
+function quoteReplyOptions(clientData: ClientData, pricingRules: PricingRules): { sameDayAmountRsd?: number } {
+  if (clientData.preferredDate) return {};
+  const sameDay = calculatePricingDecision({ ...clientData, urgency: "same_day" }, pricingRules);
+  return sameDay.kind === "quote" ? { sameDayAmountRsd: sameDay.quote.amountRsd } : {};
+}
+
+/**
+ * A provider Conversation is disposable after any typed technical failure,
+ * including creation. This first recovery changes no customer business state:
+ * the deterministic resend is marked processed only after Telegram delivery.
+ */
+async function recoverTechnicalConversationFailure(input: {
+  updateId: number;
+  lead: StoredLead;
+  replyLanguage: ReplyLanguage;
+  dependencies: Stage2Dependencies;
+}): Promise<TelegramWebhookResult> {
+  const { updateId, lead, replyLanguage, dependencies } = input;
+  await dependencies.repository.invalidateConversation(lead.id);
+  const recoveryKey = `openai:conversation_recovery:${lead.id}`;
+  const previousRecovery = await dependencies.repository.getIntegrationOperation(recoveryKey);
+  if (previousRecovery?.status === "succeeded") {
+    lead.humanNeeded = true;
+    lead.humanNeededReason = "conversation_ambiguous";
+    await dependencies.repository.saveLead(lead);
+    const delivered = await deliverReply({ updateId, lead, reply: renderHumanNeededReply(replyLanguage), dependencies });
+    if (delivered === "succeeded") {
+      await dependencies.repository.markTelegramUpdateProcessed(updateId);
+      return { kind: "processed" };
+    }
+    await dependencies.repository.markTelegramUpdateFailed(updateId, "telegram_delivery_failed");
+    return { kind: "failed", failureCode: "telegram_delivery_failed" };
+  }
+  const recoveryMarker = await dependencies.repository.createIntegrationOperation({
+    leadId: lead.id,
+    idempotencyKey: recoveryKey,
+    provider: "openai",
+    operationType: "conversation_recovery_marker",
+  });
+  if (recoveryMarker.isNew || recoveryMarker.status !== "succeeded") {
+    await dependencies.repository.completeIntegrationOperation(recoveryKey);
+  }
+  await dependencies.repository.appendActivity(lead.id, "conversation_invalidated_after_technical_turn", { outcome: "first_recovery" });
+  await dependencies.repository.saveLead(lead);
+  const delivered = await deliverReply({ updateId, lead, reply: renderTechnicalResendReply(replyLanguage), dependencies });
+  if (delivered === "succeeded") {
+    await dependencies.repository.markTelegramUpdateProcessed(updateId);
+    return { kind: "processed" };
+  }
+  await dependencies.repository.markTelegramUpdateFailed(updateId, "telegram_delivery_failed");
+  return { kind: "failed", failureCode: "telegram_delivery_failed" };
+}
+
+function isConversationTechnicalFailure(error: unknown): boolean {
+  return error instanceof AgentTurnTechnicalError ||
+    (error instanceof Error && /(?:max_turns|customer_turn_deadline|scenario_deadline|agent_turn_aborted)/iu.test(error.message));
+}
+
+/** Evaluator limits must never become a customer-visible recovery resend. */
+function isEvaluatorControlFence(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("code" in error)) return false;
+  const code = (error as { code?: unknown }).code;
+  return code === "provider_response_budget_exceeded_before_request_221" ||
+    code === "live_suite_deadline_exceeded" ||
+    code === "scenario_deadline_exceeded" ||
+    code === "customer_turn_deadline_exceeded" ||
+    code === "input_token_cap_exceeded" ||
+    code === "output_token_cap_exceeded" ||
+    code === "total_token_cap_exceeded";
 }
 
 function sameExtras(current: ClientData["extras"], next: ClientData["extras"]): boolean {
@@ -1082,10 +1542,17 @@ function dropNullValues(value: Record<string, unknown>): Record<string, unknown>
  */
 function normalizeCustomerDatePatch(patch: Record<string, unknown>, now: Date): Record<string, unknown> {
   const normalized = dropNullValues(patch);
-  if (typeof normalized.preferredDate === "string" && !isValidIsoDate(normalized.preferredDate)) {
-    const resolved = resolveRelativePreferredDate(normalized.preferredDate, now);
-    if (resolved) normalized.preferredDate = resolved;
-    else delete normalized.preferredDate;
+  if (typeof normalized.preferredDate === "string") {
+    if (isValidIsoDate(normalized.preferredDate)) {
+      // A model may echo a stale ISO date even after the webhook already
+      // resolved today's or a future requested date. Never let that overwrite
+      // validated current/future customer intent.
+      if (normalized.preferredDate < belgradeDate(now)) delete normalized.preferredDate;
+    } else {
+      const resolved = resolveRelativePreferredDate(normalized.preferredDate, now);
+      if (resolved) normalized.preferredDate = resolved;
+      else delete normalized.preferredDate;
+    }
   }
   return normalized;
 }

@@ -20,8 +20,6 @@ const requiredQuoteFields: Array<keyof ClientData> = [
   "heavyPetHair",
   "extras",
   "addressOrDistrict",
-  "preferredDate",
-  "urgency",
 ];
 
 type CompleteClientData = ClientData & Required<Pick<ClientData, (typeof requiredQuoteFields)[number]>>;
@@ -52,6 +50,12 @@ export function calculatePricingDecision(
   clientData: ClientData,
   rules: PricingRules = defaultPricingRules,
 ): PricingDecision {
+  // Oversized properties always require a human estimate. This decision is
+  // intentionally made before ordinary quote completeness so the webhook can
+  // escalate as soon as a validated area crosses the supported boundary.
+  if (clientData.areaM2 !== undefined && clientData.areaM2 > 200) {
+    return { kind: "human_needed", reason: "area_over_200_m2" };
+  }
   const missingFields = requiredQuoteFields.filter((field) => !hasValue(clientData[field]));
 
   if (missingFields.length > 0) {
@@ -59,11 +63,7 @@ export function calculatePricingDecision(
   }
 
   const completeData = clientData as CompleteClientData;
-  const { areaM2, cleaningType, bathrooms, heavyPetHair, extras: selectedExtras, urgency } = completeData;
-
-  if (areaM2 > 200) {
-    return { kind: "human_needed", reason: "area_over_200_m2" };
-  }
+  const { areaM2, cleaningType, bathrooms, heavyPetHair, extras: selectedExtras } = completeData;
 
   const areaHundredths = Math.round(areaM2 * 100);
   if (!Number.isSafeInteger(areaHundredths) || Math.abs(areaM2 * 100 - areaHundredths) >= 1e-7) {
@@ -84,7 +84,10 @@ export function calculatePricingDecision(
     (bathroomSurchargeRsd + petHairSurchargeRsd + extrasSurchargeRsd) * 10_000;
   let denominator = 10_000;
 
-  if (urgency === "same_day") {
+  // A quote is useful before the customer has chosen a date.  The standard
+  // price is therefore the default; webhook date normalization is the only
+  // place that can opt into the same-day multiplier.
+  if (clientData.urgency === "same_day") {
     numerator *= rules.sameDayMultiplierPercent;
     denominator *= 100;
   }
@@ -98,7 +101,7 @@ export function calculatePricingDecision(
       bathroomSurchargeRsd,
       petHairSurchargeRsd,
       extrasSurchargeRsd,
-      sameDayApplied: urgency === "same_day",
+      sameDayApplied: clientData.urgency === "same_day",
       pricingRulesVersion: rules.version,
     },
   };

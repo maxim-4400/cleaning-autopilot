@@ -2,46 +2,58 @@ import type { AvailabilitySlot } from "@/lib/contracts/domain";
 import type { TelegramAnyReplyMarkup, TelegramInlineKeyboardMarkup } from "@/lib/telegram/gateway";
 import { isRussianLanguage, isSerbianCyrillic, isSerbianLanguage, type ReplyLocale } from "@/lib/telegram/language";
 
-export type TelegramRenderedReply = { text: string; replyMarkup?: TelegramAnyReplyMarkup };
+/** Provenance is a renderer contract, never inferred from customer-visible text. */
+export type TelegramRenderedReply = { text: string; replyMarkup?: TelegramAnyReplyMarkup; provenance: "agent" | "template" };
 
 const telegramTextLimit = 4096;
 
 export function renderAgentReply(reply: string, language: string): TelegramRenderedReply {
   const safeText = truncateTelegramText(stripRawMarkdown(stripUnsafeArtifacts(reply)));
-  return { text: escapePlainText(safeText && isAgentReplyLocaleCompatible(safeText, language) ? safeText : fallbackAgentReply(language)) };
+  return { text: escapePlainText(safeText && isAgentReplyLocaleCompatible(safeText, language) ? safeText : fallbackAgentReply(language)), provenance: "agent" };
 }
 
-export function renderQuoteReply(language: string, amountRsd: number): TelegramRenderedReply {
-  const amount = `${new Intl.NumberFormat("en-US").format(amountRsd)} RSD`;
+export function renderQuoteReply(language: string, amountRsd: number, options: { sameDayAmountRsd?: number } = {}): TelegramRenderedReply {
+  const amount = formatRsdAmount(language, amountRsd);
+  const sameDayAmount = options.sameDayAmountRsd === undefined ? undefined : formatRsdAmount(language, options.sameDayAmountRsd);
+  if (sameDayAmount) {
+    if (isSerbianLanguage(language)) return { text: serbianText(language,
+      `<b>Redovna cena: ${amount}</b>\n\nAko je čišćenje potrebno danas, cena je ${sameDayAmount} (+20%). Kada izaberete datum, mogu da proverim slobodno vreme.`,
+      `<b>Редовна цена: ${amount}</b>\n\nАко је чишћење потребно данас, цена је ${sameDayAmount} (+20%). Када изаберете датум, могу да проверим слободно време.`,
+    ), provenance: "template" };
+    return isRussianLanguage(language)
+      ? { text: `<b>Обычная цена уборки: ${amount}</b>\n\nЕсли уборка нужна сегодня, будет ${sameDayAmount} (+20%). Когда выберете дату, я проверю свободное время.`, provenance: "template" }
+      : { text: `<b>The standard price: ${amount}</b>\n\nIf you need the cleaning today, it is ${sameDayAmount} (+20%). Once you choose a date, I can check free times.`, provenance: "template" };
+  }
   if (isSerbianLanguage(language)) {
     return { text: serbianText(language,
-      `<b>Čišćenje bi koštalo ${amount}</b>\n\nAko vam odgovara, mogu da pokažem najbliže slobodne termine.`,
-      `<b>Чишћење би коштало ${amount}</b>\n\nАко вам одговара, могу да покажем најближе слободне термине.`,
-    ) };
+      `<b>Cena čišćenja: ${amount}</b>\n\nAko vam odgovara, mogu da pokažem najbliže slobodne termine.`,
+      `<b>Цена чишћења: ${amount}</b>\n\nАко вам одговара, могу да покажем најближе слободне термине.`,
+    ), provenance: "template" };
   }
   return isRussianLanguage(language)
-    ? { text: `<b>Уборка будет стоить ${amount}</b>\n\nЕсли всё подходит, я покажу ближайшее свободное время.` }
-    : { text: `<b>Your cleaning would cost ${amount}</b>\n\nIf that works for you, I can show the nearest available times.` };
+    ? { text: `<b>Стоимость уборки: ${amount}</b>\n\nЕсли всё подходит, я покажу ближайшее свободное время.`, provenance: "template" }
+    : { text: `<b>Your cleaning would cost: ${amount}</b>\n\nIf that works for you, I can show the nearest available times.`, provenance: "template" };
 }
 
 export function renderSlotOfferReply(language: string, slots: AvailabilitySlot[]): TelegramRenderedReply {
   const header = isSerbianLanguage(language)
-    ? serbianText(language, "<b>Najbliži slobodni termini</b>\nIzaberite dugme ispod ili odgovorite brojem opcije:", "<b>Најближи слободни термини</b>\nИзаберите дугме испод или одговорите бројем опције:")
+    ? serbianText(language, "<b>Najbliži slobodni termini</b>\nIzaberite dugme ispod ili odgovorite brojem opcije.", "<b>Најближи слободни термини</b>\nИзаберите дугме испод или одговорите бројем опције.")
     : isRussianLanguage(language)
     ? "<b>Ближайшее свободное время</b>\nВыберите кнопку ниже или ответьте номером варианта."
     : "<b>Nearest available times</b>\nChoose a button below, or reply with an option number.";
-  const options = slots.map((slot) => `${slot.displayOrder}. ${escapePlainText(slot.label)}`).join("\n");
-  return { text: `${header}\n\n${options}`, replyMarkup: slotKeyboard(slots, replyLocaleForKeyboard(language)) };
+  const options = slots.map((slot) => `${slot.displayOrder}. ${escapePlainText(slot.label)}.`).join("\n");
+  return { text: `${header}\n\n${options}`, replyMarkup: slotKeyboard(slots, replyLocaleForKeyboard(language)), provenance: "template" };
 }
 
-export function renderReservationPendingReply(language: string): TelegramRenderedReply {
+export function renderReservationPendingReply(language: string, booking?: { team: "team_a" | "team_b"; start: string; quoteAmountRsd: number }): TelegramRenderedReply {
+  const details = booking ? bookingDetails({ language, ...booking }) : undefined;
   if (isSerbianLanguage(language)) return { text: serbianText(language,
-    "<b>Vaš termin je rezervisan.</b>\n\nPripremićemo konačnu potvrdu koristeći već dogovorene detalje.",
-    "<b>Ваш термин је резервисан.</b>\n\nПрипремићемо коначну потврду користећи већ договорене детаље.",
-  ) };
+    `<b>Vaš termin je potvrđen.</b>${details ? `\n\n${details}` : ""}\n\nZahtev je sačuvan i prosleđen timu.`,
+    `<b>Ваш термин је потврђен.</b>${details ? `\n\n${details}` : ""}\n\nЗахтев је сачуван и прослеђен тиму.`,
+  ), provenance: "template" };
   return isRussianLanguage(language)
-    ? { text: "<b>Время зарезервировано.</b>\n\nМы подготовим финальное подтверждение и продолжим с уже согласованными деталями." }
-    : { text: "<b>Your time is reserved.</b>\n\nWe’ll prepare the final confirmation using the details already agreed." };
+    ? { text: `<b>Время подтверждено.</b>${details ? `\n\n${details}` : ""}\n\nЗаявка сохранена и передана команде.`, provenance: "template" }
+    : { text: `<b>Your time is confirmed.</b>${details ? `\n\n${details}` : ""}\n\nYour request is saved and with our team.`, provenance: "template" };
 }
 
 // Kept for callers compiled against the Stage 3 renderer. Stage 4 booking
@@ -61,64 +73,163 @@ export function renderBookingConfirmedReply(input: {
   if (isSerbianLanguage(language)) return { text: serbianText(language,
     `<b>Vaše čišćenje je potvrđeno.</b>\n\n${details}\n\nNaš tim ima sve potrebne detalje i videćemo se u dogovorenom terminu.`,
     `<b>Ваше чишћење је потврђено.</b>\n\n${details}\n\nНаш тим има све потребне детаље и видимо се у договореном термину.`,
-  ) };
+  ), provenance: "template" };
   return isRussianLanguage(language)
-    ? { text: `<b>Ваша уборка подтверждена.</b>\n\n${details}\n\nУ нашей команды есть все детали. Увидимся в согласованное время.` }
-    : { text: `<b>Your cleaning is confirmed.</b>\n\n${details}\n\nOur team has all the details, and we’ll see you at the agreed time.` };
+    ? { text: `<b>Ваша уборка подтверждена.</b>\n\n${details}\n\nУ нашей команды есть все детали. Увидимся в согласованное время.`, provenance: "template" }
+    : { text: `<b>Your cleaning is confirmed.</b>\n\n${details}\n\nOur team has all the details, and we’ll see you at the agreed time.`, provenance: "template" };
 }
 
 export function renderBookingManualReviewReply(language: string): TelegramRenderedReply {
   if (isSerbianLanguage(language)) return { text: serbianText(language,
     "Vaš zahtev je kod našeg tima na ručnoj proveri. Nećemo praviti dalja automatska ažuriranja.",
     "Ваш захтев је код нашег тима на ручној провери. Нећемо правити даља аутоматска ажурирања.",
-  ) };
+  ), provenance: "template" };
   return isRussianLanguage(language)
-    ? { text: "Ваша заявка передана команде на ручную проверку. Дальше мы не будем вносить автоматические изменения." }
-    : { text: "Your request is with our team for manual review. We will not make further automatic changes." };
+    ? { text: "Ваша заявка передана команде на ручную проверку. Дальше мы не будем вносить автоматические изменения.", provenance: "template" }
+    : { text: "Your request is with our team for manual review. We will not make further automatic changes.", provenance: "template" };
 }
 
 export function renderCalendarReservationFailedReply(language: string): TelegramRenderedReply {
   if (isSerbianLanguage(language)) return { text: serbianText(language,
     "Nismo mogli bezbedno da potvrdimo taj termin. Naš tim će nastaviti zahtev sa već podeljenim detaljima.",
     "Нисмо могли безбедно да потврдимо тај термин. Наш тим ће наставити захтев са већ подељеним детаљима.",
-  ) };
+  ), provenance: "template" };
   return isRussianLanguage(language)
-    ? { text: "Этот вариант уже нельзя безопасно подтвердить. Мы продолжим заявку вручную и сохраним все детали." }
-    : { text: "We could not safely confirm that time. Our team will continue the request with the details already shared." };
+    ? { text: "Этот вариант уже нельзя безопасно подтвердить. Мы продолжим заявку вручную и сохраним все детали.", provenance: "template" }
+    : { text: "We could not safely confirm that time. Our team will continue the request with the details already shared.", provenance: "template" };
 }
 
 export function renderHumanNeededReply(language: string): TelegramRenderedReply {
   if (isSerbianLanguage(language)) return { text: serbianText(language,
-    "Hvala. Proslediću detalje našem timu da sve pažljivo pregleda.",
-    "Хвала. Проследићу детаље нашем тиму да све пажљиво прегледа.",
-  ) };
+    "Sačuvaću detalje i proslediti ih našem timu da sve pažljivo pregleda.",
+    "Сачуваћу детаље и проследити их нашем тиму да све пажљиво прегледа.",
+  ), provenance: "template" };
   return isRussianLanguage(language)
-    ? { text: "Спасибо, я сохраню детали и передам заявку нашей команде, чтобы всё проверить внимательно." }
-    : { text: "Thank you — I’ll pass the details to our team so they can review everything carefully." };
+    ? { text: "Я сохраню детали и передам заявку нашей команде, чтобы всё проверить внимательно.", provenance: "template" }
+    : { text: "I’ll save the details and pass the request to our team so they can review everything carefully.", provenance: "template" };
+}
+
+/** A later detail may help the team, but it must not look like a second handoff. */
+export function renderHumanNeededUpdateReply(language: string, detail?: string, persisted = false): TelegramRenderedReply {
+  // Price availability is an answer, not a claim that a fact was persisted.
+  // Every other detail that says "added" or "recorded" needs explicit
+  // webhook proof of a validated data change.
+  const informationalDetail = /(?:автоматически точную цену|automatski obračun|automatic price)/iu.test(detail ?? "");
+  if (detail && (persisted || informationalDetail)) {
+    if (isSerbianLanguage(language)) return { text: serbianText(language,
+      `${detail}. Naš tim već vodi sledeći korak.`,
+      `${detail}. Наш тим већ води следећи корак.`,
+    ), provenance: "template" };
+    return isRussianLanguage(language)
+      ? { text: `${detail}. Команда уже ведёт следующий шаг.`, provenance: "template" }
+      : { text: `${detail}. Our team is already handling the next step.`, provenance: "template" };
+  }
+  if (detail && !persisted) return renderUnpersistedHumanNeededDetailReply(language, detail);
+  if (isSerbianLanguage(language)) return { text: serbianText(language,
+    "Naš tim već prati sledeći korak i proveriće ovaj detalj.",
+    "Наш тим већ прати следећи корак и провериће овај детаљ.",
+  ), provenance: "template" };
+  return isRussianLanguage(language)
+    ? { text: "Команда уже ведёт следующий шаг и проверит эту деталь.", provenance: "template" }
+    : { text: "Our team is already handling the next step and will review that detail.", provenance: "template" };
+}
+
+/** Keep a later Human Needed reply contextual without claiming an unproven write. */
+function renderUnpersistedHumanNeededDetailReply(language: string, detail: string): TelegramRenderedReply {
+  const lower = detail.toLocaleLowerCase();
+  const kind = /(?:sofa|диван|sofe)/u.test(lower)
+    ? "sofa"
+    : /(?:carpet|ков[её]р|tepih)/u.test(lower)
+    ? "carpet"
+    : /(?:commercial|офис|poslovn)/u.test(lower)
+    ? "commercial"
+    : /(?:date|дат|datum)/u.test(lower)
+    ? "date"
+    : "detail";
+  if (isSerbianLanguage(language)) {
+    const latin = kind === "sofa" ? "Naš tim će proveriti stanje sofe i fleke."
+      : kind === "carpet" ? "Naš tim će proveriti materijal tepiha."
+      : kind === "commercial" ? "Naš tim će proveriti detalje poslovnog prostora."
+      : kind === "date" ? "Naš tim će proveriti željeni datum."
+      : "Naš tim će proveriti ovaj detalj.";
+    const cyrillic = kind === "sofa" ? "Наш тим ће проверити стање софе и флеке."
+      : kind === "carpet" ? "Наш тим ће проверити материјал тепиха."
+      : kind === "commercial" ? "Наш тим ће проверити детаље пословног простора."
+      : kind === "date" ? "Наш тим ће проверити жељени датум."
+      : "Наш тим ће проверити овај детаљ.";
+    return { text: serbianText(language, latin, cyrillic), provenance: "template" };
+  }
+  if (isRussianLanguage(language)) {
+    const text = kind === "sofa" ? "Команда проверит состояние дивана и пятна."
+      : kind === "carpet" ? "Команда проверит материал ковра."
+      : kind === "commercial" ? "Команда проверит детали коммерческого помещения."
+      : kind === "date" ? "Команда проверит желаемую дату."
+      : "Команда проверит эту деталь.";
+    return { text, provenance: "template" };
+  }
+  const text = kind === "sofa" ? "Our team will review the sofa condition and stains."
+    : kind === "carpet" ? "Our team will review the carpet material."
+    : kind === "commercial" ? "Our team will review the commercial-space details."
+    : kind === "date" ? "Our team will review the requested date."
+    : "Our team will review that detail.";
+  return { text, provenance: "template" };
+}
+
+/** Direct answer after the first legitimate handoff; never starts a second one. */
+export function renderHumanNeededAlreadyHandedOffReply(language: string): TelegramRenderedReply {
+  if (isSerbianLanguage(language)) return { text: serbianText(language,
+    "Da, zahtev je već prosleđen našem timu. Tim će videti i ovu poruku.",
+    "Да, захтев је већ прослеђен нашем тиму. Тим ће видети и ову поруку.",
+  ), provenance: "template" };
+  return isRussianLanguage(language)
+    ? { text: "Да, заявку уже передали команде. Команда увидит и это сообщение.", provenance: "template" }
+    : { text: "Yes, your request has already been passed to our team. The team will see this message too.", provenance: "template" };
+}
+
+/** A reserved lead is terminal for automated customer-turn processing. */
+export function renderReservedAcknowledgementReply(language: string): TelegramRenderedReply {
+  if (isSerbianLanguage(language)) return { text: serbianText(language,
+    "Hvala. Termin je već rezervisan; naš tim će se javiti ako bude potrebno još nešto.",
+    "Хвала. Термин је већ резервисан; наш тим ће се јавити ако буде потребно још нешто.",
+  ), provenance: "template" };
+  return isRussianLanguage(language)
+    ? { text: "Пожалуйста. Время уже зарезервировано; команда напишет, если понадобится что-то ещё.", provenance: "template" }
+    : { text: "You’re welcome. Your time is already reserved; our team will message if anything else is needed.", provenance: "template" };
 }
 
 export function renderStaleSlotReply(language: string): TelegramRenderedReply {
   if (isSerbianLanguage(language)) return { text: serbianText(language,
     "Ta opcija više nije dostupna. Pošaljite poruku i proveriću nove termine.",
     "Та опција више није доступна. Пошаљите поруку и проверићу нове термине.",
-  ) };
+  ), provenance: "template" };
   return isRussianLanguage(language)
-    ? { text: "Этот вариант больше недоступен. Напишите, и я проверю новое свободное время." }
-    : { text: "That option is no longer available. Send me a message and I’ll check fresh times." };
+    ? { text: "Этот вариант больше недоступен. Напишите, и я проверю новое свободное время.", provenance: "template" }
+    : { text: "That option is no longer available. Send me a message and I’ll check fresh times.", provenance: "template" };
 }
 
 export function renderNoAvailabilityReply(language: string): TelegramRenderedReply {
   if (isSerbianLanguage(language)) return { text: serbianText(language,
     "U naredne dve nedelje nema odgovarajućeg slobodnog termina. Naš tim će pomoći da pronađe alternativu.",
     "У наредне две недеље нема одговарајућег слободног термина. Наш тим ће помоћи да пронађе алтернативу.",
-  ) };
+  ), provenance: "template" };
   return isRussianLanguage(language)
-    ? { text: "В ближайшие две недели подходящего свободного времени пока нет. Наша команда поможет найти другой вариант." }
-    : { text: "There isn’t a suitable free time in the next two weeks. Our team will help find an alternative." };
+    ? { text: "В ближайшие две недели подходящего свободного времени пока нет. Наша команда поможет найти другой вариант.", provenance: "template" }
+    : { text: "There isn’t a suitable free time in the next two weeks. Our team will help find an alternative.", provenance: "template" };
 }
 
 export function renderNewAddressDivider(language: string): TelegramRenderedReply {
-  return { text: isRussianLanguage(language) ? "Новый адрес уборки" : "New cleaning location" };
+  return { text: isRussianLanguage(language) ? "Новый адрес уборки" : "New cleaning location", provenance: "template" };
+}
+
+/** A technical retry is not a customer handoff and never asks for all facts again. */
+export function renderTechnicalResendReply(language: string): TelegramRenderedReply {
+  if (isSerbianLanguage(language)) return { text: serbianText(language,
+    "Poslednja poruka nije mogla bezbedno da se obradi. Sve ranije potvrđene detalje smo sačuvali. Pošaljite poslednju poruku još jednom.",
+    "Последња порука није могла безбедно да се обради. Сачували смо све раније потврђене детаље. Пошаљите последњу поруку још једном.",
+  ), provenance: "template" };
+  return isRussianLanguage(language)
+    ? { text: "Последнее сообщение не удалось безопасно обработать. Все ранее подтверждённые детали сохранены. Пожалуйста, отправьте последнее сообщение ещё раз.", provenance: "template" }
+    : { text: "Your last message could not be processed safely. We kept the details already confirmed. Please send that last message again.", provenance: "template" };
 }
 
 function slotKeyboard(slots: AvailabilitySlot[], language: ReplyLocale): TelegramInlineKeyboardMarkup {
@@ -162,12 +273,12 @@ function truncateTelegramText(value: string): string {
 
 function fallbackAgentReply(language: string): string {
   if (isSerbianLanguage(language)) return serbianText(language,
-    "Hvala. Zabeležio sam to. Možete li podeliti još malo detalja?",
-    "Хвала. Забележио сам то. Можете ли поделити још мало детаља?",
+    "Mogu da pomognem oko čišćenja. Šta biste želeli da organizujete?",
+    "Могу да помогнем око чишћења. Шта бисте желели да организујете?",
   );
   return isRussianLanguage(language)
-    ? "Спасибо, я всё отметил. Подскажите, пожалуйста, немного подробнее?"
-    : "Thanks. I’ve noted that. Could you share a little more detail?";
+    ? "Помогу с уборкой. Что вы хотите уточнить или организовать?"
+    : "I can help with the cleaning. What would you like to arrange?";
 }
 
 function isAgentReplyLocaleCompatible(reply: string, language: string): boolean {
@@ -197,14 +308,51 @@ function bookingDetails(input: { language: string; team: "team_a" | "team_b"; st
     : isSerbianLanguage(input.language)
     ? `Tim ${input.team === "team_a" ? "A" : "B"}`
     : `Team ${input.team === "team_a" ? "A" : "B"}`;
-  const when = new Intl.DateTimeFormat(locale, {
-    timeZone: "Europe/Belgrade", weekday: "long", day: "numeric", month: "long", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  const date = new Intl.DateTimeFormat(locale, {
+    timeZone: "Europe/Belgrade", weekday: "long", day: "numeric", month: "long",
+  }).format(new Date(input.start));
+  const time = new Intl.DateTimeFormat(locale, {
+    timeZone: "Europe/Belgrade", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
   }).format(new Date(input.start));
   const quote = `${new Intl.NumberFormat(locale).format(input.quoteAmountRsd)} RSD`;
-  if (isRussianLanguage(input.language)) return `${team} приедет ${when}. Стоимость ${quote}.`;
-  if (isSerbianCyrillic(input.language)) return `${team} долази ${when}. Цена је ${quote}.`;
-  if (isSerbianLanguage(input.language)) return `${team} dolazi ${when}. Cena je ${quote}.`;
-  return `${team} will arrive ${when}. The price is ${quote}.`;
+  if (isRussianLanguage(input.language)) return `${team} приедет ${russianArrivalDate(date)}, в ${time}. Стоимость: ${quote}.`;
+  if (isSerbianCyrillic(input.language)) return `${team} долази ${serbianArrivalDate(date, true)}, у ${time}. Цена: ${quote}.`;
+  if (isSerbianLanguage(input.language)) return `${team} dolazi ${serbianArrivalDate(date, false)}, u ${time}. Cena: ${quote}.`;
+  return `${team} will arrive on ${date}, at ${time}. The price: ${quote}.`;
+}
+
+function russianArrivalDate(date: string): string {
+  const inflected = date
+    .replace(/^воскресенье/iu, "в воскресенье")
+    .replace(/^понедельник/iu, "в понедельник")
+    .replace(/^вторник/iu, "во вторник")
+    .replace(/^среда/iu, "в среду")
+    .replace(/^четверг/iu, "в четверг")
+    .replace(/^пятница/iu, "в пятницу")
+    .replace(/^суббота/iu, "в субботу");
+  return inflected;
+}
+
+function serbianArrivalDate(date: string, cyrillic: boolean): string {
+  const replacements = cyrillic
+    ? [["недеља", "недељу"], ["среда", "среду"], ["субота", "суботу"]]
+    : [["nedelja", "nedelju"], ["sreda", "sredu"], ["subota", "subotu"]];
+  const inflectedWeekday = replacements.reduce((value, [from, to]) => value.replace(new RegExp(`^${from}`, "iu"), to), date);
+  const inflected = cyrillic
+    ? inflectedWeekday.replace(/август/iu, "августа")
+    : inflectedWeekday.replace(/avgust/iu, "avgusta");
+  return `u ${inflected}`;
+}
+
+function formatRsdAmount(language: string, amountRsd: number): string {
+  const locale = isRussianLanguage(language)
+    ? "ru-RU"
+    : isSerbianCyrillic(language)
+    ? "sr-Cyrl-RS"
+    : isSerbianLanguage(language)
+    ? "sr-Latn-RS"
+    : "en-US";
+  return `${new Intl.NumberFormat(locale).format(amountRsd)} RSD`;
 }
 
 function escapePlainText(value: string): string {

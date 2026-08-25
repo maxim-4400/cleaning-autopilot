@@ -1,8 +1,8 @@
-import { Agent, MaxTurnsExceededError, OpenAIProvider, retryPolicies, Runner, tool } from "@openai/agents";
+import { Agent, MaxTurnsExceededError, OpenAIProvider, retryPolicies, Runner, tool, type Model, type ModelProvider } from "@openai/agents";
 import OpenAI from "openai";
 import { z } from "zod";
 
-import type { AgentToolName, AgentToolResult, AgentTurn, ClientData } from "@/lib/contracts/domain";
+import { defaultPricingRules, type AgentToolName, type AgentToolResult, type AgentTurn, type ClientData, type PricingRules } from "@/lib/contracts/domain";
 import { isRussianLanguage, isSerbianCyrillic, isSerbianLanguage, type ReplyLanguage } from "@/lib/telegram/language";
 
 export type AgentToolExecutor = (name: AgentToolName, argumentsJson: unknown) => Promise<Record<string, unknown>>;
@@ -13,11 +13,22 @@ export type AgentTurnInput = {
   message: string;
   replyLanguage: ReplyLanguage;
   knownClientData: ClientData;
+  /**
+   * The model may explain the currently active rules, but calculations remain
+   * backend-owned through calculate_quote. Keeping the full rule snapshot in
+   * the turn also makes a later date change (for example same-day +20%)
+   * understandable without asking the customer to repeat their order.
+   */
+  pricingRules?: PricingRules;
+  /** Backend-derived capabilities for this one customer turn. */
+  allowedTools?: readonly AgentToolName[];
+  /** Evaluator-owned cancellation; production callers may omit it. */
+  signal?: AbortSignal;
   executeTool: AgentToolExecutor;
 };
 
 export interface AgentGateway {
-  createConversation(leadId: string): Promise<{ id: string }>;
+  createConversation(leadId: string, signal?: AbortSignal): Promise<{ id: string }>;
   runTurn(input: AgentTurnInput): Promise<AgentTurn>;
 }
 
@@ -48,7 +59,61 @@ const humanNeededParameters = z.object({
 const calculateQuoteParameters = z.object({}).strict();
 const requestAvailableSlotsParameters = z.object({}).strict();
 
-const maxToolSteps = 4;
+/** Never allow a customer turn to perform more than this many semantic tools. */
+export const maxAgentToolSteps = 4;
+/** Bound each Responses model turn; the evaluator records and enforces this cap. */
+export const maxAgentOutputTokens = 1200;
+
+export type OpenAiAgentsGatewayOptions = {
+  /** Production keeps one provider retry; a paid evaluator sets this to zero. */
+  maxResponseRetries?: 0 | 1;
+  /** Conversation creation is an external POST and has its own bounded retry policy. */
+  maxConversationCreateAttempts?: 1 | 2;
+  maxOutputTokens?: number;
+  /** Optional bound for every provider request; only the evaluator sets it. */
+  requestTimeoutMs?: number;
+  /** Paid evaluator narrows this below the normal production tool-loop bound. */
+  maxResponsesPerTurn?: number;
+  /**
+   * Optional evaluator-owned counter at the actual Responses model boundary.
+   * It is intentionally not used by ordinary production traffic.
+   */
+  responseRequestCounter?: ResponseRequestCounter;
+};
+
+/** Counts actual SDK model requests, immediately before the provider call. */
+export interface ResponseRequestCounter {
+  beforeResponseRequest(): void;
+}
+
+/**
+ * A model-loop ceiling is an operational failure, not evidence that this
+ * customer needs a person. Callers must stop this Conversation and surface it
+ * through their normal technical recovery path instead of creating a false
+ * Human Needed handoff.
+ */
+export class AgentTurnTechnicalError extends Error {
+  constructor(
+    /**
+     * Customer-safe operational category.  Never put provider messages,
+     * request bodies or customer data in this value: it is retained by the
+     * evaluator and may be shown in operational evidence.
+     */
+    readonly code: AgentTurnTechnicalCode,
+    readonly usage?: AgentTurn["usage"],
+    readonly usageUnreconciledReason?: string,
+  ) {
+    super(code);
+  }
+}
+
+export type AgentTurnTechnicalCode =
+  | "agent_max_turns_exceeded"
+  | "agent_duplicate_update_client_data"
+  | "agent_provider_timeout"
+  | "agent_provider_http_error"
+  | "agent_provider_transport_error"
+  | "agent_provider_sdk_error";
 
 export class OpenAiAgentsGateway implements AgentGateway {
   private readonly runner: Runner;
@@ -57,21 +122,51 @@ export class OpenAiAgentsGateway implements AgentGateway {
     private readonly apiKey: string,
     private readonly model: string,
     private readonly reasoningEffort: "low" = "low",
+    private readonly maxToolSteps = maxAgentToolSteps,
+    options: OpenAiAgentsGatewayOptions = {},
   ) {
-    this.runner = new Runner({
-      modelProvider: new OpenAIProvider({
-        openAIClient: new OpenAI({ apiKey, maxRetries: 0 }),
+    if (!Number.isInteger(maxToolSteps) || maxToolSteps < 1 || maxToolSteps > maxAgentToolSteps) {
+      throw new Error(`maxToolSteps must be between 1 and ${maxAgentToolSteps}`);
+    }
+    if (!Number.isInteger(options.maxOutputTokens ?? maxAgentOutputTokens) || (options.maxOutputTokens ?? maxAgentOutputTokens) < 1 || (options.maxOutputTokens ?? maxAgentOutputTokens) > maxAgentOutputTokens) {
+      throw new Error(`maxOutputTokens must be between 1 and ${maxAgentOutputTokens}`);
+    }
+    if (options.requestTimeoutMs !== undefined && (!Number.isInteger(options.requestTimeoutMs) || options.requestTimeoutMs < 1 || options.requestTimeoutMs > 120_000)) {
+      throw new Error("requestTimeoutMs must be between 1 and 120000");
+    }
+    const maxResponsesPerTurn = options.maxResponsesPerTurn ?? maxToolSteps + 1;
+    if (maxResponsesPerTurn !== maxToolSteps + 1) {
+      throw new Error(`maxResponsesPerTurn must equal ${maxToolSteps + 1} so every tool result gets a final closure response`);
+    }
+    this.maxOutputTokens = options.maxOutputTokens ?? maxAgentOutputTokens;
+    this.maxResponseRetries = options.maxResponseRetries ?? 1;
+    this.maxConversationCreateAttempts = options.maxConversationCreateAttempts ?? 2;
+    this.requestTimeoutMs = options.requestTimeoutMs;
+    this.maxResponsesPerTurn = maxResponsesPerTurn;
+    const provider = new OpenAIProvider({
+        openAIClient: new OpenAI({ apiKey, maxRetries: 0, ...(this.requestTimeoutMs ? { timeout: this.requestTimeoutMs } : {}) }),
         useResponses: true,
-      }),
+      });
+    this.runner = new Runner({
+      modelProvider: options.responseRequestCounter
+        ? new CountingModelProvider(provider, options.responseRequestCounter)
+        : provider,
       tracingDisabled: true,
       traceIncludeSensitiveData: false,
     });
   }
 
-  async createConversation(leadId: string): Promise<{ id: string }> {
+  private readonly maxOutputTokens: number;
+  private readonly maxResponseRetries: 0 | 1;
+  private readonly maxConversationCreateAttempts: 1 | 2;
+  private readonly requestTimeoutMs: number | undefined;
+  private readonly maxResponsesPerTurn: number;
+
+  async createConversation(leadId: string, signal?: AbortSignal): Promise<{ id: string }> {
     const payload = await this.request("https://api.openai.com/v1/conversations", {
       method: "POST",
       body: JSON.stringify({ metadata: { lead_id: leadId } }),
+      signal,
     });
 
     if (!isObjectWithString(payload, "id")) throw new Error("OpenAI conversation response did not contain an id");
@@ -82,40 +177,54 @@ export class OpenAiAgentsGateway implements AgentGateway {
     const languageInstruction = replyLanguageInstruction(input.replyLanguage);
     const toolResults: AgentToolResult[] = [];
     let modelToolSteps = 0;
-    let toolLimitEscalated = false;
-    let humanNeededRequested = false;
+    // `update_client_data` is an atomic, validated merge owned by the
+    // webhook.  A second model request must not be invited to overwrite it;
+    // other semantic tools can still close the same customer turn.
+    let updateClientDataAttempted = false;
     const execute = async (name: AgentToolName, argumentsJson: unknown): Promise<Record<string, unknown>> => {
-      if (modelToolSteps >= maxToolSteps) {
+      throwIfAborted(input.signal);
+      if (name === "update_client_data") {
+        if (updateClientDataAttempted) {
+          throw new AgentTurnTechnicalError("agent_duplicate_update_client_data");
+        }
+        updateClientDataAttempted = true;
+      }
+      if (modelToolSteps >= this.maxToolSteps) {
         return { ok: false, error: "tool_step_limit_reached" };
       }
       modelToolSteps += 1;
       try {
         const output = await input.executeTool(name, argumentsJson);
+        throwIfAborted(input.signal);
         toolResults.push({ name, output });
-        if (name === "mark_human_needed") humanNeededRequested = true;
-        return this.finishToolLimitEscalation(input, toolResults, modelToolSteps, humanNeededRequested, output, () => {
-          toolLimitEscalated = true;
-        });
-      } catch {
+        return output;
+      } catch (error) {
+        if (error instanceof AgentTurnTechnicalError) throw error;
+        throwIfAborted(input.signal);
         const output = { ok: false, error: "invalid_tool_arguments" };
         toolResults.push({ name, output });
-        return this.finishToolLimitEscalation(input, toolResults, modelToolSteps, humanNeededRequested, output, () => {
-          toolLimitEscalated = true;
-        });
+        return output;
       }
     };
-    const toolsEnabled = () => modelToolSteps < maxToolSteps;
+    const toolsEnabled = (name: AgentToolName) => modelToolSteps < this.maxToolSteps &&
+      (input.allowedTools?.includes(name) ?? true) &&
+      (name !== "update_client_data" || !updateClientDataAttempted);
     const agent = new Agent({
       name: "Sherlock Cleaning Agent",
       model: this.model,
-      instructions: `${input.systemPrompt}\n\n${languageInstruction}\n\n${intakeInstruction}\n\n${dateIntakeInstruction}\n\nThe backend derives urgency deterministically from the requested cleaning date in Europe/Belgrade. Do not ask the customer to choose standard versus same-day urgency, and do not send an urgency field in update_client_data.\n\nIf a tool result has error \"tool_step_limit_reached\", do not provide a quote or take further action. Briefly tell the customer that a human will continue the request.`,
+      instructions: `${input.systemPrompt}\n\n${languageInstruction}\n\n${conversationInstruction}\n\n${intakeInstruction}\n\n${dateIntakeInstruction}\n\n${pricingInstruction(input.pricingRules ?? defaultPricingRules)}\n\nThe backend derives urgency deterministically from the requested cleaning date in Europe/Belgrade. Do not ask the customer to choose standard versus same-day urgency, and do not send an urgency field in update_client_data.\n\nA quote is terminal for the current customer turn. After calculate_quote returns a quote, write the short customer-facing answer and do not request availability in that same turn. Only request_available_slots after the customer later expresses a clear scheduling intent and the backend confirms that a previously active quote exists.`,
       tools: [
         tool({
           name: "update_client_data",
           description: "Save only validated cleaning details extracted from the customer's messages.",
           parameters: updateClientDataParameters,
           strict: true,
-          isEnabled: toolsEnabled,
+          // A duplicate update is a corrupted provider turn, not a model
+          // recoverable tool result. Let AgentTurnTechnicalError escape the
+          // SDK's default error-as-output wrapper so webhook recovery rolls
+          // back the first in-memory mutation and invalidates Conversation.
+          errorFunction: null,
+          isEnabled: () => toolsEnabled("update_client_data"),
           execute: (argumentsJson) => execute("update_client_data", argumentsJson),
         }),
         tool({
@@ -123,7 +232,7 @@ export class OpenAiAgentsGateway implements AgentGateway {
           description: "Stop automatic quoting and preserve a concrete reason for human review.",
           parameters: humanNeededParameters,
           strict: true,
-          isEnabled: toolsEnabled,
+          isEnabled: () => toolsEnabled("mark_human_needed"),
           execute: (argumentsJson) => execute("mark_human_needed", argumentsJson),
         }),
         tool({
@@ -131,7 +240,7 @@ export class OpenAiAgentsGateway implements AgentGateway {
           description: "Request the deterministic backend price after all required data is known.",
           parameters: calculateQuoteParameters,
           strict: true,
-          isEnabled: toolsEnabled,
+          isEnabled: () => toolsEnabled("calculate_quote"),
           execute: (argumentsJson) => execute("calculate_quote", argumentsJson),
         }),
         tool({
@@ -139,17 +248,18 @@ export class OpenAiAgentsGateway implements AgentGateway {
           description: "Request up to three real, server-generated available time options after an active quote. The backend presents choices securely; never invent times or identifiers.",
           parameters: requestAvailableSlotsParameters,
           strict: true,
-          isEnabled: toolsEnabled,
+          isEnabled: () => toolsEnabled("request_available_slots"),
           execute: (argumentsJson) => execute("request_available_slots", argumentsJson),
         }),
       ],
       modelSettings: {
+        ...(this.requestTimeoutMs ? { timeoutMs: this.requestTimeoutMs } : {}),
         toolChoice: "auto",
         parallelToolCalls: false,
         reasoning: { effort: this.reasoningEffort },
-        maxTokens: 1200,
+        maxTokens: this.maxOutputTokens,
         retry: {
-          maxRetries: 1,
+          maxRetries: this.maxResponseRetries,
           policy: retryPolicies.all(
             retryPolicies.providerSuggested(),
             ({ normalized }) => normalized.statusCode === 429 || (normalized.statusCode !== undefined && normalized.statusCode >= 500),
@@ -164,71 +274,222 @@ export class OpenAiAgentsGateway implements AgentGateway {
         `Known validated data: ${JSON.stringify(input.knownClientData)}\nCustomer message: ${input.message}`,
         {
           conversationId: input.conversationId,
-          maxTurns: maxToolSteps + 1,
+          maxTurns: this.maxResponsesPerTurn,
+          signal: input.signal,
           toolExecution: { maxFunctionToolConcurrency: 1 },
         },
       );
-      if (toolLimitEscalated) return { reply: fallbackReply(input.replyLanguage), toolResults, steps: modelToolSteps };
       return {
         reply: typeof result.finalOutput === "string" && result.finalOutput.trim().length > 0
           ? result.finalOutput
           : fallbackReply(input.replyLanguage),
         toolResults,
         steps: modelToolSteps,
+        usage: {
+          requests: result.runContext.usage.requests,
+          inputTokens: result.runContext.usage.inputTokens,
+          outputTokens: result.runContext.usage.outputTokens,
+          totalTokens: result.runContext.usage.totalTokens,
+          cachedInputTokens: cachedInputTokens(result.runContext.usage.inputTokensDetails),
+        },
       };
     } catch (error) {
+      // Evaluator control fences are not provider failures. Their exact typed
+      // codes drive terminal incomplete/deadline reporting and must survive
+      // unchanged through the SDK boundary.
+      if (isEvaluatorControlError(error)) throw error;
+      if (input.signal?.aborted && input.signal.reason) throw input.signal.reason;
+      // The Agents SDK wraps a function-tool exception from a single model
+      // response in ToolCallError. Keep our typed fail-closed cause intact so
+      // callers never turn it into model-visible recovery output.
+      const technicalToolCause = extractTechnicalToolCause(error);
+      if (technicalToolCause) throw technicalToolCause;
       if (error instanceof MaxTurnsExceededError) {
-        return this.failClosedForToolLimit(input, toolResults);
+        const partialUsage = usageFromMaxTurnsError(error);
+        throw new AgentTurnTechnicalError(
+          "agent_max_turns_exceeded",
+          partialUsage,
+          partialUsage ? undefined : "max_turns_usage_unavailable",
+        );
       }
-      throw error;
+      // A provider may ignore the dynamically reduced tool surface and emit a
+      // stale duplicate call. The SDK rejects that as ModelBehaviorError before
+      // it reaches `execute`; expose the same fail-closed technical boundary.
+      if (updateClientDataAttempted && error instanceof Error && /Tool update_client_data not found/u.test(error.message)) {
+        throw new AgentTurnTechnicalError("agent_duplicate_update_client_data");
+      }
+      // A Responses/transport failure is operationally recoverable just like
+      // MaxTurns.  Do not let a raw SDK/provider exception escape to the
+      // webhook: that previously became `processing_error`, retained a
+      // poisoned Conversation and leaked arbitrary error text into evaluator
+      // evidence.  Preserve only a safe category plus any released aggregate
+      // usage exposed by the SDK state.
+      const partialUsage = usageFromSdkError(error);
+      throw new AgentTurnTechnicalError(
+        normalizeProviderTechnicalCode(error),
+        partialUsage,
+        partialUsage ? undefined : "provider_turn_usage_unreconciled",
+      );
     }
-  }
-
-  private async finishToolLimitEscalation(
-    input: AgentTurnInput,
-    toolResults: AgentToolResult[],
-    modelToolSteps: number,
-    humanNeededRequested: boolean,
-    output: Record<string, unknown>,
-    markEscalated: () => void,
-  ): Promise<Record<string, unknown>> {
-    if (modelToolSteps !== maxToolSteps || humanNeededRequested) return output;
-
-    const escalation = await input.executeTool("mark_human_needed", { reason: "scope_uncertain" });
-    toolResults.push({ name: "mark_human_needed", output: escalation });
-    markEscalated();
-    return {
-      ok: false,
-      error: "tool_step_limit_reached",
-      instruction: "Automatic handling has stopped and a human review is active. Do not provide a quote or take further action.",
-    };
-  }
-
-  private async failClosedForToolLimit(input: AgentTurnInput, toolResults: AgentToolResult[]): Promise<AgentTurn> {
-    const output = await input.executeTool("mark_human_needed", { reason: "scope_uncertain" });
-    toolResults.push({ name: "mark_human_needed", output });
-    return { reply: fallbackReply(input.replyLanguage), toolResults, steps: maxToolSteps };
   }
 
   private async request(url: string, init: RequestInit): Promise<unknown> {
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      const response = await fetch(url, {
-        ...init,
-        headers: {
-          authorization: `Bearer ${this.apiKey}`,
-          "content-type": "application/json",
-          ...init.headers,
-        },
-      });
+    for (let attempt = 0; attempt < this.maxConversationCreateAttempts; attempt += 1) {
+      let response: Response;
+      try {
+        response = await fetch(url, {
+          ...init,
+          signal: composeAbortSignals(init.signal, this.requestTimeoutMs ? AbortSignal.timeout(this.requestTimeoutMs) : undefined),
+          headers: {
+            authorization: `Bearer ${this.apiKey}`,
+            "content-type": "application/json",
+            ...init.headers,
+          },
+        });
+      } catch (error) {
+        if (isEvaluatorControlError(error)) throw error;
+        // A caller-owned evaluator deadline has precedence over a native
+        // AbortError/TypeError produced by fetch.
+        if (init.signal?.aborted && init.signal.reason) throw init.signal.reason;
+        throw new AgentTurnTechnicalError(
+          normalizeProviderTechnicalCode(error),
+          undefined,
+          "provider_conversation_create_usage_unreconciled",
+        );
+      }
 
       const payload: unknown = await response.json().catch(() => null);
       if (response.ok) return payload;
-      if (attempt === 0 && (response.status === 429 || response.status >= 500)) continue;
-      throw new Error(`OpenAI request failed with HTTP ${response.status}`);
+      if (attempt + 1 < this.maxConversationCreateAttempts && (response.status === 429 || response.status >= 500)) continue;
+      throw new AgentTurnTechnicalError("agent_provider_http_error", undefined, "provider_conversation_create_usage_unreconciled");
     }
 
-    throw new Error("OpenAI request exhausted retries");
+    throw new AgentTurnTechnicalError("agent_provider_http_error", undefined, "provider_conversation_create_usage_unreconciled");
   }
+}
+
+/**
+ * The SDK resolves models lazily through a ModelProvider. Wrapping this seam
+ * counts each Responses request actually started, rather than reserving a
+ * pessimistic number per customer message.
+ */
+export class CountingModelProvider implements ModelProvider {
+  constructor(private readonly delegate: ModelProvider, private readonly counter: ResponseRequestCounter) {}
+
+  async getModel(modelName?: string): Promise<Model> {
+    const model = await this.delegate.getModel(modelName);
+    return {
+      getResponse: (request) => {
+        this.counter.beforeResponseRequest();
+        return model.getResponse(request);
+      },
+      getStreamedResponse: (request) => {
+        const stream = model.getStreamedResponse(request);
+        let started = false;
+        return {
+          [Symbol.asyncIterator]: () => {
+            const iterator = stream[Symbol.asyncIterator]();
+            return {
+              next: () => {
+                if (!started) {
+                  this.counter.beforeResponseRequest();
+                  started = true;
+                }
+                return iterator.next();
+              },
+            };
+          },
+        };
+      },
+      ...(model.getRetryAdvice ? { getRetryAdvice: (args) => model.getRetryAdvice!(args) } : {}),
+    };
+  }
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("agent_turn_aborted");
+}
+
+function composeAbortSignals(...signals: Array<AbortSignal | null | undefined>): AbortSignal | undefined {
+  const active = signals.filter((signal): signal is AbortSignal => signal !== undefined);
+  if (active.length === 0) return undefined;
+  return active.length === 1 ? active[0] : AbortSignal.any(active);
+}
+
+/** The SDK keeps usage-detail keys provider-defined, so aggregate only cache-named fields. */
+function cachedInputTokens(details: Array<Record<string, number>>): number {
+  return details.reduce(
+    (total, entry) => total + Object.entries(entry).reduce(
+      (entryTotal, [key, value]) => entryTotal + (/cache/iu.test(key) && Number.isFinite(value) ? value : 0),
+      0,
+    ),
+    0,
+  );
+}
+
+/** Recover only released aggregate usage from an SDK turn-cap error. */
+export function usageFromMaxTurnsError(error: MaxTurnsExceededError): AgentTurn["usage"] | undefined {
+  return usageFromSdkError(error);
+}
+
+/** Extract only validated aggregate usage exposed by an SDK failure state. */
+export function usageFromSdkError(error: unknown): AgentTurn["usage"] | undefined {
+  const usage = typeof error === "object" && error !== null && "state" in error
+    ? (error as { state?: { usage?: unknown } }).state?.usage
+    : undefined;
+  if (!usage) return undefined;
+  if (typeof usage !== "object" || usage === null) return undefined;
+  const candidate = usage as Record<string, unknown>;
+  if (!["requests", "inputTokens", "outputTokens", "totalTokens"].every((key) =>
+    typeof candidate[key] === "number" && Number.isFinite(candidate[key]))) return undefined;
+  return {
+    requests: candidate.requests as number,
+    inputTokens: candidate.inputTokens as number,
+    outputTokens: candidate.outputTokens as number,
+    totalTokens: candidate.totalTokens as number,
+    cachedInputTokens: cachedInputTokens(Array.isArray(candidate.inputTokensDetails)
+      ? candidate.inputTokensDetails.filter((detail): detail is Record<string, number> => typeof detail === "object" && detail !== null)
+      : []),
+  };
+}
+
+/**
+ * Classify provider/SDK failures without inspecting their message/body.  The
+ * OpenAI client exposes concrete error names, while fetch/undici use native
+ * TimeoutError/AbortError and TypeError.  Unknown SDK shapes stay safely
+ * generic rather than becoming customer-visible text.
+ */
+export function normalizeProviderTechnicalCode(error: unknown): AgentTurnTechnicalCode {
+  if (error instanceof AgentTurnTechnicalError) return error.code;
+  const name = typeof error === "object" && error !== null && "name" in error && typeof (error as { name?: unknown }).name === "string"
+    ? (error as { name: string }).name
+    : "";
+  if (error instanceof OpenAI.APIConnectionTimeoutError || /(?:timeout|timedout)/iu.test(name)) return "agent_provider_timeout";
+  if (error instanceof OpenAI.APIConnectionError || /(?:connection|network|fetch|typeerror)/iu.test(name) || error instanceof TypeError) return "agent_provider_transport_error";
+  if (error instanceof OpenAI.APIError || /(?:api|http|status)/iu.test(name)) return "agent_provider_http_error";
+  return "agent_provider_sdk_error";
+}
+
+/** Local evaluator deadlines/resource caps must remain terminal control flow. */
+function isEvaluatorControlError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("code" in error)) return false;
+  const code = (error as { code?: unknown }).code;
+  return code === "provider_response_budget_exceeded_before_request_221" ||
+    code === "live_suite_deadline_exceeded" ||
+    code === "scenario_deadline_exceeded" ||
+    code === "customer_turn_deadline_exceeded" ||
+    code === "input_token_cap_exceeded" ||
+    code === "output_token_cap_exceeded" ||
+    code === "total_token_cap_exceeded";
+}
+
+function extractTechnicalToolCause(error: unknown): AgentTurnTechnicalError | undefined {
+  if (error instanceof AgentTurnTechnicalError) return error;
+  if (typeof error === "object" && error !== null && "error" in error) {
+    const cause = (error as { error?: unknown }).error;
+    return cause instanceof AgentTurnTechnicalError ? cause : undefined;
+  }
+  return undefined;
 }
 
 function isObjectWithString<K extends string>(value: unknown, key: K): value is Record<K, string> {
@@ -430,10 +691,10 @@ function missingDetailsReply(language: ReplyLanguage, missingFields: string[]): 
 }
 
 function fallbackReply(language: string): string {
-  if (isSerbianLanguage(language)) return serbianText(language, "Hvala. Naš tim će pažljivo nastaviti sa detaljima koje ste podelili.", "Хвала. Наш тим ће пажљиво наставити са детаљима које сте поделили.");
+  if (isSerbianLanguage(language)) return serbianText(language, "Nastavićemo zahtev sa detaljima koje ste podelili.", "Наставићемо захтев са детаљима које сте поделили.");
   return isRussianLanguage(language)
-    ? "Спасибо, я передам детали нашей команде, чтобы ничего не упустить."
-    : "Thank you. Our team will continue this carefully with the details you shared.";
+    ? "Продолжим заявку с деталями, которые вы уже сообщили."
+    : "We’ll continue the request with the details you’ve already shared.";
 }
 
 function replyLanguageInstruction(language: ReplyLanguage): string {
@@ -447,9 +708,15 @@ const replyLanguageInstructions: Record<ReplyLanguage, string> = {
   "sr-Cyrl": "Reply only in Serbian using the Cyrillic script for this customer turn. Sound like a helpful local coordinator: use one or two short natural sentences, no em or en dashes, no headings, labels, raw Markdown, technical terms, or generic AI filler.",
 };
 
+const conversationInstruction = "You are a friendly, professional local coordinator, not a form. The durable conversation contains the relevant history of this one cleaning request; the Known validated data is the current source of truth for facts already confirmed. First answer the customer's direct question in a natural sentence. Then, only if useful, make one small next step toward a quote or booking, asking at most one or two related details. Do not repeat facts already known. Do not start ordinary replies with Thanks, Thank you, I noted that, or their translations. Avoid headings, colon-led lists, long dashes, scripted filler, internal terms and meta-commentary. If directly asked whether you are human, answer truthfully that you are Sherlock Cleaning's digital assistant, then continue helping.";
+
 const intakeInstruction = "Process facts in every customer message regardless of its script. A Cyrillic message may include Latin measurement notation such as m2 or m², a local district such as Vračar, or an ISO date; that does not make it English. Before replying or escalating, call update_client_data with every stated supported fact: cleaning type, area, rooms, bathrooms, pet hair, extras, address or district, and requested date. Use null only for a field that the customer did not state. For renovation, commercial or other human-review work, save the stated facts first, then call mark_human_needed. Never respond that details are missing when the current message already states them.";
 
-const dateIntakeInstruction = "Treat customer-friendly date language as valid: a Russian date without a year such as \"26 августа\", relative phrases such as \"через 2 дня\", and a weekend request. Do not demand DD.MM.YYYY or another rigid format. Use YYYY-MM-DD only when you save a date in update_client_data; the backend may already have normalised the customer date. If a date phrase is genuinely ambiguous, propose one concrete local date and ask whether it works. Never ask about an internal urgency field.";
+const dateIntakeInstruction = "Treat customer-friendly date language as valid: a Russian date without a year such as \"26 августа\", relative phrases such as \"через 2 дня\", and a weekend request. Do not demand DD.MM.YYYY or another rigid format. Use YYYY-MM-DD only when you save a date in update_client_data; the backend may already have normalised the customer date. If a date phrase is genuinely ambiguous, propose one concrete local date and ask whether it works. A date is optional for an initial estimate and is needed before scheduling. Never ask about an internal urgency field.";
+
+function pricingInstruction(pricingRules: PricingRules): string {
+  return `Current deterministic pricing rules for explanation only: ${JSON.stringify(pricingRules)}. You may explain that the exact amount is confirmed by the backend, and that a same-day date applies the configured multiplier. Never do arithmetic, invent an amount, invent availability, or confirm a booking yourself. Use calculate_quote after the base cleaning inputs are available; a date and time window are not required for a first quote. Ask for a date before scheduling, or when a same-day price needs to be confirmed.`;
+}
 
 function serbianText(language: string, latin: string, cyrillic: string): string {
   return isSerbianCyrillic(language) ? cyrillic : latin;

@@ -170,6 +170,11 @@ export class SupabaseLeadRepository implements LeadRepository {
     });
   }
 
+  async invalidateConversation(leadId: string): Promise<void> {
+    const rows = await this.expectRows(await this.request(`conversations?lead_id=eq.${encodeURIComponent(leadId)}`, { method: "DELETE" }), "invalidate conversation");
+    if (rows.length > 1) throw new Error("invalidate conversation affected an invalid row count");
+  }
+
   async getCurrentAgentConfig(): Promise<StoredAgentConfig> {
     const rows = await this.getRows("agent_config?select=*&order=version.desc&limit=1");
     if (!rows[0]) throw new Error("No agent configuration exists");

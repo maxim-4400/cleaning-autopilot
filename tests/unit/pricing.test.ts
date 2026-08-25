@@ -28,6 +28,16 @@ describe("PricingEngine", () => {
     expect(quotedAmount({ cleaningType: "deep", areaM2: 40 })).toBe(9000);
   });
 
+  it("quotes complete base facts without fabricating a date or standard urgency", () => {
+    const baseOnly = { ...completeClientData({ areaM2: 40 }) };
+    delete baseOnly.preferredDate;
+    delete baseOnly.urgency;
+    expect(calculatePricingDecision(baseOnly)).toMatchObject({
+      kind: "quote",
+      quote: { amountRsd: 4000, sameDayApplied: false },
+    });
+  });
+
   it("adds bathrooms, pet hair, extras, discount, and same-day uplift deterministically", () => {
     expect(quotedAmount({
       areaM2: 151,
