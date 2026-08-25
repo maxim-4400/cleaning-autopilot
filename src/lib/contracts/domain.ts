@@ -139,6 +139,21 @@ export type AgentTurn = {
   reply: string;
   toolResults: AgentToolResult[];
   steps: number;
+  /** Provider-reported aggregate only; it contains no response IDs or content. */
+  usage?: {
+    requests: number;
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+    /** SDK-provided input cache subtotal when the provider reports it. */
+    cachedInputTokens: number;
+  };
+  /**
+   * A run may have reached the provider before the SDK made its aggregate
+   * usage available (for example, a turn-cap abort). Keep that uncertainty
+   * explicit instead of treating an absent aggregate as zero usage.
+   */
+  usageUnreconciledReason?: string;
 };
 
 export type IntegrationOperation = {

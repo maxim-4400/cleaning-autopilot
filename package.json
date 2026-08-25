@@ -16,6 +16,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "playwright test",
+    "calendar:cleanup-primary-shadows": "node scripts/cleanup-primary-calendar-shadows.mjs",
+    "conversation:live-eval": "node scripts/conversation-live-eval.mjs",
     "verify:instrumentation-build": "node scripts/verify-instrumentation-build.mjs",
     "check": "eslint . && npm run typecheck && vitest run && npm run build && npm run verify:instrumentation-build",
     "supabase": "supabase"

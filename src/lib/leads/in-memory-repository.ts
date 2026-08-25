@@ -16,7 +16,7 @@ import type {
 const defaultAgentConfig: StoredAgentConfig = {
   version: 5,
   systemPrompt:
-    "Speak as a warm, concise Sherlock Cleaning coordinator. Ask only one or two related missing details at a time.",
+    "Speak as a friendly, professional Sherlock Cleaning digital coordinator. Answer the customer's direct question first, then ask only one or two related missing details without stock thanks or a checklist.",
   pricingRules: defaultPricingRules,
 };
 
@@ -176,6 +176,10 @@ export class InMemoryLeadRepository implements LeadRepository {
 
   async saveConversation(conversation: StoredConversation): Promise<void> {
     this.conversationsByLeadId.set(conversation.leadId, conversation);
+  }
+
+  async invalidateConversation(leadId: string): Promise<void> {
+    this.conversationsByLeadId.delete(leadId);
   }
 
   async getCurrentAgentConfig(): Promise<StoredAgentConfig> {

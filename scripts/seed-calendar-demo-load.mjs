@@ -83,6 +83,10 @@ export function demoEventArguments(entry, calendarId) {
     timezone: BELGRADE_TIMEZONE,
     visibility: "public",
     transparency: "opaque",
+    // The pinned Composio create schema accepts the enum value "none" here.
+    // Keep both fields explicit so a synthetic event can never invite or copy
+    // itself into an attendee's primary calendar through an implicit list.
+    attendees: [],
     send_updates: "none",
     create_meeting_room: false,
     extended_properties: {
@@ -323,13 +327,36 @@ async function execute(composio, environment, tool, arguments_) {
 function environmentFromProcess(env) {
   const required = ["COMPOSIO_API_KEY", "COMPOSIO_GOOGLE_CALENDAR_USER_ID", "COMPOSIO_GOOGLE_CALENDAR_CONNECTED_ACCOUNT_ID", "COMPOSIO_GOOGLE_CALENDAR_TOOLKIT_VERSION", "TEAM_A_CALENDAR_ID", "TEAM_B_CALENDAR_ID"];
   for (const key of required) if (!env[key]?.trim()) throw new Error(`Missing required environment variable: ${key}`);
+  const calendarIds = { team_a: env.TEAM_A_CALENDAR_ID.trim(), team_b: env.TEAM_B_CALENDAR_ID.trim() };
+  assertDedicatedTeamCalendars(calendarIds);
   return {
     apiKey: env.COMPOSIO_API_KEY,
     userId: env.COMPOSIO_GOOGLE_CALENDAR_USER_ID,
     connectedAccountId: env.COMPOSIO_GOOGLE_CALENDAR_CONNECTED_ACCOUNT_ID,
     toolkitVersion: env.COMPOSIO_GOOGLE_CALENDAR_TOOLKIT_VERSION,
-    calendarIds: { team_a: env.TEAM_A_CALENDAR_ID, team_b: env.TEAM_B_CALENDAR_ID },
+    calendarIds,
   };
+}
+
+/**
+ * This mirrors the runtime Calendar gateway's fail-closed routing boundary.
+ * The seed is an operator tool and must never be the exception that permits a
+ * personal/default calendar or two aliases for the same calendar.
+ */
+export function assertDedicatedTeamCalendars(calendarIds) {
+  const teamA = calendarIds?.team_a?.trim();
+  const teamB = calendarIds?.team_b?.trim();
+  if (!isDedicatedGroupCalendarId(teamA) || !isDedicatedGroupCalendarId(teamB) || teamA.localeCompare(teamB, undefined, { sensitivity: "accent" }) === 0) {
+    throw new Error("Exact distinct dedicated Team A and Team B Google group calendar IDs are required");
+  }
+  return { team_a: teamA, team_b: teamB };
+}
+
+function isDedicatedGroupCalendarId(calendarId) {
+  if (!calendarId) return false;
+  const normalized = calendarId.toLocaleLowerCase();
+  return normalized.endsWith("@group.calendar.google.com")
+    && !["primary", "default", "personal", "my calendar", "my-calendar", "me"].includes(normalized);
 }
 
 function isSameDemoEvent(event, desired) {

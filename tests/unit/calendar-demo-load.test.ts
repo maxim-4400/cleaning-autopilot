@@ -6,6 +6,7 @@ import {
   DEMO_EVENT_DESCRIPTION,
   correctionUpdateArguments,
   demoEventArguments,
+  assertDedicatedTeamCalendars,
   parseCli,
   parseCorrectionArgument,
   parseReservationRestoreArgument,
@@ -46,7 +47,7 @@ describe("calendar demo load seed", () => {
     expect(demoEvents.some((entry) => entry.startDatetime === "2026-08-25T11:30:00" && entry.team === "team_b")).toBe(true);
   });
 
-  it("marks create payloads as owned, public, synthetic, and non-notifying", () => {
+  it("marks create payloads as owned, public, synthetic, attendee-free, and non-notifying", () => {
     const input = demoEventArguments(demoEvents[0]!, "team-a@group.calendar.google.com");
     expect(input).toMatchObject({
       calendar_id: "team-a@group.calendar.google.com",
@@ -54,10 +55,33 @@ describe("calendar demo load seed", () => {
       timezone: "Europe/Belgrade",
       visibility: "public",
       transparency: "opaque",
+      attendees: [],
       send_updates: "none",
       create_meeting_room: false,
       extended_properties: { private: { sherlockDemoSeed: DEMO_CALENDAR_SEED_ID } },
     });
+  });
+
+  it("uses the same strict, distinct dedicated group-calendar guard as runtime routing", () => {
+    expect(assertDedicatedTeamCalendars({ team_a: "team-a@group.calendar.google.com", team_b: "team-b@group.calendar.google.com" }))
+      .toEqual({ team_a: "team-a@group.calendar.google.com", team_b: "team-b@group.calendar.google.com" });
+    for (const invalid of ["primary", "default", "personal", "My Calendar", "owner@example.com"]) {
+      expect(() => assertDedicatedTeamCalendars({ team_a: invalid, team_b: "team-b@group.calendar.google.com" })).toThrow(/dedicated Team/);
+    }
+    expect(() => assertDedicatedTeamCalendars({ team_a: "team-a@group.calendar.google.com", team_b: "team-a@group.calendar.google.com" })).toThrow(/distinct dedicated/);
+  });
+
+  it("fails closed before contacting Composio when an apply seed is pointed at a primary calendar", async () => {
+    const invalidEnvironment = {
+      COMPOSIO_API_KEY: "test-key",
+      COMPOSIO_GOOGLE_CALENDAR_USER_ID: "test-user",
+      COMPOSIO_GOOGLE_CALENDAR_CONNECTED_ACCOUNT_ID: "test-account",
+      COMPOSIO_GOOGLE_CALENDAR_TOOLKIT_VERSION: "20260824_01",
+      TEAM_A_CALENDAR_ID: "primary",
+      TEAM_B_CALENDAR_ID: "team-b@group.calendar.google.com",
+    };
+    await expect(runDemoCalendarSeed({ argv: ["--apply"], env: invalidEnvironment, write: () => {} }))
+      .rejects.toThrow(/dedicated Team/);
   });
 
   it("is dry-run by default and makes no provider call", async () => {
