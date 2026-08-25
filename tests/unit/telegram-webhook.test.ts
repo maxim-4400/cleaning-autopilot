@@ -105,6 +105,7 @@ describe("Telegram webhook", () => {
         preferredDate: "2026-08-26",
       },
     });
+    expect(repository.getLead(1001)?.pendingSchedulingConsentQuotedAt).toBe(repository.getLead(1001)?.quotedAt);
     expect(telegram.messages.at(-1)?.text).toContain("Стоимость уборки: 6 500 RSD");
 
     await expect(processTelegramWebhook(update(6, "покажи свободное время"), deps)).resolves.toEqual({ kind: "processed" });
@@ -607,6 +608,32 @@ describe("Telegram webhook", () => {
     expect(repository.trelloSyncJobs.get(repository.getLead(1001)?.id ?? "missing")).toMatchObject({ desiredLifecycle: "qualified" });
   });
 
+  it("renders requested-date alternatives and only next-day buttons when the requested weekday is full", async () => {
+    const repository = new InMemoryLeadRepository();
+    const telegram = new FakeTelegramGateway();
+    const calendar = new FakeCalendarGateway();
+    const lead = await repository.createLead({ telegramChatId: 1001, firstMessageLanguage: "ru", agentConfigVersion: 5 });
+    lead.status = "qualified";
+    lead.quoteValidity = "active";
+    lead.quote = { amountRsd: 6000, baseRsd: 6000, volumeDiscountPercent: 0, bathroomSurchargeRsd: 0, petHairSurchargeRsd: 0, extrasSurchargeRsd: 0, sameDayApplied: false, pricingRulesVersion: 1 };
+    lead.clientData = { cleaningType: "standard", areaM2: 75, rooms: 3, bathrooms: 1, heavyPetHair: false, extras: [], addressOrDistrict: "Врачар", preferredDate: "2026-08-24" };
+    await repository.saveLead(lead);
+    const requestedDayBusy = [{ start: "2026-08-24T06:00:00.000Z", end: "2026-08-24T18:00:00.000Z" }];
+    calendar.busyByTeam = { team_a: requestedDayBusy, team_b: requestedDayBusy };
+    const agent: AgentGateway = { async createConversation() { throw new Error("strict availability must not reach agent"); }, async runTurn() { throw new Error("strict availability must not reach agent"); } };
+    const deps = { repository, telegram, calendar, agent, calendarReservation: testCalendarReservation(repository, calendar), now: () => TEST_NOW };
+
+    await expect(processTelegramWebhook(update(15190, "Покажи свободные слоты"), deps)).resolves.toEqual({ kind: "processed" });
+
+    expect(telegram.messages.at(-1)?.text).toContain("На выбранную дату свободных слотов нет");
+    const markup = telegram.messages.at(-1)?.replyMarkup;
+    if (!markup || !("inline_keyboard" in markup)) throw new Error("slot keyboard missing");
+    expect(markup.inline_keyboard.flat().map((button) => button.text)).toHaveLength(3);
+    expect(markup.inline_keyboard.flat().every((button) => button.text.includes("25"))).toBe(true);
+    expect(calendar.availabilityQueries).toHaveLength(2);
+    expect(calendar.creates).toHaveLength(0);
+  });
+
   it.each(["show slots, 1 bathroom", "вечером, 2 санузла"])("does not fast-path availability wording mixed with new cleaning details: %s", async (message) => {
     const deps = dependencies();
     const runTurn = vi.spyOn(deps.agent, "runTurn");
@@ -731,6 +758,104 @@ describe("Telegram webhook", () => {
     expect(calendar.availabilityQueries).toHaveLength(2);
     expect(repository.getLead(1001)).toMatchObject({ pendingPreferredDate: undefined, clientData: { preferredDate: "2026-08-29" } });
     expect(telegram.messages.at(-1)?.text).toContain("Ближайшее свободное время");
+  });
+
+  it("uses bare post-quote Russian yes only for the matching delivered active quote", async () => {
+    const repository = new InMemoryLeadRepository();
+    const telegram = new FakeTelegramGateway();
+    const calendar = new FakeCalendarGateway();
+    const lead = await repository.createLead({ telegramChatId: 1001, firstMessageLanguage: "ru", agentConfigVersion: 5 });
+    lead.status = "qualified";
+    lead.quoteValidity = "active";
+    lead.quotedAt = TEST_NOW.toISOString();
+    lead.pendingSchedulingConsentQuotedAt = TEST_NOW.toISOString();
+    lead.quote = { amountRsd: 6000, baseRsd: 6000, volumeDiscountPercent: 0, bathroomSurchargeRsd: 0, petHairSurchargeRsd: 0, extrasSurchargeRsd: 0, sameDayApplied: false, pricingRulesVersion: 1 };
+    lead.clientData = { cleaningType: "standard", areaM2: 75, rooms: 3, bathrooms: 1, heavyPetHair: false, extras: [], addressOrDistrict: "Врачар", preferredDate: "2026-08-29" };
+    await repository.saveLead(lead);
+    const agent: AgentGateway = { async createConversation() { throw new Error("quote consent is backend-owned"); }, async runTurn() { throw new Error("quote consent is backend-owned"); } };
+    const deps = { repository, telegram, calendar, agent, calendarReservation: testCalendarReservation(repository, calendar), now: () => TEST_NOW };
+
+    await expect(processTelegramWebhook(update(15185, "Да."), deps)).resolves.toEqual({ kind: "processed" });
+
+    expect(calendar.availabilityQueries).toHaveLength(2);
+    expect(calendar.creates).toHaveLength(0);
+    expect(repository.getLead(1001)?.pendingSchedulingConsentQuotedAt).toBeUndefined();
+    expect(telegram.messages.at(-1)?.text).toContain("Ближайшее свободное время");
+  });
+
+  it("asks for date and time after bare quote consent when the quote has no preferred date", async () => {
+    const repository = new InMemoryLeadRepository();
+    const telegram = new FakeTelegramGateway();
+    const calendar = new FakeCalendarGateway();
+    const lead = await repository.createLead({ telegramChatId: 1001, firstMessageLanguage: "ru", agentConfigVersion: 5 });
+    lead.status = "qualified";
+    lead.quoteValidity = "active";
+    lead.quotedAt = TEST_NOW.toISOString();
+    lead.pendingSchedulingConsentQuotedAt = TEST_NOW.toISOString();
+    lead.quote = { amountRsd: 4000, baseRsd: 4000, volumeDiscountPercent: 0, bathroomSurchargeRsd: 0, petHairSurchargeRsd: 0, extrasSurchargeRsd: 0, sameDayApplied: false, pricingRulesVersion: 1 };
+    lead.clientData = { cleaningType: "standard", areaM2: 50, rooms: 2, bathrooms: 1, heavyPetHair: false, extras: [], addressOrDistrict: "Врачар" };
+    await repository.saveLead(lead);
+    const agent: AgentGateway = { async createConversation() { throw new Error("quote consent is backend-owned"); }, async runTurn() { throw new Error("quote consent is backend-owned"); } };
+    const deps = { repository, telegram, calendar, agent, calendarReservation: testCalendarReservation(repository, calendar), now: () => TEST_NOW };
+
+    await expect(processTelegramWebhook(update(15186, "да"), deps)).resolves.toEqual({ kind: "processed" });
+
+    expect(calendar.availabilityQueries).toHaveLength(0);
+    expect(calendar.creates).toHaveLength(0);
+    expect(repository.getLead(1001)?.pendingSchedulingConsentQuotedAt).toBeUndefined();
+    expect(telegram.messages.at(-1)?.text).toContain("На какой день и какое время");
+  });
+
+  it("does not fast-path an unbound bare yes and clears the stale consent marker", async () => {
+    const repository = new InMemoryLeadRepository();
+    const telegram = new FakeTelegramGateway();
+    const calendar = new FakeCalendarGateway();
+    const lead = await repository.createLead({ telegramChatId: 1001, firstMessageLanguage: "ru", agentConfigVersion: 5 });
+    lead.status = "qualified";
+    lead.quoteValidity = "active";
+    lead.quotedAt = TEST_NOW.toISOString();
+    lead.pendingSchedulingConsentQuotedAt = "2026-08-24T09:59:59.000Z";
+    lead.quote = { amountRsd: 4000, baseRsd: 4000, volumeDiscountPercent: 0, bathroomSurchargeRsd: 0, petHairSurchargeRsd: 0, extrasSurchargeRsd: 0, sameDayApplied: false, pricingRulesVersion: 1 };
+    lead.clientData = { cleaningType: "standard", areaM2: 50, rooms: 2, bathrooms: 1, heavyPetHair: false, extras: [], addressOrDistrict: "Врачар", preferredDate: "2026-08-29" };
+    await repository.saveLead(lead);
+    let turns = 0;
+    const agent: AgentGateway = {
+      async createConversation() { return { id: "stale-consent" }; },
+      async runTurn() { turns += 1; return { reply: "Уточню, что вам удобнее.", toolResults: [], steps: 1 }; },
+    };
+    const deps = { repository, telegram, calendar, agent, calendarReservation: testCalendarReservation(repository, calendar), now: () => TEST_NOW };
+
+    await expect(processTelegramWebhook(update(15187, "да"), deps)).resolves.toEqual({ kind: "processed" });
+
+    expect(turns).toBe(1);
+    expect(calendar.availabilityQueries).toHaveLength(0);
+    expect(repository.getLead(1001)?.pendingSchedulingConsentQuotedAt).toBeUndefined();
+  });
+
+  it("re-queries a standalone time window from the preferred date without an old offer, but keeps later offer-bound", async () => {
+    const repository = new InMemoryLeadRepository();
+    const telegram = new FakeTelegramGateway();
+    const calendar = new FakeCalendarGateway();
+    const lead = await repository.createLead({ telegramChatId: 1001, firstMessageLanguage: "ru", agentConfigVersion: 5 });
+    lead.status = "qualified";
+    lead.quoteValidity = "active";
+    lead.quote = { amountRsd: 6000, baseRsd: 6000, volumeDiscountPercent: 0, bathroomSurchargeRsd: 0, petHairSurchargeRsd: 0, extrasSurchargeRsd: 0, sameDayApplied: false, pricingRulesVersion: 1 };
+    lead.clientData = { cleaningType: "standard", areaM2: 75, rooms: 3, bathrooms: 1, heavyPetHair: false, extras: [], addressOrDistrict: "Врачар", preferredDate: "2026-08-29" };
+    await repository.saveLead(lead);
+    let turns = 0;
+    const agent: AgentGateway = {
+      async createConversation() { return { id: "window-no-offer" }; },
+      async runTurn() { turns += 1; return { reply: "Понял.", toolResults: [], steps: 1 }; },
+    };
+    const deps = { repository, telegram, calendar, agent, calendarReservation: testCalendarReservation(repository, calendar), now: () => TEST_NOW };
+
+    await expect(processTelegramWebhook(update(15188, "позже"), deps)).resolves.toEqual({ kind: "processed" });
+    expect(calendar.availabilityQueries).toHaveLength(0);
+    expect(turns).toBe(1);
+
+    await expect(processTelegramWebhook(update(15189, "вечером"), deps)).resolves.toEqual({ kind: "processed" });
+    expect(calendar.availabilityQueries).toHaveLength(2);
+    expect(turns).toBe(1);
   });
 
   it("uses the same safe failure path when a typed pending-date yes cannot query Calendar", async () => {
@@ -1079,6 +1204,7 @@ describe("Telegram webhook", () => {
     )).resolves.toEqual({ kind: "failed", failureCode: "telegram_delivery_failed" });
     expect(deps.repository.getLead(1001)).toMatchObject({ status: "new_lead" });
     expect(deps.repository.getLead(1001)).toMatchObject({ humanNeeded: true, humanNeededReason: "delivery_failed" });
+    expect(deps.repository.getLead(1001)?.pendingSchedulingConsentQuotedAt).toBeUndefined();
     expect(deps.repository.updates.get(3)).toMatchObject({ status: "failed" });
   });
 
@@ -1836,7 +1962,7 @@ describe("Telegram webhook", () => {
     deps.calendar.busyByTeam = { team_a: allHorizonBusy, team_b: allHorizonBusy };
 
     await expect(processTelegramWebhook(update(820, "Please show available slots again"), deps)).resolves.toEqual({ kind: "processed" });
-    expect(deps.telegram.messages.at(-1)?.text).toBe("There isn’t a suitable free time in the next two weeks. We can check another date.");
+    expect(deps.telegram.messages.at(-1)?.text).toBe("There are no free slots on that requested date over the next two weeks. We can check another date.");
     expect(deps.repository.getLead(1001)).toMatchObject({
       status: "qualified",
       quoteValidity: "active",

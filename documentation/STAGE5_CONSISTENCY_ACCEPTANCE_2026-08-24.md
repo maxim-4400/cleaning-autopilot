@@ -1,5 +1,11 @@
 # Stage 5 consistency slice — acceptance checklist
 
+> **Historical delivery record.** This checklist captures the 2026-08-24
+> dashboard consistency slice. For the current product contract and
+> implementation, use [MVP1 requirements](MVP1_REQUIREMENTS.md),
+> [Project context](../PROJECT_CONTEXT.md), and the
+> [documentation index](README.md).
+
 This document is the release gate for the 2026-08-24 Demo Console consistency
 slice. Every item below requires evidence from the actual production dashboard
 in the owner’s Chrome after the approved deployment. Local tests are necessary

@@ -121,6 +121,7 @@ export class SupabaseLeadRepository implements LeadRepository {
       quote_details: lead.quote ?? null,
       quote_validity: lead.quote ? lead.quoteValidity ?? "active" : null,
       quote_invalidated_at: lead.quoteInvalidatedAt ?? null,
+      pending_scheduling_consent_quoted_at: lead.pendingSchedulingConsentQuotedAt ?? null,
       pricing_rules_snapshot: lead.pricingRulesSnapshot ?? null,
       human_needed: lead.humanNeeded,
       human_needed_reason: lead.humanNeededReason ?? null,
@@ -439,6 +440,9 @@ function mapLead(row: Record<string, unknown>): StoredLead {
       ? row.quote_invalidated_at
       : undefined,
     quotedAt: typeof row.quoted_at === "string" ? row.quoted_at : undefined,
+    pendingSchedulingConsentQuotedAt: typeof row.pending_scheduling_consent_quoted_at === "string"
+      ? row.pending_scheduling_consent_quoted_at
+      : undefined,
     pricingRulesSnapshot: pricingRulesFromRow(row),
     humanNeeded: row.human_needed,
     humanNeededReason: isEnumValue(humanNeededReasons, row.human_needed_reason) ? row.human_needed_reason : undefined,

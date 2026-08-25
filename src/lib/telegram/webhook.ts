@@ -17,6 +17,7 @@ import {
   renderHumanNeededAlreadyHandedOffReply,
   renderHumanNeededUpdateReply,
   renderReservedAcknowledgementReply,
+  renderSchedulingConsentNeedsDateReply,
   renderNewAddressDivider,
   renderNoAvailabilityReply,
   renderNearestSlotAlternativesReply,
@@ -256,6 +257,29 @@ export async function processTelegramWebhook(
       return { kind: "processed" };
     }
     const now = turnNow;
+    const hasPendingSchedulingConsent = hasActivePendingSchedulingConsent(lead);
+    const bareSchedulingConsent = isBareSchedulingConsent(messageText);
+    // A quote acceptance is valid for exactly the next customer turn. Any
+    // other customer message consumes it before normal interpretation, so an
+    // old affirmative cannot later become an implicit availability request.
+    if (lead.pendingSchedulingConsentQuotedAt && (!hasPendingSchedulingConsent || !bareSchedulingConsent)) {
+      clearPendingSchedulingConsent(lead);
+      await dependencies.repository.saveLead(lead);
+    }
+    if (hasPendingSchedulingConsent && bareSchedulingConsent) {
+      clearPendingSchedulingConsent(lead);
+      await dependencies.repository.saveLead(lead);
+      const reply = lead.clientData.preferredDate && dependencies.calendarReservation && isEligibleForSlotReservation(lead)
+        ? await renderAvailabilityOffer({ lead, replyLanguage, dependencies, calendarReservation: dependencies.calendarReservation, options: { supersedeExisting: true } })
+        : renderSchedulingConsentNeedsDateReply(replyLanguage);
+      const delivered = await deliverReply({ updateId: update.update_id, lead, reply, dependencies });
+      if (delivered !== "succeeded") {
+        await dependencies.repository.markTelegramUpdateFailed(update.update_id, "telegram_delivery_failed");
+        return { kind: "failed", failureCode: "telegram_delivery_failed" };
+      }
+      await dependencies.repository.markTelegramUpdateProcessed(update.update_id);
+      return { kind: "processed" };
+    }
     // Incidental time words in an unrelated question (for example, "what is
     // the weather today?") are not booking intent. Once the conversation has
     // established cleaning context, a short follow-up such as "tomorrow" is
@@ -406,6 +430,7 @@ export async function processTelegramWebhook(
         if (operation.status !== "succeeded" || !operation.externalId) {
           lead.humanNeeded = true;
           lead.humanNeededReason = "conversation_ambiguous";
+          clearPendingSchedulingConsent(lead);
           await dependencies.repository.saveLead(lead);
           throw new Error("OpenAI conversation creation requires manual recovery");
         }
@@ -472,6 +497,7 @@ export async function processTelegramWebhook(
     let persistedHandoffFact = wasHumanNeededBeforeTurn && (backendHandoffLocationPersisted || (Boolean(relativePreferredDate) && lead.clientData.preferredDate === relativePreferredDate));
     let calendarFailure = false;
     let noAvailableSlots = false;
+    let noAvailableSlotsReason: "nonworking_day" | "requested_date_unavailable" | "requested_time_unavailable" | undefined;
     let offeredSlots: AvailabilitySlot[] | undefined;
     await sendTyping(dependencies.telegram, lead.telegramChatId);
     const agentTurnOperation = await dependencies.repository.createIntegrationOperation({
@@ -545,6 +571,7 @@ export async function processTelegramWebhook(
           if (!result.ok) {
             if (result.error === "no_available_slots") {
               noAvailableSlots = true;
+              noAvailableSlotsReason = result.availabilityReason;
               await dependencies.repository.appendActivity(lead.id, "calendar_no_availability", { error_code: result.error });
             }
             return { ok: false, error: result.error };
@@ -602,6 +629,7 @@ export async function processTelegramWebhook(
     if (humanNeededReason) {
       lead.humanNeeded = true;
       lead.humanNeededReason = humanNeededReason;
+      clearPendingSchedulingConsent(lead);
       quote = undefined;
       // An exhausted scheduling horizon does not invalidate a previously
       // delivered price. The model may still explicitly flag it for a human.
@@ -628,7 +656,7 @@ export async function processTelegramWebhook(
     const reply = offeredSlots
       ? renderSlotOfferReply(replyLanguage, offeredSlots)
       : noAvailableSlots
-      ? renderNoAvailabilityReply(replyLanguage)
+      ? renderNoAvailabilityReply(replyLanguage, noAvailableSlotsReason)
       : quote && !humanNeededReason
       ? renderQuoteReply(replyLanguage, quote.amountRsd, quoteReplyOptions(lead.clientData, config.pricingRules))
       : wasHumanNeededBeforeTurn
@@ -655,6 +683,7 @@ export async function processTelegramWebhook(
       if (!lead.humanNeeded) {
         lead.humanNeeded = true;
         lead.humanNeededReason = deliveryOutcome === "ambiguous" ? "delivery_ambiguous" : "delivery_failed";
+        clearPendingSchedulingConsent(lead);
       }
       await dependencies.repository.saveLead(lead);
       await dependencies.repository.appendActivity(lead.id, "telegram_delivery_failed", { outcome: deliveryOutcome });
@@ -664,6 +693,12 @@ export async function processTelegramWebhook(
 
     if (quote && !humanNeededReason) {
       lead.status = "qualified";
+      // This marker exists only after the customer has actually received the
+      // typed quote. It also binds a bare next-turn confirmation to this exact
+      // active quote instead of to model prose or a Conversation id.
+      lead.pendingSchedulingConsentQuotedAt = lead.quoteValidity === "active" && lead.quotedAt
+        ? lead.quotedAt
+        : undefined;
       await dependencies.repository.saveLead(lead);
       await dependencies.repository.appendActivity(lead.id, "quote_delivered", { amount_rsd: quote.amountRsd });
     }
@@ -719,14 +754,15 @@ async function renderAvailabilityOffer(input: {
 }): Promise<TelegramRenderedReply> {
   const offer = await input.calendarReservation.offerSlots(input.lead, input.replyLanguage, input.options);
   if (offer.ok) return offer.match === "nearest_alternatives"
-    ? renderNearestSlotAlternativesReply(input.replyLanguage, offer.slots)
+    ? renderNearestSlotAlternativesReply(input.replyLanguage, offer.slots, offer.availabilityReason === "exact" ? "requested_date_unavailable" : offer.availabilityReason)
     : renderSlotOfferReply(input.replyLanguage, offer.slots);
   if (offer.error === "no_available_slots") {
     await input.dependencies.repository.appendActivity(input.lead.id, "calendar_no_availability", { error_code: offer.error });
-    return renderNoAvailabilityReply(input.replyLanguage);
+    return renderNoAvailabilityReply(input.replyLanguage, offer.availabilityReason);
   }
   input.lead.humanNeeded = true;
   input.lead.humanNeededReason = "calendar_unavailable";
+  clearPendingSchedulingConsent(input.lead);
   await input.dependencies.repository.saveLead(input.lead);
   await input.dependencies.repository.appendActivity(input.lead.id, "calendar_availability_failed", { error_code: offer.error });
   return renderCalendarAvailabilityFailedReply(input.replyLanguage);
@@ -967,10 +1003,10 @@ async function resolveScheduleRecoveryRequest(input: {
 
   const nowIso = input.now.toISOString();
   const activeTokens = await input.repository.listActiveCalendarSlotTokens({ leadId: input.lead.id, now: nowIso });
-  // A recovery query is meaningful only against a still-valid, typed server
-  // offer. Do not make model prose, a Conversation id, or an old request date
-  // substitute for that durable scheduling state.
-  if (activeTokens.length === 0) return undefined;
+  // "Later" is relative to a displayed offer, so it must retain a durable
+  // token. A standalone time window or "next day" is safe from the persisted
+  // preferred date after an active quote, even if an old offer has expired.
+  if (isLater && activeTokens.length === 0) return undefined;
 
   const offeredDate = activeTokens.length > 0 ? earliestOfferedDate(activeTokens) : undefined;
   const baseDate = offeredDate ?? input.lead.clientData.preferredDate;
@@ -1199,11 +1235,16 @@ async function reserveSelectedSlot(input: {
     return "stale";
   }
 
+  if (input.lead.pendingSchedulingConsentQuotedAt) {
+    clearPendingSchedulingConsent(input.lead);
+    await input.dependencies.repository.saveLead(input.lead);
+  }
   const reservation = await input.dependencies.calendarReservation.reserveSlot(input.lead, selectedSlot.token, input.replyLanguage);
   if (!reservation.ok) {
     if (isStaleSlotReservationError(reservation.error)) return "stale";
     input.lead.humanNeeded = true;
     input.lead.humanNeededReason = reservation.ambiguous ? "calendar_ambiguous" : "calendar_unavailable";
+    clearPendingSchedulingConsent(input.lead);
     await input.dependencies.repository.saveLead(input.lead);
     await input.dependencies.repository.appendActivity(input.lead.id, "calendar_reservation_failed", { error_code: reservation.error });
     const delivered = await deliverReply({
@@ -1280,6 +1321,7 @@ async function markReservationDeliveryFailure(
 ): Promise<void> {
   lead.humanNeeded = true;
   lead.humanNeededReason = outcome === "ambiguous" ? "delivery_ambiguous" : "delivery_failed";
+  clearPendingSchedulingConsent(lead);
   await dependencies.repository.saveLead(lead);
   await dependencies.repository.appendActivity(lead.id, "calendar_reservation_delivery_failed", { outcome });
 }
@@ -1607,6 +1649,7 @@ async function recoverTechnicalConversationFailure(input: {
   if (previousRecovery?.status === "succeeded") {
     lead.humanNeeded = true;
     lead.humanNeededReason = "conversation_ambiguous";
+    clearPendingSchedulingConsent(lead);
     await dependencies.repository.saveLead(lead);
     const delivered = await deliverReply({ updateId, lead, reply: renderHumanNeededReply(replyLanguage), dependencies });
     if (delivered === "succeeded") {
@@ -1664,6 +1707,30 @@ function supersedeQuote(lead: StoredLead, now: Date = new Date()): void {
   if (!lead.quote) return;
   lead.quoteValidity = "superseded";
   lead.quoteInvalidatedAt = now.toISOString();
+  clearPendingSchedulingConsent(lead);
+}
+
+function hasActivePendingSchedulingConsent(lead: StoredLead): boolean {
+  return Boolean(
+    lead.pendingSchedulingConsentQuotedAt &&
+    lead.quote &&
+    lead.quoteValidity === "active" &&
+    lead.quotedAt === lead.pendingSchedulingConsentQuotedAt &&
+    !lead.humanNeeded &&
+    !lead.calendarEventId,
+  );
+}
+
+function clearPendingSchedulingConsent(lead: StoredLead): void {
+  lead.pendingSchedulingConsentQuotedAt = undefined;
+}
+
+function isBareSchedulingConsent(message: string): boolean {
+  const normalized = message.normalize("NFKC").toLocaleLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  return /^(?:yes|yeah|yep|sure|да|ага|давай|može|moze|da|може)$/iu.test(normalized);
 }
 
 function dropNullValues(value: Record<string, unknown>): Record<string, unknown> {

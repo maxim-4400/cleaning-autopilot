@@ -35,6 +35,17 @@ export function renderQuoteReply(language: string, amountRsd: number, options: {
     : { text: `<b>Your cleaning would cost: ${amount}</b>\n\nIf that works for you, I can show the nearest available times.`, provenance: "template" };
 }
 
+/** The first post-quote "yes" is useful only when a date is already known. */
+export function renderSchedulingConsentNeedsDateReply(language: string): TelegramRenderedReply {
+  if (isSerbianLanguage(language)) return { text: serbianText(language,
+    "Odlično. Koji datum i koje vreme bi vam najviše odgovarali? Na primer, 29. avgust uveče.",
+    "Одлично. Који датум и које време би вам највише одговарали? На пример, 29. август увече.",
+  ), provenance: "template" };
+  return isRussianLanguage(language)
+    ? { text: "Отлично. На какой день и какое время вам удобнее? Например, 29 августа вечером.", provenance: "template" }
+    : { text: "Great. Which date and time would suit you best? For example, 29 August in the evening.", provenance: "template" };
+}
+
 export function renderSlotOfferReply(language: string, slots: AvailabilitySlot[]): TelegramRenderedReply {
   const header = isSerbianLanguage(language)
     ? serbianText(language, "<b>Najbliži slobodni termini</b>\nIzaberite dugme ispod ili odgovorite brojem opcije.", "<b>Најближи слободни термини</b>\nИзаберите дугме испод или одговорите бројем опције.")
@@ -46,12 +57,17 @@ export function renderSlotOfferReply(language: string, slots: AvailabilitySlot[]
 }
 
 /** The requested range was checked first; these are real, explicitly relaxed alternatives. */
-export function renderNearestSlotAlternativesReply(language: string, slots: AvailabilitySlot[]): TelegramRenderedReply {
+export function renderNearestSlotAlternativesReply(language: string, slots: AvailabilitySlot[], reason: "nonworking_day" | "requested_date_unavailable" | "requested_time_unavailable" = "requested_time_unavailable"): TelegramRenderedReply {
+  const dateUnavailable = reason === "requested_date_unavailable";
+  const nonworkingDay = reason === "nonworking_day";
   const header = isSerbianLanguage(language)
-    ? serbianText(language, "<b>U traženom periodu nema slobodnog termina.</b>\nEvo najbližih stvarnih alternativa:", "<b>У траженом периоду нема слободног термина.</b>\nЕво најближих стварних алтернатива:")
+    ? serbianText(language,
+      nonworkingDay ? "<b>Nedeljom ne radimo.</b>\nEvo najbližih stvarnih alternativa:" : dateUnavailable ? "<b>Na traženi datum nema slobodnog termina.</b>\nEvo najbližih stvarnih alternativa:" : "<b>U traženo vreme nema slobodnog termina.</b>\nEvo najbližih stvarnih alternativa:",
+      nonworkingDay ? "<b>Недељом не радимо.</b>\nЕво најближих стварних алтернатива:" : dateUnavailable ? "<b>На тражени датум нема слободног термина.</b>\nЕво најближих стварних алтернатива:" : "<b>У тражено време нема слободног термина.</b>\nЕво најближих стварних алтернатива:",
+    )
     : isRussianLanguage(language)
-    ? "<b>В указанное время свободных слотов нет.</b>\nВот ближайшие реальные варианты:"
-    : "<b>There are no free slots in that requested time.</b>\nHere are the nearest real alternatives:";
+    ? nonworkingDay ? "<b>По воскресеньям мы не работаем.</b>\nВот ближайшие реальные варианты:" : dateUnavailable ? "<b>На выбранную дату свободных слотов нет.</b>\nВот ближайшие реальные варианты:" : "<b>В указанное время свободных слотов нет.</b>\nВот ближайшие реальные варианты:"
+    : nonworkingDay ? "<b>We do not work on Sundays.</b>\nHere are the nearest real alternatives:" : dateUnavailable ? "<b>There are no free slots on that requested date.</b>\nHere are the nearest real alternatives:" : "<b>There are no free slots in that requested time.</b>\nHere are the nearest real alternatives:";
   const options = slots.map((slot) => `${slot.displayOrder}. ${escapePlainText(slot.label)}.`).join("\n");
   return { text: `${header}\n\n${options}`, replyMarkup: slotKeyboard(slots, replyLocaleForKeyboard(language)), provenance: "template" };
 }
@@ -229,14 +245,23 @@ export function renderStaleSlotReply(language: string): TelegramRenderedReply {
     : { text: "That option is no longer available. Send me a message and I’ll check fresh times.", provenance: "template" };
 }
 
-export function renderNoAvailabilityReply(language: string): TelegramRenderedReply {
+export function renderNoAvailabilityReply(language: string, reason: "nonworking_day" | "requested_date_unavailable" | "requested_time_unavailable" = "requested_date_unavailable"): TelegramRenderedReply {
+  if (reason === "nonworking_day") {
+    if (isSerbianLanguage(language)) return { text: serbianText(language,
+      "Nedeljom ne radimo. Možemo proveriti drugi datum.",
+      "Недељом не радимо. Можемо проверити други датум.",
+    ), provenance: "template" };
+    return isRussianLanguage(language)
+      ? { text: "По воскресеньям мы не работаем. Можем проверить другую дату.", provenance: "template" }
+      : { text: "We do not work on Sundays. We can check another date.", provenance: "template" };
+  }
   if (isSerbianLanguage(language)) return { text: serbianText(language,
-    "U naredne dve nedelje nema odgovarajućeg slobodnog termina. Možemo proveriti drugi datum.",
-    "У наредне две недеље нема одговарајућег слободног термина. Можемо проверити други датум.",
+    reason === "requested_time_unavailable" ? "U traženo vreme nema slobodnog termina u naredne dve nedelje. Možemo proveriti drugi period." : "Na traženi datum nema slobodnog termina u naredne dve nedelje. Možemo proveriti drugi datum.",
+    reason === "requested_time_unavailable" ? "У тражено време нема слободног термина у наредне две недеље. Можемо проверити други период." : "На тражени датум нема слободног термина у наредне две недеље. Можемо проверити други датум.",
   ), provenance: "template" };
   return isRussianLanguage(language)
-    ? { text: "В ближайшие две недели подходящего свободного времени пока нет. Можем проверить другую дату.", provenance: "template" }
-    : { text: "There isn’t a suitable free time in the next two weeks. We can check another date.", provenance: "template" };
+    ? { text: reason === "requested_time_unavailable" ? "В указанное время в ближайшие две недели свободных слотов нет. Можем проверить другой период." : "На выбранную дату в ближайшие две недели свободных слотов нет. Можем проверить другую дату.", provenance: "template" }
+    : { text: reason === "requested_time_unavailable" ? "There are no free slots in that requested time over the next two weeks. We can check another time range." : "There are no free slots on that requested date over the next two weeks. We can check another date.", provenance: "template" };
 }
 
 export function renderNewAddressDivider(language: string): TelegramRenderedReply {

@@ -1,5 +1,11 @@
 # Cleaning Autopilot MVP1 — staged implementation plan
 
+> **Historical delivery record.** This plan preserves the original staged
+> implementation and review gates. For the current product contract and
+> implementation, use [MVP1 requirements](MVP1_REQUIREMENTS.md),
+> [Project context](../PROJECT_CONTEXT.md), and the
+> [documentation index](README.md).
+
 ## Назначение
 
 Этот документ задаёт рабочую последовательность для реализации MVP1 более дешёвой моделью и контрольные границы review. Продуктовый контракт находится в `MVP1_REQUIREMENTS.md`, а фактическое состояние проекта — в корневом `PROJECT_CONTEXT.md`.

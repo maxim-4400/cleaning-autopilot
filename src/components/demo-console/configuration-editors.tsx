@@ -54,7 +54,7 @@ export function ConfigurationEditors({ accessToken, pricingRules, prompt, savedA
       setMeta({ savedAt: result.data.savedAt, source: result.data.source, sections: result.data.sections });
       if (section === "prompt") { const next = reset ? result.data.systemPrompt : promptValue; setPromptValue(next); setSavedPrompt(next); }
       else { const next = reset ? result.data.pricingRules : pricingValue; setPricingValue(next); setSavedPricing(next); }
-      setSection(section, { pending: false, message: reset ? "Restored to the baseline" : "Saved" });
+      setSection(section, { pending: false, message: reset ? "Project defaults restored" : "Saved" });
     });
   };
   const updatePricing = (path: PricingPath, raw: string) => { const value = Number(raw); setPricingValue((current) => setPricingPath(current, path, Number.isFinite(value) ? value : 0)); setSection("pricing", { pending: false }); };
@@ -72,14 +72,14 @@ function PricingGroup({ fields, label, onChange, pricing, suffix }: { fields: Ar
 function SectionActions({ dirty, message, onReset, onSave, pending, section }: { dirty: boolean; message?: string; onReset: () => void; onSave: () => void; pending: boolean; section: Section }) {
   const name = section === "prompt" ? "prompt" : "pricing";
   const confirmReset = () => {
-    const confirmed = window.confirm(`Use the shipped baseline for only the ${name} settings? This does not change the other section.`);
+    const confirmed = window.confirm(`Restore project defaults for only the ${name} settings? This does not change the other section.`);
     if (confirmed) onReset();
   };
-  return <div className="mt-6 flex flex-wrap items-center gap-3 border-t border-slate-100 pt-5"><button className="min-h-11 rounded-xl bg-teal-700 px-4 text-sm font-bold text-white transition hover:bg-teal-800 disabled:cursor-not-allowed disabled:opacity-50" disabled={pending || !dirty} onClick={onSave} type="button">{pending ? "Saving…" : `Save ${name}`}</button><button className="min-h-11 rounded-xl border border-slate-300 bg-white px-4 text-sm font-bold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50" disabled={pending} onClick={confirmReset} type="button">Use shipped baseline</button>{message && <p aria-live="polite" className="text-sm font-medium text-slate-600">{message}</p>}</div>;
+  return <div className="mt-6 flex flex-wrap items-center gap-3 border-t border-slate-100 pt-5"><button className="min-h-11 rounded-xl bg-teal-700 px-4 text-sm font-bold text-white transition hover:bg-teal-800 disabled:cursor-not-allowed disabled:opacity-50" disabled={pending || !dirty} onClick={onSave} type="button">{pending ? "Saving…" : `Save ${name}`}</button><button className="min-h-11 rounded-xl border border-slate-300 bg-white px-4 text-sm font-bold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50" disabled={pending} onClick={confirmReset} type="button">Restore project defaults</button>{message && <p aria-live="polite" className="text-sm font-medium text-slate-600">{message}</p>}</div>;
 }
 
 function SectionStatus({ section, state }: { section: Section; state: ConfigSectionState }) {
-  const label = state.mode === "baseline" ? `Following shipped ${state.shippedBaselineRevision} baseline` : `Custom override preserved on this server. Shipped ${state.shippedBaselineRevision} baseline is available.`;
+  const label = state.mode === "baseline" ? "Using the latest project defaults" : "Custom version saved. Latest project defaults are available";
   return <p className="mt-3 text-sm font-medium text-teal-800" data-config-mode={state.mode}>{section === "prompt" ? "Prompt" : "Pricing"}: {label}</p>;
 }
 
