@@ -21,6 +21,11 @@ describe("effective agent configuration", () => {
           systemPrompt: "Active file prompt",
           pricingRules,
           pricingRulesText: JSON.stringify(pricingRules),
+          revision: "a".repeat(64),
+          sections: {
+            prompt: { mode: "custom" as const, semanticRevision: "custom", shippedBaselineRevision: "mvp-0.9.1", sha256: "b".repeat(64), revision: "c".repeat(64) },
+            pricing: { mode: "custom" as const, semanticRevision: "custom", shippedBaselineRevision: "mvp-0.9.1", sha256: "d".repeat(64), revision: "e".repeat(64) },
+          },
         };
       },
     });

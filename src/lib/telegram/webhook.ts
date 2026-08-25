@@ -3,13 +3,15 @@ import { randomUUID } from "node:crypto";
 
 import { AgentTurnTechnicalError, type AgentGateway } from "@/lib/agent/gateway";
 import { CalendarReservationService } from "@/lib/calendar/reservation-service";
+import type { SlotOfferOptions } from "@/lib/calendar/reservation-service";
 import { clientDataPatchSchema, humanNeededReasons, type AgentToolName, type AgentTurn, type AvailabilitySlot, type ClientData, type HumanNeededReason, type PricingRules, type Quote } from "@/lib/contracts/domain";
-import type { LeadRepository, StoredAgentConfig, StoredLead } from "@/lib/leads/repository";
+import type { LeadRepository, StoredAgentConfig, StoredCalendarSlotToken, StoredLead } from "@/lib/leads/repository";
 import { calculatePricingDecision } from "@/lib/pricing/engine";
 import { getEffectiveAgentConfig } from "@/lib/runtime-config/effective-agent-config";
 import { TelegramDeliveryError, type TelegramGateway, type TelegramReplyMarkup } from "@/lib/telegram/gateway";
 import {
   renderAgentReply,
+  renderCalendarAvailabilityFailedReply,
   renderCalendarReservationFailedReply,
   renderHumanNeededReply,
   renderHumanNeededAlreadyHandedOffReply,
@@ -17,6 +19,7 @@ import {
   renderReservedAcknowledgementReply,
   renderNewAddressDivider,
   renderNoAvailabilityReply,
+  renderNearestSlotAlternativesReply,
   renderQuoteReply,
   renderReservationPendingReply,
   renderSlotOfferReply,
@@ -298,14 +301,25 @@ export async function processTelegramWebhook(
       await dependencies.repository.markTelegramUpdateProcessed(update.update_id);
       return { kind: "processed" };
     }
-    if (lead.pendingPreferredDate && lead.dateProposalExpiresAt && new Date(lead.dateProposalExpiresAt).getTime() > now.getTime() && isProposalConfirmation(messageText)) {
+    if (lead.pendingPreferredDate && lead.dateProposalExpiresAt && new Date(lead.dateProposalExpiresAt).getTime() > now.getTime() && lead.dateProposalVersion && isProposalConfirmation(messageText)) {
       const nextClientData = mergeClientData(lead.clientData, { preferredDate: lead.pendingPreferredDate }, now);
       if (pricingInputsChanged(lead.clientData, nextClientData)) supersedeQuote(lead, now);
       lead.clientData = nextClientData;
       clearDateProposal(lead);
       await dependencies.repository.saveLead(lead);
       await dependencies.repository.appendActivity(lead.id, "date_proposal_confirmed", { preferred_date: nextClientData.preferredDate });
-      const delivered = await deliverReply({ updateId: update.update_id, lead, reply: renderWeekendConfirmation(replyLanguage, nextClientData.preferredDate!), dependencies });
+      // The persisted date proposal is a typed, expiring and versioned
+      // backend object. A bare "да" can only take this path, never infer an
+      // availability promise from model prose or a Conversation id.
+      const offerReply = dependencies.calendarReservation && isEligibleForSlotReservation(lead)
+        ? await renderAvailabilityOffer({ lead, replyLanguage, dependencies, calendarReservation: dependencies.calendarReservation, options: { supersedeExisting: true } })
+        : undefined;
+      const delivered = await deliverReply({
+        updateId: update.update_id,
+        lead,
+        reply: offerReply ?? renderWeekendConfirmation(replyLanguage, nextClientData.preferredDate!),
+        dependencies,
+      });
       if (delivered !== "succeeded") { await dependencies.repository.markTelegramUpdateFailed(update.update_id, "telegram_delivery_failed"); return { kind: "failed", failureCode: "telegram_delivery_failed" }; }
       await dependencies.repository.markTelegramUpdateProcessed(update.update_id);
       return { kind: "processed" };
@@ -346,30 +360,26 @@ export async function processTelegramWebhook(
     // Availability is a backend-owned scheduling intent. Keep an unambiguous,
     // qualified availability-only request out of the OpenAI and Trello paths:
     // neither provider is needed to calculate the next offered slots.
-    const strictSchedulingIntent = isStrictTimeWindowRequest(messageText) || isStrictAvailabilityRequest(messageText);
+    let scheduleRecovery = dependencies.calendarReservation && isEligibleForSlotReservation(lead)
+      ? await resolveScheduleRecoveryRequest({ message: messageText, lead, now, repository: dependencies.repository })
+      : undefined;
+    if (scheduleRecovery?.clientDataChanged) {
+      if (pricingInputsChanged(lead.clientData, scheduleRecovery.clientData)) {
+        // A same-day request can become a later date (or the reverse), which
+        // changes the deterministic price. Never offer a slot against that
+        // stale quote; the normal quote path will show the new amount first.
+        supersedeQuote(lead, now);
+      }
+      lead.clientData = scheduleRecovery.clientData;
+      clearDateProposal(lead);
+      await dependencies.repository.saveLead(lead);
+      await dependencies.repository.appendActivity(lead.id, "schedule_recovery_requested", { preferred_date: lead.clientData.preferredDate, preferred_window: lead.clientData.preferredTimeWindow, kind: scheduleRecovery.kind });
+      if (!isEligibleForSlotReservation(lead)) scheduleRecovery = undefined;
+    }
+    const strictSchedulingIntent = Boolean(scheduleRecovery) || isStrictTimeWindowRequest(messageText) || isStrictAvailabilityRequest(messageText);
     const explicitSchedulingIntent = strictSchedulingIntent || hasExplicitSchedulingIntent(messageText);
     if (strictSchedulingIntent && dependencies.calendarReservation && isEligibleForSlotReservation(lead) && !lead.calendarEventId) {
-      const offer = await dependencies.calendarReservation.offerSlots(lead, replyLanguage);
-      if (!offer.ok && (
-        offer.error === "duration_exceeds_workday" ||
-        offer.error === "calendar_availability_failed" ||
-        offer.error === "calendar_slot_offer_persist_failed"
-      )) {
-        lead.humanNeeded = true;
-        lead.humanNeededReason = "calendar_unavailable";
-        await dependencies.repository.saveLead(lead);
-        await dependencies.repository.appendActivity(lead.id, "calendar_availability_failed", { error_code: offer.error });
-      } else if (!offer.ok && offer.error === "no_available_slots") {
-        lead.humanNeeded = true;
-        lead.humanNeededReason = "calendar_unavailable";
-        await dependencies.repository.saveLead(lead);
-        await dependencies.repository.appendActivity(lead.id, "calendar_no_availability", { error_code: offer.error });
-      }
-      const response = offer.ok
-        ? renderSlotOfferReply(replyLanguage, offer.slots)
-        : offer.error === "no_available_slots"
-        ? renderNoAvailabilityReply(replyLanguage)
-        : renderCalendarReservationFailedReply(replyLanguage);
+      const response = await renderAvailabilityOffer({ lead, replyLanguage, dependencies, calendarReservation: dependencies.calendarReservation, options: scheduleRecovery?.offerOptions });
       const delivered = await deliverReply({ updateId: update.update_id, lead, reply: response, dependencies });
       if (delivered !== "succeeded") { await dependencies.repository.markTelegramUpdateFailed(update.update_id, "telegram_delivery_failed"); return { kind: "failed", failureCode: "telegram_delivery_failed" }; }
       await dependencies.repository.markTelegramUpdateProcessed(update.update_id);
@@ -535,7 +545,6 @@ export async function processTelegramWebhook(
           if (!result.ok) {
             if (result.error === "no_available_slots") {
               noAvailableSlots = true;
-              humanNeededReason = "calendar_unavailable";
               await dependencies.repository.appendActivity(lead.id, "calendar_no_availability", { error_code: result.error });
             }
             return { ok: false, error: result.error };
@@ -632,7 +641,7 @@ export async function processTelegramWebhook(
         )
       : humanNeededReason
       ? calendarFailure
-        ? renderCalendarReservationFailedReply(replyLanguage)
+        ? renderCalendarAvailabilityFailedReply(replyLanguage)
         : renderHumanNeededReply(replyLanguage)
       : conversationalReply
       ?? renderAgentReply(turn.reply, replyLanguage);
@@ -698,6 +707,29 @@ export async function processTelegramWebhook(
       }
     }
   }
+}
+
+/** Shared direct-offer boundary for strict requests and typed pending `да`. */
+async function renderAvailabilityOffer(input: {
+  lead: StoredLead;
+  replyLanguage: ReplyLanguage;
+  dependencies: Stage2Dependencies;
+  calendarReservation: CalendarReservationService;
+  options?: SlotOfferOptions;
+}): Promise<TelegramRenderedReply> {
+  const offer = await input.calendarReservation.offerSlots(input.lead, input.replyLanguage, input.options);
+  if (offer.ok) return offer.match === "nearest_alternatives"
+    ? renderNearestSlotAlternativesReply(input.replyLanguage, offer.slots)
+    : renderSlotOfferReply(input.replyLanguage, offer.slots);
+  if (offer.error === "no_available_slots") {
+    await input.dependencies.repository.appendActivity(input.lead.id, "calendar_no_availability", { error_code: offer.error });
+    return renderNoAvailabilityReply(input.replyLanguage);
+  }
+  input.lead.humanNeeded = true;
+  input.lead.humanNeededReason = "calendar_unavailable";
+  await input.dependencies.repository.saveLead(input.lead);
+  await input.dependencies.repository.appendActivity(input.lead.id, "calendar_availability_failed", { error_code: offer.error });
+  return renderCalendarAvailabilityFailedReply(input.replyLanguage);
 }
 
 function telegramProfile(from: { id: number; first_name?: string; last_name?: string; username?: string } | undefined) {
@@ -898,9 +930,113 @@ function prefersSunday(message: string): boolean {
 function resolveTimeWindow(message: string): "morning" | "midday" | "evening" | undefined {
   const text = message.normalize("NFKC").toLocaleLowerCase();
   if (/(?:morning|утром|ujutru|ујутру)/u.test(text)) return "morning";
-  if (/(?:midday|noon|afternoon|дн[её]м|в середине дня|popodne|oko podne|поподне|око подне)/u.test(text)) return "midday";
-  if (/(?:evening|вечером|uveče|uvece|увече)/u.test(text)) return "evening";
+  if (/(?:midday|noon|afternoon|дн[её]м|в середине дня|ближе к обеду|popodne|oko podne|поподне|око подне)/u.test(text)) return "midday";
+  if (/(?:evening|вечером|после семи|после\s+19(?::00)?|uveče|uvece|увече)/u.test(text)) return "evening";
   return undefined;
+}
+
+type ScheduleRecoveryRequest = {
+  kind: "later" | "time_window" | "next_day";
+  clientData: ClientData;
+  clientDataChanged: boolean;
+  offerOptions: SlotOfferOptions;
+};
+
+/**
+ * A compact scheduling follow-up is resolved entirely by typed backend state.
+ * It is intentionally available only after a qualified active quote; a model
+ * cannot turn a conversational acknowledgement into a booking instruction.
+ */
+async function resolveScheduleRecoveryRequest(input: {
+  message: string;
+  lead: StoredLead;
+  now: Date;
+  repository: LeadRepository;
+}): Promise<ScheduleRecoveryRequest | undefined> {
+  const text = input.message.normalize("NFKC").toLocaleLowerCase().replace(/\s+/gu, " ").trim();
+  // This fast path deliberately accepts only a whole, compact scheduling
+  // follow-up. It must never try to prove the absence of every possible order
+  // detail: any added fact belongs to the normal agent/data-validation path.
+  if (!isSchedulingOnlyRecoveryMessage(text)) return undefined;
+  const isLater = /(?:^|\s)(?:позже|попозже|later|kasnije)(?:$|\s|[?!.,])/u.test(text);
+  const isNextDay = /(?:на\s+следующ(?:ий|его)\s+день|следующ(?:ий|его)\s+день|next day)/u.test(text);
+  const window = resolveTimeWindow(text);
+  const afterMinutes = resolveAfterLocalMinutes(text);
+  const hasRecoveryPhrase = isLater || isNextDay || window !== undefined || afterMinutes !== undefined;
+  if (!hasRecoveryPhrase) return undefined;
+
+  const nowIso = input.now.toISOString();
+  const activeTokens = await input.repository.listActiveCalendarSlotTokens({ leadId: input.lead.id, now: nowIso });
+  // A recovery query is meaningful only against a still-valid, typed server
+  // offer. Do not make model prose, a Conversation id, or an old request date
+  // substitute for that durable scheduling state.
+  if (activeTokens.length === 0) return undefined;
+
+  const offeredDate = activeTokens.length > 0 ? earliestOfferedDate(activeTokens) : undefined;
+  const baseDate = offeredDate ?? input.lead.clientData.preferredDate;
+  if (!baseDate) return undefined;
+  const preferredDate = isNextDay ? addBelgradeDays(baseDate, 1) : (isLater ? offeredDate! : baseDate);
+  const nextClientData = mergeClientData(input.lead.clientData, {
+    preferredDate,
+    ...(window ? { preferredTimeWindow: window } : {}),
+  }, input.now);
+  const minimumStartOnPreferredDate = isLater ? nextGridAfterLastOfferedStart(activeTokens, preferredDate) : undefined;
+  return {
+    kind: isLater ? "later" : isNextDay ? "next_day" : "time_window",
+    clientData: nextClientData,
+    clientDataChanged: JSON.stringify(nextClientData) !== JSON.stringify(input.lead.clientData),
+    offerOptions: {
+      ...(afterMinutes !== undefined ? { minimumLocalStartMinutes: afterMinutes } : {}),
+      ...(minimumStartOnPreferredDate ? { minimumStartOnPreferredDate } : {}),
+      supersedeExisting: true,
+    },
+  };
+}
+
+function isSchedulingOnlyRecoveryMessage(message: string): boolean {
+  const text = message.replace(/[?!.,;]+$/gu, "").trim();
+  return [
+    // Russian: these are the customer phrases supported by the typed recovery
+    // contract. Keep every expression bounded from ^ to $ so appended facts
+    // such as "вечером, две комнаты" never reach Calendar directly.
+    /^(?:а\s+)?(?:позже|попозже)(?:\s+(?:нет\s+)?слотов)?$/u,
+    /^(?:(?:а|а как насч[её]т|есть ли|будет ли)\s+)?после\s+(?:19(?::00)?|семи)(?:\s+(?:есть|слоты|есть\s+слоты))?$/u,
+    /^(?:(?:а|а как насч[её]т|есть ли|будет ли)\s+)?(?:утром|вечером|в середине дня|ближе к обеду)(?:\s+есть)?$/u,
+    /^(?:тогда\s+)?на\s+следующ(?:ий|его)\s+день(?:\s+(?:утром|вечером|в середине дня|ближе к обеду))?$/u,
+    // Equivalent compact English and Serbian time-only asks remain safe. They
+    // share the same typed active-offer precondition below.
+    /^(?:what about\s+)?later(?:\s+(?:slots?|times?))?$/u,
+    /^(?:(?:what about|is there|any)\s+)?after\s+(?:7|19(?::00)?)(?:\s*(?:pm))?$/u,
+    /^(?:(?:what about|is there|any)\s+)?(?:morning|midday|afternoon|evening|near noon)(?:\s+available)?$/u,
+    /^(?:then\s+)?next day(?:\s+(?:morning|midday|afternoon|evening|near noon))?$/u,
+    /^(?:a\s+)?kasnije(?:\s+(?:termini|vreme))?$/u,
+    /^(?:(?:a šta je sa|ima li|da li ima)\s+)?(?:ujutru|popodne|oko podne|uveče|uvece)(?:\s+ima)?$/u,
+  ].some((pattern) => pattern.test(text));
+}
+
+function resolveAfterLocalMinutes(text: string): number | undefined {
+  if (/(?:после\s+семи|после\s+19(?::00)?|after\s+(?:7|19(?::00)?)(?:\s*pm)?)/u.test(text)) return 19 * 60;
+  return undefined;
+}
+
+function earliestOfferedDate(tokens: StoredCalendarSlotToken[]): string {
+  return [...tokens]
+    .sort((left, right) => left.start.localeCompare(right.start) || left.displayOrder - right.displayOrder)
+    .map((token) => belgradeDate(new Date(token.start)))[0]!;
+}
+
+function nextGridAfterLastOfferedStart(tokens: StoredCalendarSlotToken[], preferredDate: string): string | undefined {
+  const starts = tokens
+    .filter((token) => belgradeDate(new Date(token.start)) === preferredDate)
+    .map((token) => new Date(token.start).getTime());
+  if (starts.length === 0) return undefined;
+  return new Date(Math.max(...starts) + 30 * 60_000).toISOString();
+}
+
+function addBelgradeDays(date: string, days: number): string {
+  const value = new Date(`${date}T12:00:00.000Z`);
+  value.setUTCDate(value.getUTCDate() + days);
+  return value.toISOString().slice(0, 10);
 }
 
 function isStrictTimeWindowRequest(message: string): boolean {

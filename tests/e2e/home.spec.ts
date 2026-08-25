@@ -13,12 +13,19 @@ const dashboardFixture = {
   trelloBoard: { kind: "projection", freshness: "fresh", observedAt: "2026-08-23T09:45:00.000Z", boardUrl: "https://trello.com/b/demo-board", cards: [{ title: "Standard cleaning · 75 m²", lifecycle: "booked", humanNeeded: false }] },
 };
 
+const configSectionsFixture = {
+  prompt: { mode: "baseline", semanticRevision: "mvp-0.9.1", shippedBaselineRevision: "mvp-0.9.1", sha256: "a".repeat(64), revision: "b".repeat(64) },
+  pricing: { mode: "baseline", semanticRevision: "mvp-0.9.1", shippedBaselineRevision: "mvp-0.9.1", sha256: "c".repeat(64), revision: "d".repeat(64) },
+};
+
 async function mockAuthenticatedConsole(page: Page, loginPath = "/login") {
   await page.route("https://auth.test/auth/v1/token?grant_type=password", async (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ access_token: "test-access-token", refresh_token: "test-refresh-token", expires_in: 3600, token_type: "bearer", user: { id: "00000000-0000-4000-8000-000000000001", aud: "authenticated", role: "authenticated", email: "admin@example.test" } }) }));
   await page.route("**/api/admin/dashboard", async (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify(dashboardFixture) }));
   await page.route("**/api/admin/demo-console-config", async (route) => {
     const pricingRules = { version: 1, standardRateRsdPerM2: 80, standardMinimumRsd: 4000, deepRateRsdPerM2: 160, deepMinimumRsd: 9000, extraBathroomRsd: 500, heavyPetHairRsd: 900, extrasRsd: { windows: 900, oven_inside: 1000, fridge_inside: 900, balcony_or_terrace: 1000 }, sameDayMultiplierPercent: 120, volumeDiscountPercent: { upTo100: 0, from101To150: 5, from151To200: 10 } };
-    return route.fulfill({ contentType: "application/json", body: JSON.stringify({ systemPrompt: "Current prompt", pricingRules, source: route.request().method() === "GET" ? "baseline" : "active", revision: "fixture-revision" }) });
+    const saved = route.request().method() === "PATCH";
+    const sections = saved ? { ...configSectionsFixture, prompt: { mode: "custom", semanticRevision: "custom", shippedBaselineRevision: "mvp-0.9.1", sha256: "f".repeat(64), revision: "0".repeat(64) } } : configSectionsFixture;
+    return route.fulfill({ contentType: "application/json", body: JSON.stringify({ systemPrompt: saved ? "Updated combined prompt" : "Current prompt", pricingRules, source: saved ? "active" : "baseline", revision: "e".repeat(64), sections }) });
   });
   await page.goto(loginPath);
   await page.getByLabel("Email").fill("admin@example.test");
@@ -55,7 +62,7 @@ test("does not label a pending booked lifecycle as a confirmed booking", async (
   const pendingFixture = { ...dashboardFixture, currentStatus: "recovery", currentStatusDetail: "Retrying Trello sync", latestLead: { ...dashboardFixture.latestLead, bookingConfirmed: false } };
   await page.route("https://auth.test/auth/v1/token?grant_type=password", async (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ access_token: "test-access-token", refresh_token: "test-refresh-token", expires_in: 3600, token_type: "bearer", user: { id: "00000000-0000-4000-8000-000000000001", aud: "authenticated", role: "authenticated", email: "admin@example.test" } }) }));
   await page.route("**/api/admin/dashboard", async (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify(pendingFixture) }));
-  await page.route("**/api/admin/demo-console-config", async (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ systemPrompt: "Current prompt", pricingRules: { version: 1, standardRateRsdPerM2: 80, standardMinimumRsd: 4000, deepRateRsdPerM2: 160, deepMinimumRsd: 9000, extraBathroomRsd: 500, heavyPetHairRsd: 900, extrasRsd: { windows: 900, oven_inside: 1000, fridge_inside: 900, balcony_or_terrace: 1000 }, sameDayMultiplierPercent: 120, volumeDiscountPercent: { upTo100: 0, from101To150: 5, from151To200: 10 } }, source: "baseline", revision: "fixture-revision" }) }));
+  await page.route("**/api/admin/demo-console-config", async (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ systemPrompt: "Current prompt", pricingRules: { version: 1, standardRateRsdPerM2: 80, standardMinimumRsd: 4000, deepRateRsdPerM2: 160, deepMinimumRsd: 9000, extraBathroomRsd: 500, heavyPetHairRsd: 900, extrasRsd: { windows: 900, oven_inside: 1000, fridge_inside: 900, balcony_or_terrace: 1000 }, sameDayMultiplierPercent: 120, volumeDiscountPercent: { upTo100: 0, from101To150: 5, from151To200: 10 } }, source: "baseline", revision: "e".repeat(64), sections: configSectionsFixture }) }));
   await page.goto("/login");
   await page.getByLabel("Email").fill("admin@example.test");
   await page.getByLabel("Password").fill("not-a-real-password");
@@ -98,11 +105,14 @@ test("keeps protected proof and menu usable on a phone", async ({ page }) => {
   await page.getByRole("link", { name: "Settings" }).click();
   await expect(page).toHaveURL(/\/settings$/);
   await expect(page.getByRole("textbox", { name: "Main Prompt" })).toBeVisible();
+  await expect(page.getByText("Prompt: Following shipped mvp-0.9.1 baseline")).toBeVisible();
+  await expect(page.getByText("Pricing: Following shipped mvp-0.9.1 baseline")).toBeVisible();
   await expect(page.getByRole("button", { name: "Save prompt" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Reset pricing" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Use shipped baseline" })).toHaveCount(2);
   await page.getByRole("textbox", { name: "Main Prompt" }).fill("Updated combined prompt");
   await page.getByRole("button", { name: "Save prompt" }).click();
   await expect(page.getByText("Saved", { exact: true })).toBeVisible();
+  await expect(page.getByText("Prompt: Custom override preserved on this server. Shipped mvp-0.9.1 baseline is available.")).toBeVisible();
   await page.getByRole("button", { name: "Open navigation" }).click();
   await expect(page.getByRole("link", { name: "Dashboard", exact: true })).toBeVisible();
 });
@@ -115,6 +125,7 @@ test("requires a focused confirmation before restoring one configuration section
       try {
         expect(dialog.type()).toBe("confirm");
         expect(dialog.message()).toContain("only the pricing settings");
+        expect(dialog.message()).toContain("shipped baseline");
         expect(dialog.message()).toContain("other section");
       } catch (error) {
         reject(error);
@@ -123,7 +134,7 @@ test("requires a focused confirmation before restoring one configuration section
       void dialog.dismiss().then(resolve, reject);
     });
   });
-  await page.getByRole("button", { name: "Reset pricing" }).click();
+  await page.getByRole("button", { name: "Use shipped baseline" }).nth(1).click();
   await confirmation;
   await expect(page.getByText("Restored to the baseline", { exact: true })).toHaveCount(0);
 });

@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "sections": {
+    "prompt": {
+      "current": {
+        "semanticRevision": "mvp-0.9.1",
+        "sha256": "9fb9684f09a242a2929272a117189567ab01245c4d4ebf8de43e04257581a320"
+      },
+      "history": [
+        {
+          "semanticRevision": "stage5-initial",
+          "sha256": "0f9d5e54b0bdf361ef83d932438bd0325c7494e8ac3968b813343bfa7bd9c53f"
+        },
+        {
+          "semanticRevision": "mvp-0.9.0",
+          "sha256": "bc788340b693ee874a22666ef77884cc5b60d9ec151f27aa204181a630b6c11c"
+        }
+      ]
+    },
+    "pricing": {
+      "current": {
+        "semanticRevision": "mvp-0.9.1",
+        "sha256": "dad1a8e046525231db8eae97ddb9694776b59b6664167f568718db602f6d70ef"
+      },
+      "history": []
+    }
+  }
+}

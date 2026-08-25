@@ -4,6 +4,7 @@ import type { AvailabilitySlot } from "@/lib/contracts/domain";
 import {
   renderAgentReply,
   renderBookingConfirmedReply,
+  renderCalendarAvailabilityFailedReply,
   renderCalendarReservationFailedReply,
   renderHumanNeededReply,
   renderNewAddressDivider,
@@ -102,7 +103,8 @@ describe("Telegram renderer", () => {
     expect(renderSlotOfferReply("sr-Latn", [slot]).text).toContain("Najbliži slobodni termini");
     expect(renderReservationReply("sr-Cyrl").text).toContain("Ваш термин је потврђен");
     expect(renderCalendarReservationFailedReply("sr-Latn").text).toContain("Nismo mogli bezbedno");
-    expect(renderHumanNeededReply("sr-Cyrl").text).toContain("Сачуваћу детаље");
+    expect(renderCalendarAvailabilityFailedReply("sr-Latn").text).toContain("nismo mogli bezbedno da proverimo");
+    expect(renderHumanNeededReply("sr-Cyrl").text).toContain("Сачуваћу захтев");
     expect(renderStaleSlotReply("sr-Latn").text).toContain("više nije dostupna");
     expect(renderNoAvailabilityReply("sr-Cyrl").text).toContain("наредне две недеље");
     expect(renderAgentReply("", "sr-Latn").text).toContain("Mogu");
