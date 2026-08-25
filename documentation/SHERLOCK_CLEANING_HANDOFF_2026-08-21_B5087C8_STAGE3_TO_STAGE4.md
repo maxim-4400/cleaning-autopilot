@@ -1,5 +1,11 @@
 # Sherlock Cleaning — hand-off после Этапа 3
 
+> **Historical delivery record.** This hand-off preserves the Stage 3 to Stage
+> 4 snapshot from 2026-08-21. For the current product contract and
+> implementation, use [MVP1 requirements](MVP1_REQUIREMENTS.md),
+> [Project context](../PROJECT_CONTEXT.md), and the
+> [documentation index](README.md).
+
 Уникальный идентификатор документа: `SHERLOCK-CLEANING-HANDOFF-2026-08-21-B5087C8-STAGE3-TO-STAGE4`.
 
 Дата snapshot: 2026-08-21, timezone `Europe/Belgrade`.

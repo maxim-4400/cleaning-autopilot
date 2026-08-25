@@ -105,14 +105,14 @@ test("keeps protected proof and menu usable on a phone", async ({ page }) => {
   await page.getByRole("link", { name: "Settings" }).click();
   await expect(page).toHaveURL(/\/settings$/);
   await expect(page.getByRole("textbox", { name: "Main Prompt" })).toBeVisible();
-  await expect(page.getByText("Prompt: Following shipped mvp-0.9.1 baseline")).toBeVisible();
-  await expect(page.getByText("Pricing: Following shipped mvp-0.9.1 baseline")).toBeVisible();
+  await expect(page.getByText("Prompt: Using the latest project defaults")).toBeVisible();
+  await expect(page.getByText("Pricing: Using the latest project defaults")).toBeVisible();
   await expect(page.getByRole("button", { name: "Save prompt" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Use shipped baseline" })).toHaveCount(2);
+  await expect(page.getByRole("button", { name: "Restore project defaults" })).toHaveCount(2);
   await page.getByRole("textbox", { name: "Main Prompt" }).fill("Updated combined prompt");
   await page.getByRole("button", { name: "Save prompt" }).click();
   await expect(page.getByText("Saved", { exact: true })).toBeVisible();
-  await expect(page.getByText("Prompt: Custom override preserved on this server. Shipped mvp-0.9.1 baseline is available.")).toBeVisible();
+  await expect(page.getByText("Prompt: Custom version saved. Latest project defaults are available")).toBeVisible();
   await page.getByRole("button", { name: "Open navigation" }).click();
   await expect(page.getByRole("link", { name: "Dashboard", exact: true })).toBeVisible();
 });
@@ -125,7 +125,7 @@ test("requires a focused confirmation before restoring one configuration section
       try {
         expect(dialog.type()).toBe("confirm");
         expect(dialog.message()).toContain("only the pricing settings");
-        expect(dialog.message()).toContain("shipped baseline");
+        expect(dialog.message()).toContain("Restore project defaults");
         expect(dialog.message()).toContain("other section");
       } catch (error) {
         reject(error);
@@ -134,9 +134,9 @@ test("requires a focused confirmation before restoring one configuration section
       void dialog.dismiss().then(resolve, reject);
     });
   });
-  await page.getByRole("button", { name: "Use shipped baseline" }).nth(1).click();
+  await page.getByRole("button", { name: "Restore project defaults" }).nth(1).click();
   await confirmation;
-  await expect(page.getByText("Restored to the baseline", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Project defaults restored", { exact: true })).toHaveCount(0);
 });
 
 test("retains the secure header and menu when configuration cannot be read", async ({ page }) => {

@@ -4,6 +4,7 @@ import { calendarIdForTeam, ComposioCalendarGateway, FakeCalendarGateway, parseC
 import { CalendarReservationService } from "@/lib/calendar/reservation-service";
 import { InMemoryLeadRepository } from "@/lib/leads/in-memory-repository";
 import { SchedulingEngine } from "@/lib/scheduling/engine";
+import { renderNearestSlotAlternativesReply } from "@/lib/telegram/renderer";
 
 const engine = new SchedulingEngine();
 const now = new Date("2026-08-24T06:00:00.000Z"); // 08:00 Europe/Belgrade, Monday
@@ -352,9 +353,67 @@ describe("CalendarReservationService", () => {
     const allHorizonBusy = [{ start: "2026-08-24T00:00:00.000Z", end: "2026-09-08T00:00:00.000Z" }];
     calendar.busyByTeam = { team_a: allHorizonBusy, team_b: allHorizonBusy };
 
-    await expect(service.offerSlots(lead, "en")).resolves.toEqual({ ok: false, error: "no_available_slots" });
+    await expect(service.offerSlots(lead, "en")).resolves.toEqual({ ok: false, error: "no_available_slots", availabilityReason: "requested_date_unavailable" });
     await expect(repository.listActiveCalendarSlotTokens({ leadId: lead.id, now: now.toISOString() })).resolves.toEqual([]);
     await expect(service.reserveSlot(lead, first.slots[0].token)).resolves.toEqual({ ok: false, error: "slot_offer_superseded" });
+  });
+
+  it("labels a fully busy requested weekday as date-unavailable while offering the next real day", async () => {
+    const repository = new InMemoryLeadRepository();
+    const calendar = new FakeCalendarGateway();
+    const service = new CalendarReservationService(repository, calendar, engine, () => now);
+    const lead = await qualifiedLead(repository, 131);
+    // 08:00–20:00 Belgrade on the requested Monday. Tuesday remains free.
+    const requestedDayBusy = [{ start: "2026-08-24T06:00:00.000Z", end: "2026-08-24T18:00:00.000Z" }];
+    calendar.busyByTeam = { team_a: requestedDayBusy, team_b: requestedDayBusy };
+
+    const offer = await service.offerSlots(lead, "en");
+
+    expect(offer).toMatchObject({ ok: true, match: "nearest_alternatives", availabilityReason: "requested_date_unavailable" });
+    if (!offer.ok) throw new Error(offer.error);
+    expect(offer.slots.every((slot) => slot.start.startsWith("2026-08-25"))).toBe(true);
+  });
+
+  it("labels a requested evening as time-unavailable when the day still has earlier free time", async () => {
+    const repository = new InMemoryLeadRepository();
+    const calendar = new FakeCalendarGateway();
+    const service = new CalendarReservationService(repository, calendar, engine, () => now);
+    const lead = await qualifiedLead(repository, 133);
+    lead.clientData = {
+      ...lead.clientData,
+      areaM2: 25,
+      preferredDate: "2026-08-25",
+      preferredTimeWindow: "evening",
+    };
+    // The requested Tuesday still has morning and midday capacity, but both
+    // teams are busy throughout the requested evening. Wednesday evening is
+    // genuinely free, so it is an alternative to the time, not the date.
+    const requestedEveningBusy = [{ start: "2026-08-25T14:00:00.000Z", end: "2026-08-25T18:00:00.000Z" }];
+    calendar.busyByTeam = { team_a: requestedEveningBusy, team_b: requestedEveningBusy };
+
+    const offer = await service.offerSlots(lead, "ru");
+
+    expect(offer).toMatchObject({ ok: true, match: "nearest_alternatives", availabilityReason: "requested_time_unavailable" });
+    if (!offer.ok) throw new Error(offer.error);
+    expect(offer.slots.every((slot) => slot.start.startsWith("2026-08-26"))).toBe(true);
+    expect(renderNearestSlotAlternativesReply("ru", offer.slots, "requested_time_unavailable").text)
+      .toContain("В указанное время свободных слотов нет");
+  });
+
+  it("keeps a partially free requested weekday as an exact offer", async () => {
+    const repository = new InMemoryLeadRepository();
+    const calendar = new FakeCalendarGateway();
+    const service = new CalendarReservationService(repository, calendar, engine, () => now);
+    const lead = await qualifiedLead(repository, 132);
+    // Leave the afternoon free on the requested Monday.
+    const morningBusy = [{ start: "2026-08-24T06:00:00.000Z", end: "2026-08-24T12:00:00.000Z" }];
+    calendar.busyByTeam = { team_a: morningBusy, team_b: morningBusy };
+
+    const offer = await service.offerSlots(lead, "en");
+
+    expect(offer).toMatchObject({ ok: true, match: "exact", availabilityReason: "exact" });
+    if (!offer.ok) throw new Error(offer.error);
+    expect(offer.slots.every((slot) => slot.start.startsWith("2026-08-24"))).toBe(true);
   });
 });
 

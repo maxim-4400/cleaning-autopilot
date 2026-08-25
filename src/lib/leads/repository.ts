@@ -31,6 +31,11 @@ export type StoredLead = {
   quoteValidity?: "active" | "superseded";
   quoteInvalidatedAt?: string;
   quotedAt?: string;
+  /**
+   * A one-turn backend-owned consent marker. It is set only after the typed
+   * quote template has been delivered and matches the currently active quote.
+   */
+  pendingSchedulingConsentQuotedAt?: string;
   pricingRulesSnapshot?: PricingRules;
   humanNeeded: boolean;
   humanNeededReason?: HumanNeededReason;

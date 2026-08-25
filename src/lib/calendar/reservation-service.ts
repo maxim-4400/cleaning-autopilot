@@ -9,6 +9,7 @@ import { isRussianLanguage, isSerbianCyrillic, isSerbianLanguage, type ReplyLang
 const tokenLifetimeMs = 30 * 60_000;
 
 export type SlotOfferMatch = "exact" | "nearest_alternatives";
+export type AvailabilityReason = "exact" | "nonworking_day" | "requested_date_unavailable" | "requested_time_unavailable";
 export type SlotOfferOptions = {
   /** Customer's exact clock constraint, in Europe/Belgrade local minutes. */
   minimumLocalStartMinutes?: number;
@@ -31,7 +32,10 @@ export class CalendarReservationService {
     lead: StoredLead,
     replyLanguage: ReplyLanguage,
     options: SlotOfferOptions = {},
-  ): Promise<{ ok: true; slots: AvailabilitySlot[]; match: SlotOfferMatch } | { ok: false; error: string }> {
+  ): Promise<
+    | { ok: true; slots: AvailabilitySlot[]; match: SlotOfferMatch; availabilityReason: "exact" | "nonworking_day" | "requested_date_unavailable" | "requested_time_unavailable" }
+    | { ok: false; error: string; availabilityReason?: Exclude<AvailabilityReason, "exact"> }
+  > {
     if (lead.status !== "qualified" || !lead.quote || lead.quoteValidity !== "active" || lead.humanNeeded) {
       return { ok: false, error: "active_qualified_quote_required" };
     }
@@ -62,6 +66,12 @@ export class CalendarReservationService {
     }
     let rawSlots: Array<Omit<AvailabilitySlot, "token" | "offerId" | "displayOrder" | "label">>;
     let match: SlotOfferMatch = "exact";
+    let availabilityReason: AvailabilityReason = "exact";
+    const hasRequestedTimeConstraint = Boolean(
+      lead.clientData.preferredTimeWindow ||
+      options.minimumLocalStartMinutes !== undefined ||
+      options.minimumStartOnPreferredDate,
+    );
     try {
       rawSlots = this.scheduling.findSlots({
         clientData: lead.clientData,
@@ -70,10 +80,20 @@ export class CalendarReservationService {
         minimumLocalStartMinutes: options.minimumLocalStartMinutes,
         minimumStartOnPreferredDate: options.minimumStartOnPreferredDate,
       });
+      // The engine searches the safe 14-day horizon. Any returned option on a
+      // later calendar day is an alternative, never an exact match for the
+      // customer's requested date. Sunday has its own, more specific reason.
+      if (rawSlots.length > 0 && isSunday(lead.clientData.preferredDate)) {
+        match = "nearest_alternatives";
+        availabilityReason = "nonworking_day";
+      } else if (rawSlots.length > 0 && !rawSlots.some((slot) => belgradeDate(slot.start) === lead.clientData.preferredDate)) {
+        match = "nearest_alternatives";
+        availabilityReason = hasRequestedTimeConstraint ? "requested_time_unavailable" : "requested_date_unavailable";
+      }
       // When a requested range has no exact slot, show actual closest times
       // rather than reporting a false empty calendar. The response renderer
       // makes the relaxation explicit.
-      if (rawSlots.length === 0 && (lead.clientData.preferredTimeWindow || options.minimumLocalStartMinutes !== undefined || options.minimumStartOnPreferredDate)) {
+      if (rawSlots.length === 0 && hasRequestedTimeConstraint) {
         rawSlots = rankNearestAlternatives(this.scheduling.findSlots({
           clientData: { ...lead.clientData, preferredTimeWindow: undefined },
           now,
@@ -83,7 +103,10 @@ export class CalendarReservationService {
           minimumStartOnPreferredDate: options.minimumStartOnPreferredDate,
           limit: 1_000,
         }), lead.clientData.preferredTimeWindow, options).slice(0, 3);
-        if (rawSlots.length > 0) match = "nearest_alternatives";
+        if (rawSlots.length > 0) {
+          match = "nearest_alternatives";
+          availabilityReason = "requested_time_unavailable";
+        }
       }
     } catch (error) {
       if (error instanceof Error && error.message === "cleaning_duration_exceeds_workday") return { ok: false, error: "duration_exceeds_workday" };
@@ -109,8 +132,18 @@ export class CalendarReservationService {
     } catch {
       return { ok: false, error: "calendar_slot_offer_persist_failed" };
     }
-    if (slots.length === 0) return { ok: false, error: "no_available_slots" };
-    return { ok: true, slots, match };
+    if (slots.length === 0) {
+      return {
+        ok: false,
+        error: "no_available_slots",
+        availabilityReason: isSunday(lead.clientData.preferredDate)
+          ? "nonworking_day"
+          : hasRequestedTimeConstraint
+          ? "requested_time_unavailable"
+          : "requested_date_unavailable",
+      };
+    }
+    return { ok: true, slots, match, availabilityReason: availabilityReason as "exact" | "nonworking_day" | "requested_date_unavailable" | "requested_time_unavailable" };
   }
 
   async reserveSlot(lead: StoredLead, token: string, replyLanguage: ReplyLanguage = "en"): Promise<{ ok: true; eventId: string } | { ok: false; error: string; ambiguous?: boolean }> {
@@ -195,6 +228,18 @@ export class CalendarReservationService {
     await this.onReservationPersisted?.(lead, replyLanguage);
     await this.repository.appendActivity(lead.id, "calendar_reserved_pending_trello", { team: slot.team, calendar_event_id: eventId });
   }
+}
+
+function isSunday(isoDate: string | undefined): boolean {
+  if (!isoDate) return false;
+  return new Date(`${isoDate}T12:00:00.000Z`).getUTCDay() === 0;
+}
+
+function belgradeDate(value: string): string {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Belgrade", year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(new Date(value)).filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
+  return `${parts.year}-${parts.month}-${parts.day}`;
 }
 
 function rankNearestAlternatives(

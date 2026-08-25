@@ -1,5 +1,11 @@
 # Stage 4 completion handoff — 2026-08-23
 
+> **Historical delivery record.** This hand-off preserves the Stage 4 snapshot
+> from 2026-08-23. For the current product contract and implementation, use
+> [MVP1 requirements](MVP1_REQUIREMENTS.md),
+> [Project context](../PROJECT_CONTEXT.md), and the
+> [documentation index](README.md).
+
 ## Status
 
 Stage 4 is complete. It delivered the real Trello lifecycle, recovery outbox and the final controlled production happy-path acceptance. No later stage has been authorized or started.
