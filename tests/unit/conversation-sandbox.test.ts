@@ -63,7 +63,7 @@ const scenarios: ConversationScenario[] = [
   fixture("sr-latn-da", ["Treba mi čišćenje za vikend.", "Da.", "Standardno 50 m2, jedna soba, jedno kupatilo, Dorćol, bez dodataka."], [turn("Sada mogu da zabeležim detalje za procenu.")], { quote: false, calendarCreates: 0, replyLanguage: "sr-Latn" }),
   fixture("identity", ["Ты человек?", "Хорошо, нужна обычная уборка 50 м².", "Одна комната, один санузел, Дорчол, без шерсти и допуслуг, 26 августа."], [turn("Я цифровой помощник Sherlock Cleaning, но помогу оформить уборку. Какая площадь и тип уборки нужны?"), turn("Для 50 м² сколько комнат и санузлов?", { cleaningType: "standard", areaM2: 50 }), turn("Сейчас посчитаю точную стоимость.", full({ areaM2: 50, rooms: 1, bathrooms: 1, addressOrDistrict: "Дорчол" }), "quote")], { quote: true, calendarCreates: 0, replyLanguage: "ru", checkpoints: ["quote"] }),
   fixture("off-topic", ["Какая сегодня погода?", "Ладно, мне нужна уборка 50 м².", "Обычная, одна комната, один санузел, Врачар, без шерсти и допуслуг, 26 августа."], [turn("Я помогаю с уборкой и бронированием. Какой тип уборки и какая примерно площадь вам нужны?"), turn("Для 50 м² это обычная или генеральная уборка?", { areaM2: 50 }), turn("Сейчас посчитаю стоимость.", full({ areaM2: 50, rooms: 1, bathrooms: 1, addressOrDistrict: "Врачар" }), "quote")], { quote: true, calendarCreates: 0, replyLanguage: "ru", checkpoints: ["quote"] }),
-  fixture("calendar-failure", ["Standard 75 m2, 3 rooms, one bathroom, no pet hair or extras, Vracar, 26 August.", "Please show available times.", "Can someone help find another date?"], [turn("I’ll calculate the estimate first.", full(), "quote"), turn("Our team will help find an alternative date.")], { quote: true, humanNeeded: true, calendarCreates: 0, replyLanguage: "en", checkpoints: ["quote", "human_needed"], calendarFullyBooked: true }),
+  fixture("calendar-failure", ["Standard 75 m2, 3 rooms, one bathroom, no pet hair or extras, Vracar, 26 August.", "Please show available times.", "Can someone help find another date?"], [turn("I’ll calculate the estimate first.", full(), "quote"), turn("I can help check another date.")], { quote: true, calendarCreates: 0, replyLanguage: "en", checkpoints: ["quote"], calendarFullyBooked: true }),
   fixture("provider-tool-limit", ["Нужна уборка 75 м² в Врачаре.", "Обычная, три комнаты, один санузел, без шерсти и допуслуг, 26 августа.", "Хорошо."], [turn("Сохраню детали и передам заявку команде, чтобы она продолжила без риска ошибки.", { areaM2: 75, addressOrDistrict: "Врачар" }, "human"), turn("Добавлю остальные детали для команды.", full({ addressOrDistrict: "Врачар" })), turn("Команда продолжит с сохранёнными деталями.")], { humanNeeded: true, calendarCreates: 0, replyLanguage: "ru", checkpoints: ["human_needed"] }),
 ];
 
@@ -195,6 +195,45 @@ describe("conversation sandbox", () => {
     expect(artifact.transcript[6]?.visibleText).toContain("Команда А");
     expect(artifact.transcript[6]?.visibleText).toContain("7 200 RSD");
     expect(artifact.transcript[7]?.visibleText).toContain("уже зарезервировано");
+  });
+  it("runs the typed scheduling-recovery matrix without losing quote facts or booking before final selection", async () => {
+    const recovery = fixture("typed-recovery-matrix", [
+      "Нужна обычная уборка 75 м² в Врачаре, 3 комнаты, 1 санузел, без шерсти и допуслуг, 26 августа.",
+      "Покажи свободные слоты.",
+      "А позже нет слотов?",
+      "После 19:00.",
+      "Тогда на следующий день вечером.",
+      "1",
+    ], [
+      turn("Посчитаю точную стоимость и покажу время.", full({ addressOrDistrict: "Врачар" }), "quote"),
+    ], { quote: true, slotOffer: true, calendarCreates: 1, replyLanguage: "ru", checkpoints: ["quote", "slots", "reservation"] });
+    const artifact = await runConversationScenario(recovery);
+
+    expect(artifact.turns).toHaveLength(1);
+    expect(artifact.lead.clientData).toMatchObject({
+      cleaningType: "standard", areaM2: 75, rooms: 3, bathrooms: 1,
+      heavyPetHair: false, extras: [], addressOrDistrict: "Врачар",
+      preferredDate: "2026-08-27", preferredTimeWindow: "evening",
+    });
+    // New availability queries supersede old buttons, but none can create a
+    // Calendar event until the customer explicitly selects the final option.
+    expect(artifact.messageEvidence.slice(0, 5).map((evidence) => evidence.calendarCreates)).toEqual([0, 0, 0, 0, 0]);
+    expect(artifact.messageEvidence.slice(0, 5).map((evidence) => evidence.slotOfferCount)).toEqual([0, 1, 2, 3, 4]);
+    expect(artifact.messageEvidence[4]).toMatchObject({ preferredDate: "2026-08-27", calendarCreates: 0 });
+    expect(artifact.messageEvidence[5]).toMatchObject({ calendarCreates: 1, preferredDate: "2026-08-27" });
+
+    const pendingDate = fixture("typed-pending-date-yes", [
+      "Нужна обычная уборка 75 м² в Врачаре, 3 комнаты, 1 санузел, без шерсти и допуслуг.",
+      "Хочу уборку на выходных.",
+      "Да.",
+    ], [turn("Посчитаю стоимость и предложу время.", full({ addressOrDistrict: "Врачар" }), "quote")], {
+      quote: true, slotOffer: true, calendarCreates: 0, replyLanguage: "ru", checkpoints: ["quote", "slots"],
+    });
+    const pendingArtifact = await runConversationScenario(pendingDate);
+    expect(pendingArtifact.turns).toHaveLength(1);
+    expect(pendingArtifact.lead.clientData).toMatchObject({ areaM2: 75, rooms: 3, bathrooms: 1, preferredDate: "2026-08-29" });
+    expect(pendingArtifact.messageEvidence.map((evidence) => evidence.calendarCreates)).toEqual([0, 0, 0]);
+    expect(pendingArtifact.messageEvidence.at(-1)).toMatchObject({ preferredDate: "2026-08-29", slotOfferCount: 1 });
   });
   it("retains useful later details after a Human Needed handoff without exposing another handoff tool or reply", async () => {
     const artifact = await runConversationScenario(scenarios.find((scenario) => scenario.id === "ru-renovation-human")!);

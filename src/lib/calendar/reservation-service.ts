@@ -8,6 +8,16 @@ import { isRussianLanguage, isSerbianCyrillic, isSerbianLanguage, type ReplyLang
 
 const tokenLifetimeMs = 30 * 60_000;
 
+export type SlotOfferMatch = "exact" | "nearest_alternatives";
+export type SlotOfferOptions = {
+  /** Customer's exact clock constraint, in Europe/Belgrade local minutes. */
+  minimumLocalStartMinutes?: number;
+  /** A "later" request starts after the final displayed option on that day. */
+  minimumStartOnPreferredDate?: string;
+  /** The intent changed, so old callbacks must become stale even if Calendar fails. */
+  supersedeExisting?: boolean;
+};
+
 export class CalendarReservationService {
   constructor(
     private readonly repository: LeadRepository,
@@ -17,13 +27,29 @@ export class CalendarReservationService {
     private readonly onReservationPersisted?: (lead: StoredLead, replyLanguage: ReplyLanguage) => Promise<void>,
   ) {}
 
-  async offerSlots(lead: StoredLead, replyLanguage: ReplyLanguage): Promise<{ ok: true; slots: AvailabilitySlot[] } | { ok: false; error: string }> {
+  async offerSlots(
+    lead: StoredLead,
+    replyLanguage: ReplyLanguage,
+    options: SlotOfferOptions = {},
+  ): Promise<{ ok: true; slots: AvailabilitySlot[]; match: SlotOfferMatch } | { ok: false; error: string }> {
     if (lead.status !== "qualified" || !lead.quote || lead.quoteValidity !== "active" || lead.humanNeeded) {
       return { ok: false, error: "active_qualified_quote_required" };
     }
     const now = this.now();
     if (!lead.clientData.preferredDate) return { ok: false, error: "preferred_date_required" };
     const { from, to } = availabilityWindow(lead.clientData.preferredDate);
+    const issuedAt = now.toISOString();
+    // A changed customer preference invalidates a previous offer before the
+    // provider re-query. The existing RPC atomically marks all old tokens
+    // superseded; if Calendar then fails, an old button cannot book a time the
+    // customer has just rejected.
+    if (options.supersedeExisting) {
+      try {
+        await this.repository.saveCalendarSlotOffer({ leadId: lead.id, offerId: randomUUID(), issuedAt, tokens: [] });
+      } catch {
+        return { ok: false, error: "calendar_slot_offer_persist_failed" };
+      }
+    }
     let teamA: Awaited<ReturnType<CalendarGateway["getBusyIntervals"]>>;
     let teamB: Awaited<ReturnType<CalendarGateway["getBusyIntervals"]>>;
     try {
@@ -35,13 +61,34 @@ export class CalendarReservationService {
       return { ok: false, error: "calendar_availability_failed" };
     }
     let rawSlots: Array<Omit<AvailabilitySlot, "token" | "offerId" | "displayOrder" | "label">>;
+    let match: SlotOfferMatch = "exact";
     try {
-      rawSlots = this.scheduling.findSlots({ clientData: lead.clientData, now, busyByTeam: { team_a: teamA, team_b: teamB } });
+      rawSlots = this.scheduling.findSlots({
+        clientData: lead.clientData,
+        now,
+        busyByTeam: { team_a: teamA, team_b: teamB },
+        minimumLocalStartMinutes: options.minimumLocalStartMinutes,
+        minimumStartOnPreferredDate: options.minimumStartOnPreferredDate,
+      });
+      // When a requested range has no exact slot, show actual closest times
+      // rather than reporting a false empty calendar. The response renderer
+      // makes the relaxation explicit.
+      if (rawSlots.length === 0 && (lead.clientData.preferredTimeWindow || options.minimumLocalStartMinutes !== undefined || options.minimumStartOnPreferredDate)) {
+        rawSlots = rankNearestAlternatives(this.scheduling.findSlots({
+          clientData: { ...lead.clientData, preferredTimeWindow: undefined },
+          now,
+          busyByTeam: { team_a: teamA, team_b: teamB },
+          // Keep the "later" floor: relaxing a time preference must never
+          // resurrect options which were just rejected from an old offer.
+          minimumStartOnPreferredDate: options.minimumStartOnPreferredDate,
+          limit: 1_000,
+        }), lead.clientData.preferredTimeWindow, options).slice(0, 3);
+        if (rawSlots.length > 0) match = "nearest_alternatives";
+      }
     } catch (error) {
       if (error instanceof Error && error.message === "cleaning_duration_exceeds_workday") return { ok: false, error: "duration_exceeds_workday" };
       throw error;
     }
-    const issuedAt = now.toISOString();
     const expiresAt = new Date(now.getTime() + tokenLifetimeMs).toISOString();
     const offerId = randomUUID();
     const slots = rawSlots.map((slot, index) => ({
@@ -63,7 +110,7 @@ export class CalendarReservationService {
       return { ok: false, error: "calendar_slot_offer_persist_failed" };
     }
     if (slots.length === 0) return { ok: false, error: "no_available_slots" };
-    return { ok: true, slots };
+    return { ok: true, slots, match };
   }
 
   async reserveSlot(lead: StoredLead, token: string, replyLanguage: ReplyLanguage = "en"): Promise<{ ok: true; eventId: string } | { ok: false; error: string; ambiguous?: boolean }> {
@@ -148,6 +195,43 @@ export class CalendarReservationService {
     await this.onReservationPersisted?.(lead, replyLanguage);
     await this.repository.appendActivity(lead.id, "calendar_reserved_pending_trello", { team: slot.team, calendar_event_id: eventId });
   }
+}
+
+function rankNearestAlternatives(
+  slots: Array<Omit<AvailabilitySlot, "token" | "offerId" | "displayOrder" | "label">>,
+  window: StoredLead["clientData"]["preferredTimeWindow"],
+  options: SlotOfferOptions,
+): Array<Omit<AvailabilitySlot, "token" | "offerId" | "displayOrder" | "label">> {
+  const target = options.minimumLocalStartMinutes ?? windowBoundary(window);
+  if (target === undefined) return slots;
+  return [...slots].sort((left, right) => {
+    const distance = (slot: Omit<AvailabilitySlot, "token" | "offerId" | "displayOrder" | "label">) => options.minimumLocalStartMinutes !== undefined
+      ? Math.abs(localMinutes(slot.start) - target)
+      : distanceFromRequestedMinutes(localMinutes(slot.start), target, window);
+    const byDistance = distance(left) - distance(right);
+    return byDistance || left.start.localeCompare(right.start) || left.team.localeCompare(right.team);
+  });
+}
+
+function windowBoundary(window: StoredLead["clientData"]["preferredTimeWindow"]): number | undefined {
+  if (window === "morning") return 8 * 60;
+  if (window === "midday") return 12 * 60;
+  if (window === "evening") return 16 * 60;
+  return undefined;
+}
+
+function distanceFromRequestedMinutes(minutes: number, target: number, window: StoredLead["clientData"]["preferredTimeWindow"]): number {
+  if (window === "morning") return minutes < 12 * 60 ? Math.max(0, target - minutes) : minutes - 12 * 60;
+  if (window === "midday") return minutes < 12 * 60 ? 12 * 60 - minutes : minutes >= 16 * 60 ? minutes - 16 * 60 : 0;
+  if (window === "evening") return minutes < 16 * 60 ? 16 * 60 - minutes : minutes >= 20 * 60 ? minutes - 20 * 60 : 0;
+  return Math.abs(minutes - target);
+}
+
+function localMinutes(value: string): number {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Belgrade", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).formatToParts(new Date(value)).filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
+  return Number(parts.hour) * 60 + Number(parts.minute);
 }
 
 function fingerprintSchedule(lead: StoredLead): string {

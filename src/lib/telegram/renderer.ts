@@ -45,6 +45,17 @@ export function renderSlotOfferReply(language: string, slots: AvailabilitySlot[]
   return { text: `${header}\n\n${options}`, replyMarkup: slotKeyboard(slots, replyLocaleForKeyboard(language)), provenance: "template" };
 }
 
+/** The requested range was checked first; these are real, explicitly relaxed alternatives. */
+export function renderNearestSlotAlternativesReply(language: string, slots: AvailabilitySlot[]): TelegramRenderedReply {
+  const header = isSerbianLanguage(language)
+    ? serbianText(language, "<b>U traženom periodu nema slobodnog termina.</b>\nEvo najbližih stvarnih alternativa:", "<b>У траженом периоду нема слободног термина.</b>\nЕво најближих стварних алтернатива:")
+    : isRussianLanguage(language)
+    ? "<b>В указанное время свободных слотов нет.</b>\nВот ближайшие реальные варианты:"
+    : "<b>There are no free slots in that requested time.</b>\nHere are the nearest real alternatives:";
+  const options = slots.map((slot) => `${slot.displayOrder}. ${escapePlainText(slot.label)}.`).join("\n");
+  return { text: `${header}\n\n${options}`, replyMarkup: slotKeyboard(slots, replyLocaleForKeyboard(language)), provenance: "template" };
+}
+
 export function renderReservationPendingReply(language: string, booking?: { team: "team_a" | "team_b"; start: string; quoteAmountRsd: number }): TelegramRenderedReply {
   const details = booking ? bookingDetails({ language, ...booking }) : undefined;
   if (isSerbianLanguage(language)) return { text: serbianText(language,
@@ -99,14 +110,25 @@ export function renderCalendarReservationFailedReply(language: string): Telegram
     : { text: "We could not safely confirm that time. Our team will continue the request with the details already shared.", provenance: "template" };
 }
 
-export function renderHumanNeededReply(language: string): TelegramRenderedReply {
+/** Availability failed before any booking write; do not imply a reservation attempt. */
+export function renderCalendarAvailabilityFailedReply(language: string): TelegramRenderedReply {
   if (isSerbianLanguage(language)) return { text: serbianText(language,
-    "Sačuvaću detalje i proslediti ih našem timu da sve pažljivo pregleda.",
-    "Сачуваћу детаље и проследити их нашем тиму да све пажљиво прегледа.",
+    "Trenutno nismo mogli bezbedno da proverimo slobodne termine. Sačuvali smo detalje zahteva i proverićemo ih sa timom.",
+    "Тренутно нисмо могли безбедно да проверимо слободне термине. Сачували смо детаље захтева и проверићемо их са тимом.",
   ), provenance: "template" };
   return isRussianLanguage(language)
-    ? { text: "Я сохраню детали и передам заявку нашей команде, чтобы всё проверить внимательно.", provenance: "template" }
-    : { text: "I’ll save the details and pass the request to our team so they can review everything carefully.", provenance: "template" };
+    ? { text: "Сейчас не получилось безопасно проверить свободное время. Детали заявки сохранены, мы уточним их с командой.", provenance: "template" }
+    : { text: "We could not safely check free times right now. Your request details are saved, and we will check them with the team.", provenance: "template" };
+}
+
+export function renderHumanNeededReply(language: string): TelegramRenderedReply {
+  if (isSerbianLanguage(language)) return { text: serbianText(language,
+    "Treba da proverimo još nekoliko detalja sa timom. Sačuvaću zahtev i proslediti ga kolegi; javićemo vam se nakon provere.",
+    "Треба да проверимо још неколико детаља са тимом. Сачуваћу захтев и проследити га колеги; јавићемо вам се после провере.",
+  ), provenance: "template" };
+  return isRussianLanguage(language)
+    ? { text: "Нужно уточнить пару деталей с командой. Я всё сохраню и передам заявку специалисту, а после проверки команда свяжется с вами.", provenance: "template" }
+    : { text: "We need to check a couple of details with the team. I’ll save your request and pass it to a specialist; the team will contact you after the review.", provenance: "template" };
 }
 
 /** A later detail may help the team, but it must not look like a second handoff. */
@@ -209,12 +231,12 @@ export function renderStaleSlotReply(language: string): TelegramRenderedReply {
 
 export function renderNoAvailabilityReply(language: string): TelegramRenderedReply {
   if (isSerbianLanguage(language)) return { text: serbianText(language,
-    "U naredne dve nedelje nema odgovarajućeg slobodnog termina. Naš tim će pomoći da pronađe alternativu.",
-    "У наредне две недеље нема одговарајућег слободног термина. Наш тим ће помоћи да пронађе алтернативу.",
+    "U naredne dve nedelje nema odgovarajućeg slobodnog termina. Možemo proveriti drugi datum.",
+    "У наредне две недеље нема одговарајућег слободног термина. Можемо проверити други датум.",
   ), provenance: "template" };
   return isRussianLanguage(language)
-    ? { text: "В ближайшие две недели подходящего свободного времени пока нет. Наша команда поможет найти другой вариант.", provenance: "template" }
-    : { text: "There isn’t a suitable free time in the next two weeks. Our team will help find an alternative.", provenance: "template" };
+    ? { text: "В ближайшие две недели подходящего свободного времени пока нет. Можем проверить другую дату.", provenance: "template" }
+    : { text: "There isn’t a suitable free time in the next two weeks. We can check another date.", provenance: "template" };
 }
 
 export function renderNewAddressDivider(language: string): TelegramRenderedReply {

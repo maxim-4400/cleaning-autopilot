@@ -18,6 +18,12 @@ export class SchedulingEngine {
     clientData: ClientData;
     now: Date;
     busyByTeam: Record<CleaningTeam, BusyInterval[]>;
+    /** A precise customer request such as "after 19:00" applies every day. */
+    minimumLocalStartMinutes?: number;
+    /** "Later" applies after the last displayed option on its offered day. */
+    minimumStartOnPreferredDate?: string;
+    /** Internal fallback ranking needs the same calendar snapshot, not a re-query. */
+    limit?: number;
   }): SchedulableSlot[] {
     if (!input.clientData.preferredDate) return [];
     const durationMinutes = this.durationMinutes(input.clientData);
@@ -36,7 +42,13 @@ export class SchedulingEngine {
         const start = zonedDateTimeToUtc(date, minute);
         const end = new Date(start.getTime() + durationMinutes * 60_000);
         const bufferEnd = new Date(end.getTime() + 30 * 60_000);
-        if (localDate(end) !== date || localDate(bufferEnd) !== date || localMinutes(bufferEnd) > 20 * 60 || (minStart && start < minStart) || !withinRequestedWindow(input.clientData.preferredTimeWindow, localMinutes(start))) continue;
+        if (
+          localDate(end) !== date || localDate(bufferEnd) !== date || localMinutes(bufferEnd) > 20 * 60 ||
+          (minStart && start < minStart) ||
+          (input.minimumLocalStartMinutes !== undefined && localMinutes(start) < input.minimumLocalStartMinutes) ||
+          (date === requestedDate && input.minimumStartOnPreferredDate && start < new Date(input.minimumStartOnPreferredDate)) ||
+          !withinRequestedWindow(input.clientData.preferredTimeWindow, localMinutes(start))
+        ) continue;
         for (const team of teams) {
           if (!input.busyByTeam[team].some((busy) => overlaps(start, bufferEnd, new Date(busy.start), new Date(busy.end)))) {
             slots.push({ team, start: start.toISOString(), end: end.toISOString(), bufferEnd: bufferEnd.toISOString() });
@@ -44,7 +56,7 @@ export class SchedulingEngine {
         }
       }
     }
-    return slots.sort((a, b) => a.start.localeCompare(b.start) || a.team.localeCompare(b.team)).slice(0, 3);
+    return slots.sort((a, b) => a.start.localeCompare(b.start) || a.team.localeCompare(b.team)).slice(0, input.limit ?? 3);
   }
 }
 

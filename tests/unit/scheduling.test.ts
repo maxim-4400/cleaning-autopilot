@@ -195,6 +195,26 @@ describe("CalendarReservationService", () => {
     expect(calendar.creates).toHaveLength(0);
   });
 
+  it("ranks relaxed after-19 alternatives nearest to 19:00 from the same busy snapshot", async () => {
+    const repository = new InMemoryLeadRepository();
+    const calendar = new FakeCalendarGateway();
+    const service = new CalendarReservationService(repository, calendar, engine, () => now);
+    const lead = await qualifiedLead(repository, 79);
+    lead.clientData = { ...lead.clientData, preferredTimeWindow: "evening" };
+
+    const offer = await service.offerSlots(lead, "en", { minimumLocalStartMinutes: 19 * 60, supersedeExisting: true });
+    if (!offer.ok) throw new Error(offer.error);
+    expect(offer.match).toBe("nearest_alternatives");
+    // A 4h clean + buffer cannot start at 19:00. The closest real option is
+    // 15:30 Belgrade (13:30Z), not an unrelated morning slot.
+    expect(offer.slots.map((slot) => slot.start)).toEqual([
+      "2026-08-24T13:30:00.000Z",
+      "2026-08-24T13:30:00.000Z",
+      "2026-08-25T13:30:00.000Z",
+    ]);
+    expect(calendar.availabilityQueries).toHaveLength(2);
+  });
+
   it("does not create an event when the recheck reports a conflict", async () => {
     const repository = new InMemoryLeadRepository();
     const calendar = new FakeCalendarGateway();
