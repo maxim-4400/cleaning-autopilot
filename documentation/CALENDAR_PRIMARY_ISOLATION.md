@@ -5,10 +5,11 @@ targets. Each must be a distinct `@group.calendar.google.com` ID. The runtime
 gateway and the demo-load seed both fail closed for `primary`, default/personal
 aliases, personal addresses and duplicate Team IDs.
 
-All Calendar create requests set `attendees: []` and `send_updates: "none"`.
-This prevents an attendee invitation or notification from creating a copy in an
-operator's primary calendar. Do not use a personal calendar as either team
-calendar, and do not add the operator as an attendee to operational events.
+All Calendar create requests set the ownership triple `attendees: []`,
+`send_updates: "none"`, and `exclude_organizer: true`. This prevents an
+attendee invitation, notification, or organizer shadow copy from materializing
+in an operator's primary calendar. Do not use a personal calendar as either
+team calendar, and do not add the operator as an attendee to operational events.
 
 ## Removing already-created primary copies
 
