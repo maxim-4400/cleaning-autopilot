@@ -2,10 +2,41 @@ import { Agent, MaxTurnsExceededError, OpenAIProvider, retryPolicies, Runner, to
 import OpenAI from "openai";
 import { z } from "zod";
 
-import { defaultPricingRules, type AgentToolName, type AgentToolResult, type AgentTurn, type ClientData, type PricingRules } from "@/lib/contracts/domain";
+import { defaultPricingRules, type AgentToolName, type AgentToolResult, type AgentTurn, type ClientData, type CurrentTurnDateCoordinate, type PricingRules, type SchedulingSemanticAction } from "@/lib/contracts/domain";
+import type { StoredAvailabilityAttempt } from "@/lib/leads/repository";
 import { isRussianLanguage, isSerbianCyrillic, isSerbianLanguage, type ReplyLanguage } from "@/lib/telegram/language";
 
 export type AgentToolExecutor = (name: AgentToolName, argumentsJson: unknown) => Promise<Record<string, unknown>>;
+
+/**
+ * Safe, server-derived state supplied to the one scheduling agent. It has no
+ * Calendar IDs, slot tokens or provider payloads: the agent can reason about
+ * the customer-visible situation while the backend remains the source of
+ * truth for the actual availability query and reservation.
+ */
+export type SchedulingSnapshot = {
+  state: "intake" | "quoted" | "offered" | "reserved_pending_trello" | "booked" | "human_needed";
+  /** Server-derived Europe/Belgrade date for relative-language interpretation. */
+  currentDate: string;
+  preferredDate?: string;
+  preferredTimeWindow?: "morning" | "midday" | "evening";
+  /** Current-message-only date; never a durable lead or Conversation fact. */
+  currentTurnDateCoordinate?: CurrentTurnDateCoordinate;
+  /** Current server-owned amount for a fresh post-availability Conversation. */
+  activeQuoteAmountRsd?: number;
+  lastOffer?: {
+    dates: string[];
+    labels: string[];
+  };
+  /** Latest validated Calendar search outcome. It is context only: every
+   * later availability question must still invoke the Calendar tool. */
+  lastAvailabilityAttempt?: StoredAvailabilityAttempt;
+  policy: {
+    timezone: "Europe/Belgrade";
+    workingHours: "Mon-Sat 08:00-20:00; Sunday closed";
+    searchHorizonDays: 14;
+  };
+};
 
 export type AgentTurnInput = {
   conversationId: string;
@@ -22,6 +53,15 @@ export type AgentTurnInput = {
   pricingRules?: PricingRules;
   /** Backend-derived capabilities for this one customer turn. */
   allowedTools?: readonly AgentToolName[];
+  /**
+   * A quoted/offered turn must use either a semantic Calendar request or a
+   * typed no-Calendar decision. The production SDK gateway enforces this
+   * after the model run; injected deterministic test agents need not mimic
+   * model-loop enforcement.
+   */
+  schedulingDecisionRequired?: boolean;
+  /** Authoritative, privacy-safe scheduling context for this customer turn. */
+  schedulingSnapshot?: SchedulingSnapshot;
   /** Evaluator-owned cancellation; production callers may omit it. */
   signal?: AbortSignal;
   executeTool: AgentToolExecutor;
@@ -57,12 +97,271 @@ const humanNeededParameters = z.object({
 }).strict();
 
 const calculateQuoteParameters = z.object({}).strict();
-const requestAvailableSlotsParameters = z.object({}).strict();
+const localTimeSchema = z.string().regex(/^(?:0[89]|1[0-9]):(?:00|30)$/u);
+export const schedulingAvailabilityIntentSchema = z.object({
+  dateReference: z.enum([
+    "current_preferred_date",
+    "today",
+    "tomorrow",
+    "same_day_as_last_offer",
+    "day_after_last_offer",
+    "exact_date",
+  ]),
+  exactDate: z.string().date().optional(),
+  timePreference: z.enum([
+    "any",
+    "morning",
+    "midday",
+    "evening",
+    "after",
+    "before",
+    "range",
+  ]),
+  /** A date-only follow-up may retain a previous time window. Explicit `any`
+   * means the customer has removed that constraint. */
+  timePreferenceMode: z.enum(["preserve", "explicit"]),
+  relation: z.enum(["fresh", "later_than_last_offer"]).default("fresh"),
+  /** The model owns whether an existing customer-visible offer is retained or
+   * explicitly rejected. The backend verifies it against actual active tokens. */
+  // Provider wire input is required by the strict schema below. This executor
+  // seam also supports injected deterministic gateways, which predate V34;
+  // resolver derives their only safe disposition from actual active tokens.
+  existingOfferDisposition: z.enum(["none", "retain_until_replacement", "reject_now"]).optional(),
+  afterLocalTime: localTimeSchema.optional(),
+  beforeLocalTime: localTimeSchema.optional(),
+}).strict().superRefine((value, context) => {
+  if (value.timePreferenceMode === "preserve" && value.timePreference !== "any") {
+    context.addIssue({ code: "custom", message: "preserve requires timePreference any" });
+  }
+  if (value.dateReference === "exact_date" && !value.exactDate) {
+    context.addIssue({ code: "custom", message: "exactDate is required for exact_date" });
+  }
+  if (value.dateReference !== "exact_date" && value.exactDate) {
+    context.addIssue({ code: "custom", message: "exactDate is only allowed for exact_date" });
+  }
+  if (value.timePreference === "after" && !value.afterLocalTime) {
+    context.addIssue({ code: "custom", message: "afterLocalTime is required for after" });
+  }
+  if (value.timePreference === "before" && !value.beforeLocalTime) {
+    context.addIssue({ code: "custom", message: "beforeLocalTime is required for before" });
+  }
+  if (value.timePreference === "range" && (!value.afterLocalTime || !value.beforeLocalTime || value.afterLocalTime >= value.beforeLocalTime)) {
+    context.addIssue({ code: "custom", message: "range requires an ordered local time range" });
+  }
+  if (!["after", "range"].includes(value.timePreference) && value.afterLocalTime) {
+    context.addIssue({ code: "custom", message: "afterLocalTime is not valid for this preference" });
+  }
+  if (!["before", "range"].includes(value.timePreference) && value.beforeLocalTime) {
+    context.addIssue({ code: "custom", message: "beforeLocalTime is not valid for this preference" });
+  }
+  if (value.timePreferenceMode === "preserve" && (value.afterLocalTime || value.beforeLocalTime)) {
+    context.addIssue({ code: "custom", message: "preserve cannot include an explicit time boundary" });
+  }
+});
+export type SchedulingAvailabilityIntent = z.infer<typeof schedulingAvailabilityIntentSchema>;
+
+const requestAvailableSlotsParameters = z.object({ intent: schedulingAvailabilityIntentSchema }).strict();
+/**
+ * Provider wire schema for availability is deliberately discriminated rather
+ * than a collection of optional coordinates. A strict function schema then
+ * makes impossible cross-shapes (for example, `preserve + evening` or an
+ * exact date without its date) invalid before the deterministic executor.
+ */
+const providerAvailabilityDateSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.enum([
+      "current_preferred_date",
+      "today",
+      "tomorrow",
+      "same_day_as_last_offer",
+      "day_after_last_offer",
+    ]),
+  }).strict(),
+  z.object({ kind: z.literal("exact_date"), exactDate: z.string().date() }).strict(),
+]);
+const providerAvailabilityTimeSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("preserve") }).strict(),
+  z.object({ kind: z.literal("any") }).strict(),
+  z.object({ kind: z.literal("morning") }).strict(),
+  z.object({ kind: z.literal("midday") }).strict(),
+  z.object({ kind: z.literal("evening") }).strict(),
+  z.object({ kind: z.literal("after"), afterLocalTime: localTimeSchema }).strict(),
+  z.object({ kind: z.literal("before"), beforeLocalTime: localTimeSchema }).strict(),
+  z.object({ kind: z.literal("range"), afterLocalTime: localTimeSchema, beforeLocalTime: localTimeSchema }).strict(),
+]);
+const providerAvailabilityIntentSchema = z.object({
+  date: providerAvailabilityDateSchema,
+  time: providerAvailabilityTimeSchema,
+  relation: z.enum(["fresh", "later_than_last_offer"]),
+  existingOfferDisposition: z.enum(["none", "retain_until_replacement", "reject_now"]),
+}).strict();
+export const requestAvailableSlotsProviderParameters = z.object({ intent: providerAvailabilityIntentSchema }).strict();
+
+function requestAvailableSlotsProviderParametersForSnapshot(snapshot: SchedulingSnapshot | undefined) {
+  const coordinate = snapshot?.currentTurnDateCoordinate;
+  // A date said in this customer message is the exclusive coordinate for this
+  // availability request. Never offer a stale preferred date or old offer as
+  // an alternative in the same provider surface.
+  if (coordinate) {
+    const date = coordinate.recommendedDateReference === "today"
+      ? z.object({ kind: z.literal("today") }).strict()
+      : coordinate.recommendedDateReference === "tomorrow"
+        ? z.object({ kind: z.literal("tomorrow") }).strict()
+        : z.object({ kind: z.literal("exact_date"), exactDate: z.literal(coordinate.date) }).strict();
+    return z.object({ intent: z.object({
+      date,
+      time: providerAvailabilityTimeSchema,
+      relation: z.enum(["fresh", "later_than_last_offer"]),
+      existingOfferDisposition: z.enum(["none", "retain_until_replacement", "reject_now"]),
+    }).strict() }).strict();
+  }
+
+  const choices: z.ZodTypeAny[] = [];
+  if (snapshot?.preferredDate) choices.push(z.object({ kind: z.literal("current_preferred_date") }).strict());
+  if (snapshot?.lastOffer) {
+    choices.push(z.object({ kind: z.literal("same_day_as_last_offer") }).strict());
+    choices.push(z.object({ kind: z.literal("day_after_last_offer") }).strict());
+  }
+  // A safe attempt is not a durable preferred date, but its candidate is a
+  // separately auditable exact coordinate. Keep it available alongside old
+  // durable references so a time-only refinement after no-slots/failure can
+  // re-read the date that was actually checked rather than drifting back.
+  if (snapshot?.lastAvailabilityAttempt?.candidateDate) {
+    choices.push(z.object({ kind: z.literal("exact_date"), exactDate: z.literal(snapshot.lastAvailabilityAttempt.candidateDate) }).strict());
+  }
+  const date = choices.length === 0
+    // The tool is disabled below when no date coordinate exists. Keep this
+    // fallback schema representable so the SDK can construct the Agent before
+    // filtering disabled tools.
+    ? providerAvailabilityDateSchema
+    : choices.length === 1
+    ? choices[0]!
+    : z.union(choices as [z.ZodTypeAny, z.ZodTypeAny, ...z.ZodTypeAny[]]);
+  return z.object({ intent: z.object({
+    date,
+    time: providerAvailabilityTimeSchema,
+    relation: z.enum(["fresh", "later_than_last_offer"]),
+    existingOfferDisposition: z.enum(["none", "retain_until_replacement", "reject_now"]),
+  }).strict() }).strict();
+}
+
+function hasAvailabilityDateCoordinate(snapshot: SchedulingSnapshot | undefined): boolean {
+  return Boolean(snapshot?.preferredDate || snapshot?.lastOffer || snapshot?.currentTurnDateCoordinate || snapshot?.lastAvailabilityAttempt?.candidateDate);
+}
+
+/**
+ * Evidence-bound provider contract for the only Calendar-search function.
+ * The wire shape is intentionally more constrained than the canonical
+ * backend intent; `normalizeProviderAvailabilityParameters` is its sole
+ * adapter and the canonical schema remains the final authority.
+ */
+export const availabilityProviderEnvelopeConfig = {
+  revision: "v36.2-current-turn-exclusive-last-attempt-exact-alongside-durable-refs",
+  root: "{intent:{date,time,relation,existingOfferDisposition}}",
+  strict: true,
+  dateKinds: ["current_preferred_date", "today", "tomorrow", "same_day_as_last_offer", "day_after_last_offer", "exact_date"] as const,
+  timeKinds: ["preserve", "any", "morning", "midday", "evening", "after", "before", "range"] as const,
+  relationKinds: ["fresh", "later_than_last_offer"] as const,
+  existingOfferDispositionKinds: ["none", "retain_until_replacement", "reject_now"] as const,
+  preserveNormalization: "any_preserve",
+  otherTimeNormalization: "explicit",
+  canonicalValidation: "schedulingAvailabilityIntentSchema",
+  currentTurnDateCoordinate: "exclusive_when_present",
+  lastAvailabilityAttemptFallback: "exact_candidate_date_alongside_durable_refs_without_current_coordinate",
+} as const;
+
+function normalizeProviderAvailabilityIntent(intent: z.infer<typeof providerAvailabilityIntentSchema>): SchedulingAvailabilityIntent | undefined {
+  const date = intent.date.kind === "exact_date"
+    ? { dateReference: "exact_date" as const, exactDate: intent.date.exactDate }
+    : { dateReference: intent.date.kind };
+  const time = intent.time.kind === "preserve"
+    ? { timePreference: "any" as const, timePreferenceMode: "preserve" as const }
+    : intent.time.kind === "after"
+      ? { timePreference: "after" as const, timePreferenceMode: "explicit" as const, afterLocalTime: intent.time.afterLocalTime }
+      : intent.time.kind === "before"
+        ? { timePreference: "before" as const, timePreferenceMode: "explicit" as const, beforeLocalTime: intent.time.beforeLocalTime }
+        : intent.time.kind === "range"
+          ? { timePreference: "range" as const, timePreferenceMode: "explicit" as const, afterLocalTime: intent.time.afterLocalTime, beforeLocalTime: intent.time.beforeLocalTime }
+          : { timePreference: intent.time.kind, timePreferenceMode: "explicit" as const };
+  const parsed = schedulingAvailabilityIntentSchema.safeParse({
+    ...date,
+    ...time,
+    relation: intent.relation,
+    existingOfferDisposition: intent.existingOfferDisposition,
+  });
+  return parsed.success ? parsed.data : undefined;
+}
+
+function normalizeProviderAvailabilityParameters(argumentsJson: unknown): z.infer<typeof requestAvailableSlotsParameters> | undefined {
+  const parsed = requestAvailableSlotsProviderParameters.safeParse(argumentsJson);
+  if (!parsed.success) return undefined;
+  const intent = normalizeProviderAvailabilityIntent(parsed.data.intent);
+  if (!intent) return undefined;
+  const canonical = requestAvailableSlotsParameters.safeParse({ intent });
+  return canonical.success ? canonical.data : undefined;
+}
+const schedulingDecisionParameters = z.object({
+  reason: z.enum([
+    "question_not_about_scheduling",
+    "date_or_time_preference_missing",
+    "awaiting_customer_choice",
+    "already_reserved",
+    "human_review_in_progress",
+  ]),
+}).strict();
 
 /** Never allow a customer turn to perform more than this many semantic tools. */
 export const maxAgentToolSteps = 4;
 /** Bound each Responses model turn; the evaluator records and enforces this cap. */
 export const maxAgentOutputTokens = 1200;
+export const providerReplayInstructionRevision = "v23-stateless-full-primary-provider-replay";
+/** The replay deliberately reuses the complete primary instruction verbatim. */
+export const providerReplayPromptContract = "same_full_primary_instruction";
+/** Canonical one-shot transport recovery boundary; no omission replay stacks on it. */
+export const providerReplayConfig = {
+  revision: providerReplayInstructionRevision,
+  promptContract: providerReplayPromptContract,
+  stateless: true,
+  maxReplayAttempts: 1,
+  primaryMaxDurationMs: 9_000,
+  replayMaxDurationMs: 6_000,
+  maxTurns: 4,
+  parallelToolCalls: false,
+  maxFunctionToolConcurrency: 1,
+  noSchedulingOmissionReplayStacking: true,
+} as const;
+/**
+ * A zero-tool required-state turn is a semantic omission, not a reason to
+ * parse natural language in the backend. Re-run the complete primary agent
+ * statelessly once, with the same full prompt and tool surface, so it can
+ * update validated details, quote, or use the canonical scheduling tools.
+ */
+export const schedulingOmissionReplayInstructionRevision = "v30-stateless-full-primary-scheduling-omission-replay";
+export const schedulingOmissionReplayPromptContract = "same_full_primary_instruction";
+export const schedulingOmissionReplayConfig = {
+  revision: schedulingOmissionReplayInstructionRevision,
+  promptContract: schedulingOmissionReplayPromptContract,
+  stateless: true,
+  maxReplayAttempts: 1,
+  maxDurationMs: 9_000,
+  maxTurns: 4,
+  parallelToolCalls: false,
+  maxFunctionToolConcurrency: 1,
+  noProviderFailureReplayStacking: true,
+  noRecursion: true,
+} as const;
+/**
+ * Calendar availability is rendered exclusively by the webhook after its
+ * executor has produced a safe backend-owned result. Stopping only this tool
+ * avoids an unnecessary model closure request while keeping every other tool
+ * conversational.
+ */
+export const availabilityTerminalToolConfig = {
+  toolName: "request_available_slots",
+  toolUseBehavior: { stopAtToolNames: ["request_available_slots"] },
+  terminalAfterSafeExecutorResult: true,
+  resetConversationBeforeDeferredCommit: true,
+} as const;
 
 export type OpenAiAgentsGatewayOptions = {
   /** Production keeps one provider retry; a paid evaluator sets this to zero. */
@@ -110,6 +409,10 @@ export class AgentTurnTechnicalError extends Error {
 export type AgentTurnTechnicalCode =
   | "agent_max_turns_exceeded"
   | "agent_duplicate_update_client_data"
+  | "agent_quote_recalculation_missing"
+  | "agent_invalid_availability_arguments"
+  | "agent_scheduling_decision_missing"
+  | "agent_tool_execution_failed"
   | "agent_provider_timeout"
   | "agent_provider_http_error"
   | "agent_provider_transport_error"
@@ -176,32 +479,91 @@ export class OpenAiAgentsGateway implements AgentGateway {
   async runTurn(input: AgentTurnInput): Promise<AgentTurn> {
     const languageInstruction = replyLanguageInstruction(input.replyLanguage);
     const toolResults: AgentToolResult[] = [];
+    const schedulingActions: SchedulingSemanticAction[] = [];
     let modelToolSteps = 0;
+    let schedulingDecisionRecorded = false;
+    let executorTechnicalFailure = false;
     // `update_client_data` is an atomic, validated merge owned by the
     // webhook.  A second model request must not be invited to overwrite it;
     // other semantic tools can still close the same customer turn.
     let updateClientDataAttempted = false;
+    let primaryUsage: AgentTurn["usage"] | undefined;
+    let providerReplayUsage: AgentTurn["usage"] | undefined;
+    let omissionReplayUsage: AgentTurn["usage"] | undefined;
+    let providerReplayAttempted = false;
+    let omissionReplayAttempted = false;
+    /** SDK input validation rejects malformed function JSON before execute. */
+    let invalidAvailabilityArguments = false;
+    /** True as soon as any model-requested tool reaches the executor boundary. */
+    let toolExecutionStarted = false;
     const execute = async (name: AgentToolName, argumentsJson: unknown): Promise<Record<string, unknown>> => {
       throwIfAborted(input.signal);
+      toolExecutionStarted = true;
       if (name === "update_client_data") {
         if (updateClientDataAttempted) {
           throw new AgentTurnTechnicalError("agent_duplicate_update_client_data");
         }
         updateClientDataAttempted = true;
       }
+      let schedulingAction: SchedulingSemanticAction | undefined;
+      let executorArgumentsJson = argumentsJson;
+      if (name === "request_available_slots") {
+        const parsed = normalizeProviderAvailabilityParameters(argumentsJson);
+        if (!parsed) throw new AgentTurnTechnicalError("agent_invalid_availability_arguments");
+        executorArgumentsJson = parsed;
+        schedulingAction = {
+          kind: "availability",
+          dateReference: parsed.intent.dateReference,
+          timePreference: parsed.intent.timePreference,
+          timePreferenceMode: parsed.intent.timePreferenceMode,
+          relation: parsed.intent.relation,
+          existingOfferDisposition: parsed.intent.existingOfferDisposition,
+          ...(parsed.intent.afterLocalTime ? { afterLocalTime: parsed.intent.afterLocalTime } : {}),
+          ...(parsed.intent.beforeLocalTime ? { beforeLocalTime: parsed.intent.beforeLocalTime } : {}),
+        };
+      }
+      if (name === "record_scheduling_decision") {
+        const parsed = schedulingDecisionParameters.safeParse(argumentsJson);
+        if (!parsed.success) {
+          const output = { ok: false, error: "invalid_tool_arguments" };
+          toolResults.push({ name, output });
+          return output;
+        }
+        schedulingAction = { kind: "no_calendar", reason: parsed.data.reason };
+      }
       if (modelToolSteps >= this.maxToolSteps) {
         return { ok: false, error: "tool_step_limit_reached" };
       }
       modelToolSteps += 1;
       try {
-        const output = await input.executeTool(name, argumentsJson);
+        const output = await input.executeTool(name, executorArgumentsJson);
         throwIfAborted(input.signal);
         toolResults.push({ name, output });
+        // An auditable scheduling action describes an executor that actually
+        // ran, not a provider-proposed tool call.  A normal business outcome
+        // such as no availability is still a real Calendar attempt; a tool
+        // step refusal never reaches this point and is intentionally absent.
+        // A no-Calendar action is only evidence when the deterministic
+        // executor accepted it. Availability is different: a completed
+        // Calendar read that returns `no_available_slots` is still the
+        // customer-requested semantic action and must remain auditable.
+        if (schedulingAction && (schedulingAction.kind === "availability" || output.ok === true)) {
+          schedulingDecisionRecorded = true;
+          schedulingActions.push(schedulingAction);
+        }
         return output;
       } catch (error) {
         if (error instanceof AgentTurnTechnicalError) throw error;
         throwIfAborted(input.signal);
-        const output = { ok: false, error: "invalid_tool_arguments" };
+        // Executor/repository faults are not bad model JSON.  Fail the whole
+        // turn closed after the SDK finishes this response. Returning a typed
+        // internal sentinel here avoids the SDK reclassifying a tool exception
+        // as a provider transport failure. It is never returned to the
+        // webhook/customer: the post-run fence below throws a typed technical
+        // error, which triggers snapshot rollback. No semantic action was
+        // recorded because the executor did not complete.
+        executorTechnicalFailure = true;
+        const output = { ok: false, error: "tool_execution_failed" };
         toolResults.push({ name, output });
         return output;
       }
@@ -209,10 +571,10 @@ export class OpenAiAgentsGateway implements AgentGateway {
     const toolsEnabled = (name: AgentToolName) => modelToolSteps < this.maxToolSteps &&
       (input.allowedTools?.includes(name) ?? true) &&
       (name !== "update_client_data" || !updateClientDataAttempted);
-    const agent = new Agent({
+    const buildPrimaryTurnAgent = (timeoutMs: number) => new Agent({
       name: "Sherlock Cleaning Agent",
       model: this.model,
-      instructions: `${input.systemPrompt}\n\n${languageInstruction}\n\n${conversationInstruction}\n\n${intakeInstruction}\n\n${dateIntakeInstruction}\n\n${pricingInstruction(input.pricingRules ?? defaultPricingRules)}\n\nThe backend derives urgency deterministically from the requested cleaning date in Europe/Belgrade. Do not ask the customer to choose standard versus same-day urgency, and do not send an urgency field in update_client_data.\n\nA quote is terminal for the current customer turn. After calculate_quote returns a quote, write the short customer-facing answer and do not request availability in that same turn. Only request_available_slots after the customer later expresses a clear scheduling intent and the backend confirms that a previously active quote exists.`,
+      instructions: `${input.systemPrompt}\n\n${languageInstruction}\n\n${conversationInstruction}\n\n${intakeInstruction}\n\n${dateIntakeInstruction}\n\n${pricingInstruction(input.pricingRules ?? defaultPricingRules)}\n\n${schedulingInstruction(input.schedulingSnapshot, input.schedulingDecisionRequired ?? false)}\n\nThe backend derives urgency deterministically from the requested cleaning date in Europe/Belgrade. Do not ask the customer to choose standard versus same-day urgency, and do not send an urgency field in update_client_data.\n\nA quote is terminal for the current customer turn. After calculate_quote returns a quote, write the short customer-facing answer and do not request availability in that same turn.`,
       tools: [
         tool({
           name: "update_client_data",
@@ -245,16 +607,39 @@ export class OpenAiAgentsGateway implements AgentGateway {
         }),
         tool({
           name: "request_available_slots",
-          description: "Request up to three real, server-generated available time options after an active quote. The backend presents choices securely; never invent times or identifiers.",
-          parameters: requestAvailableSlotsParameters,
+          description: "Search current real Team A/B availability. Submit exactly { intent: { date, time, relation, existingOfferDisposition } }: date.kind is current_preferred_date, today, tomorrow, same_day_as_last_offer, day_after_last_offer, or exact_date with exactDate; time.kind is preserve, any, morning, midday, evening, after with afterLocalTime, before with beforeLocalTime, or range with ordered afterLocalTime and beforeLocalTime. Use preserve only for a date-only follow-up that retains the current window; every other time kind is explicit. relation is fresh or later_than_last_offer. existingOfferDisposition is none with no active offer, retain_until_replacement to keep an old offer until fresh results, or reject_now when the customer rejects it. Use this whenever the customer asks about availability, another date/time, or changed scheduling preference. Never invent times or identifiers.",
+          parameters: requestAvailableSlotsProviderParametersForSnapshot(input.schedulingSnapshot),
           strict: true,
-          isEnabled: () => toolsEnabled("request_available_slots"),
+          // SDK validation happens before execute. Return a private sentinel
+          // so the terminal tool can end cleanly; the post-run fence below
+          // turns it into our typed fail-closed protocol error.
+          errorFunction: async () => {
+            invalidAvailabilityArguments = true;
+            return "invalid_tool_arguments";
+          },
+          isEnabled: () => toolsEnabled("request_available_slots") && hasAvailabilityDateCoordinate(input.schedulingSnapshot),
           execute: (argumentsJson) => execute("request_available_slots", argumentsJson),
         }),
+        tool({
+          name: "record_scheduling_decision",
+          description: "Record the one reason a quoted/offered customer turn does not need a Calendar search. Use this only when the message is genuinely unrelated to availability, needs a date/time detail before any search, is just acknowledging an existing offer, is already reserved, or is already with a human. Never use it to defer an availability question or a changed scheduling preference.",
+          parameters: schedulingDecisionParameters,
+          strict: true,
+          isEnabled: () => toolsEnabled("record_scheduling_decision"),
+          execute: (argumentsJson) => execute("record_scheduling_decision", argumentsJson),
+        }),
       ],
+      // The SDK returns the function output as finalOutput for this one
+      // terminal tool. Gateway never exposes that JSON as customer prose;
+      // webhook selects the corresponding deterministic renderer only after
+      // the executor has completed and its deferred write is safe to commit.
+      toolUseBehavior: { stopAtToolNames: [...availabilityTerminalToolConfig.toolUseBehavior.stopAtToolNames] },
       modelSettings: {
-        ...(this.requestTimeoutMs ? { timeoutMs: this.requestTimeoutMs } : {}),
-        toolChoice: "auto",
+        timeoutMs,
+        // A scheduling-state turn must leave a typed decision. The SDK resets
+        // this preference after the first tool call, so the final customer
+        // prose remains possible after a semantic tool has returned.
+        toolChoice: input.schedulingDecisionRequired ? "required" : "auto",
         parallelToolCalls: false,
         reasoning: { effort: this.reasoningEffort },
         maxTokens: this.maxOutputTokens,
@@ -267,31 +652,97 @@ export class OpenAiAgentsGateway implements AgentGateway {
         },
       },
     });
+    const primaryTimeoutMs = Math.min(this.requestTimeoutMs ?? providerReplayConfig.primaryMaxDurationMs, providerReplayConfig.primaryMaxDurationMs);
+    const agent = buildPrimaryTurnAgent(primaryTimeoutMs);
 
     try {
-      const result = await this.runner.run(
-        agent,
-        `Known validated data: ${JSON.stringify(input.knownClientData)}\nCustomer message: ${input.message}`,
-        {
-          conversationId: input.conversationId,
-          maxTurns: this.maxResponsesPerTurn,
-          signal: input.signal,
-          toolExecution: { maxFunctionToolConcurrency: 1 },
-        },
+      const primaryMessage = `Known validated data: ${JSON.stringify(input.knownClientData)}\nCustomer message: ${input.message}`;
+      let result: { finalOutput: unknown; runContext: { usage: { requests: number; inputTokens: number; outputTokens: number; totalTokens: number; inputTokensDetails?: unknown } } };
+      try {
+        result = await this.runner.run(
+          agent,
+          primaryMessage,
+          {
+            conversationId: input.conversationId,
+            maxTurns: this.maxResponsesPerTurn,
+            signal: input.signal,
+            toolExecution: { maxFunctionToolConcurrency: providerReplayConfig.maxFunctionToolConcurrency },
+          },
+        );
+        primaryUsage = usageFromRunResult(result);
+      } catch (primaryError) {
+        if (!isEligibleProviderReplay(primaryError, { toolExecutionStarted, callerSignal: input.signal })) throw primaryError;
+        providerReplayAttempted = true;
+        primaryUsage = usageFromProviderFailure(primaryError);
+        const replaySignal = composeAbortSignals(input.signal, AbortSignal.timeout(providerReplayConfig.replayMaxDurationMs));
+        result = await this.runner.run(
+          buildPrimaryTurnAgent(Math.min(this.requestTimeoutMs ?? providerReplayConfig.replayMaxDurationMs, providerReplayConfig.replayMaxDurationMs)),
+          primaryMessage,
+          {
+            maxTurns: providerReplayConfig.maxTurns,
+            signal: replaySignal,
+            toolExecution: { maxFunctionToolConcurrency: providerReplayConfig.maxFunctionToolConcurrency },
+          },
+        );
+        providerReplayUsage = usageFromRunResult(result);
+      }
+      if (executorTechnicalFailure) {
+        throw new AgentTurnTechnicalError("agent_tool_execution_failed");
+      }
+      if (invalidAvailabilityArguments) {
+        throw new AgentTurnTechnicalError("agent_invalid_availability_arguments");
+      }
+      const omissionReplayRequired = !providerReplayAttempted && input.schedulingDecisionRequired &&
+        !toolExecutionStarted && toolResults.length === 0 &&
+        !schedulingDecisionRecorded &&
+        !toolResults.some((toolResult) => toolResult.name === "calculate_quote" && toolResult.output.kind === "quote");
+      if (omissionReplayRequired) {
+        omissionReplayAttempted = true;
+        const omissionReplaySignal = composeAbortSignals(input.signal, AbortSignal.timeout(schedulingOmissionReplayConfig.maxDurationMs));
+        // This is deliberately the *same* full primary Agent rather than a
+        // scheduling parser. It receives the exact full prompt, authoritative
+        // input and tool executor closure; only the durable Conversation is
+        // omitted. A successful replay therefore remains governed by all
+        // existing deterministic backend guards.
+        result = await this.runner.run(
+          buildPrimaryTurnAgent(Math.min(this.requestTimeoutMs ?? schedulingOmissionReplayConfig.maxDurationMs, schedulingOmissionReplayConfig.maxDurationMs)),
+          primaryMessage,
+          {
+            maxTurns: schedulingOmissionReplayConfig.maxTurns,
+            signal: omissionReplaySignal,
+            toolExecution: { maxFunctionToolConcurrency: schedulingOmissionReplayConfig.maxFunctionToolConcurrency },
+          },
+        );
+        omissionReplayUsage = usageFromRunResult(result);
+        if (executorTechnicalFailure) {
+          throw new AgentTurnTechnicalError("agent_tool_execution_failed");
+        }
+        if (invalidAvailabilityArguments) {
+          throw new AgentTurnTechnicalError("agent_invalid_availability_arguments");
+        }
+      }
+      const quoteRecalculatedInSchedulingState = toolResults.some((toolResult) =>
+        toolResult.name === "calculate_quote" && toolResult.output.kind === "quote",
       );
+      if (input.schedulingDecisionRequired && !schedulingDecisionRecorded && !quoteRecalculatedInSchedulingState) {
+        throw new AgentTurnTechnicalError("agent_scheduling_decision_missing");
+      }
+      const terminalAvailabilityResult = toolResults.some((toolResult) => toolResult.name === availabilityTerminalToolConfig.toolName);
       return {
-        reply: typeof result.finalOutput === "string" && result.finalOutput.trim().length > 0
+        reply: terminalAvailabilityResult
+          ? fallbackReply(input.replyLanguage)
+          : typeof result.finalOutput === "string" && result.finalOutput.trim().length > 0
           ? result.finalOutput
           : fallbackReply(input.replyLanguage),
         toolResults,
+        ...(schedulingActions.length > 0 ? { schedulingActions } : {}),
         steps: modelToolSteps,
-        usage: {
-          requests: result.runContext.usage.requests,
-          inputTokens: result.runContext.usage.inputTokens,
-          outputTokens: result.runContext.usage.outputTokens,
-          totalTokens: result.runContext.usage.totalTokens,
-          cachedInputTokens: cachedInputTokens(result.runContext.usage.inputTokensDetails),
-        },
+        usage: sumUsage(primaryUsage, providerReplayUsage, omissionReplayUsage),
+        ...(providerReplayAttempted && !primaryUsage ? { usageUnreconciledReason: "primary_replay_leg_usage_unreconciled" } : {}),
+        ...(terminalAvailabilityResult || omissionReplayAttempted || providerReplayAttempted ? { conversationResetRequired: true } : {}),
+        ...(providerReplayAttempted
+          ? { statelessRecovery: "provider_failure_replay" as const }
+          : omissionReplayAttempted ? { statelessRecovery: "scheduling_omission_replay" as const } : {}),
       };
     } catch (error) {
       // Evaluator control fences are not provider failures. Their exact typed
@@ -299,17 +750,46 @@ export class OpenAiAgentsGateway implements AgentGateway {
       // unchanged through the SDK boundary.
       if (isEvaluatorControlError(error)) throw error;
       if (input.signal?.aborted && input.signal.reason) throw input.signal.reason;
+      if (error instanceof AgentTurnTechnicalError) {
+        const completedUsage = sumUsage(primaryUsage, providerReplayUsage, omissionReplayUsage);
+        const usage = aggregateLegFailureUsage(completedUsage, error.usage);
+        throw new AgentTurnTechnicalError(
+          error.code,
+          usage,
+          unreconciledLegReason({ providerReplayAttempted, primaryReplayUsage: primaryUsage, completedProviderReplayUsage: providerReplayUsage, omissionReplayAttempted, completedOmissionReplayUsage: omissionReplayUsage, completedUsage, currentLegUsage: error.usage, finalProviderFailure: isProviderTimeoutOrTransport(error), explicitReason: error.usageUnreconciledReason, fallbackReason: "provider_turn_usage_unreconciled" }),
+        );
+      }
       // The Agents SDK wraps a function-tool exception from a single model
       // response in ToolCallError. Keep our typed fail-closed cause intact so
       // callers never turn it into model-visible recovery output.
       const technicalToolCause = extractTechnicalToolCause(error);
-      if (technicalToolCause) throw technicalToolCause;
+      if (technicalToolCause) {
+        const completedUsage = sumUsage(primaryUsage, providerReplayUsage, omissionReplayUsage);
+        throw new AgentTurnTechnicalError(
+          technicalToolCause.code,
+          aggregateLegFailureUsage(completedUsage, technicalToolCause.usage),
+          unreconciledLegReason({ providerReplayAttempted, primaryReplayUsage: primaryUsage, completedProviderReplayUsage: providerReplayUsage, omissionReplayAttempted, completedOmissionReplayUsage: omissionReplayUsage, completedUsage, currentLegUsage: technicalToolCause.usage, finalProviderFailure: isProviderTimeoutOrTransport(technicalToolCause), explicitReason: technicalToolCause.usageUnreconciledReason, fallbackReason: "provider_turn_usage_unreconciled" }),
+        );
+      }
+      // Function-tool Zod validation happens in the SDK before `execute`.
+      // Its typed error does not expose model prose or arguments here, but
+      // the SDK state does retain the canonical function name. Treat only a
+      // malformed availability call as our distinct safe protocol failure;
+      // other function-input errors retain their existing fail-closed path.
+      if (isInvalidAvailabilityToolInput(error)) {
+        const completedUsage = sumUsage(primaryUsage, providerReplayUsage, omissionReplayUsage);
+        throw new AgentTurnTechnicalError(
+          "agent_invalid_availability_arguments",
+          completedUsage,
+        );
+      }
       if (error instanceof MaxTurnsExceededError) {
         const partialUsage = usageFromMaxTurnsError(error);
+        const completedUsage = sumUsage(primaryUsage, providerReplayUsage, omissionReplayUsage);
         throw new AgentTurnTechnicalError(
           "agent_max_turns_exceeded",
-          partialUsage,
-          partialUsage ? undefined : "max_turns_usage_unavailable",
+          aggregateLegFailureUsage(completedUsage, partialUsage),
+          unreconciledLegReason({ providerReplayAttempted, primaryReplayUsage: primaryUsage, completedProviderReplayUsage: providerReplayUsage, omissionReplayAttempted, completedOmissionReplayUsage: omissionReplayUsage, completedUsage, currentLegUsage: partialUsage, finalProviderFailure: false, fallbackReason: "max_turns_usage_unavailable" }),
         );
       }
       // A provider may ignore the dynamically reduced tool surface and emit a
@@ -325,10 +805,11 @@ export class OpenAiAgentsGateway implements AgentGateway {
       // evidence.  Preserve only a safe category plus any released aggregate
       // usage exposed by the SDK state.
       const partialUsage = usageFromSdkError(error);
+      const completedUsage = sumUsage(primaryUsage, providerReplayUsage, omissionReplayUsage);
       throw new AgentTurnTechnicalError(
         normalizeProviderTechnicalCode(error),
-        partialUsage,
-        partialUsage ? undefined : "provider_turn_usage_unreconciled",
+        aggregateLegFailureUsage(completedUsage, partialUsage),
+        unreconciledLegReason({ providerReplayAttempted, primaryReplayUsage: primaryUsage, completedProviderReplayUsage: providerReplayUsage, omissionReplayAttempted, completedOmissionReplayUsage: omissionReplayUsage, completedUsage, currentLegUsage: partialUsage, finalProviderFailure: isProviderTimeoutOrTransport(error), fallbackReason: "provider_turn_usage_unreconciled" }),
       );
     }
   }
@@ -416,6 +897,73 @@ function composeAbortSignals(...signals: Array<AbortSignal | null | undefined>):
   return active.length === 1 ? active[0] : AbortSignal.any(active);
 }
 
+/** Combine completed provider legs without inventing data. */
+function sumUsage(...usages: Array<AgentTurn["usage"] | undefined>): AgentTurn["usage"] | undefined {
+  const known = usages.filter((usage): usage is NonNullable<AgentTurn["usage"]> => usage !== undefined);
+  if (known.length === 0) return undefined;
+  return known.reduce((total, usage) => ({
+    requests: total.requests + usage.requests,
+    inputTokens: total.inputTokens + usage.inputTokens,
+    outputTokens: total.outputTokens + usage.outputTokens,
+    totalTokens: total.totalTokens + usage.totalTokens,
+    cachedInputTokens: total.cachedInputTokens + usage.cachedInputTokens,
+  }), { requests: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedInputTokens: 0 });
+}
+
+/** A provider error belongs only to the currently executing leg. */
+function aggregateLegFailureUsage(
+  completedPrimaryUsage: AgentTurn["usage"] | undefined,
+  currentLegUsage: AgentTurn["usage"] | undefined,
+): AgentTurn["usage"] | undefined {
+  return sumUsage(completedPrimaryUsage, currentLegUsage);
+}
+
+/**
+ * A completed primary response is known evidence, never evidence that a
+ * started recovery leg reconciled. Keep a specific unreconciled marker whenever
+ * a recovery leg failed without published usage.
+ */
+function unreconciledLegReason(input: {
+  providerReplayAttempted: boolean;
+  /** Known aggregate released by the failed primary provider leg. */
+  primaryReplayUsage: AgentTurn["usage"] | undefined;
+  /** Usage from a completed replay; absent only while its provider leg failed. */
+  completedProviderReplayUsage: AgentTurn["usage"] | undefined;
+  omissionReplayAttempted: boolean;
+  /** Usage from a completed full-primary omission replay. */
+  completedOmissionReplayUsage?: AgentTurn["usage"];
+  completedUsage?: AgentTurn["usage"];
+  currentLegUsage: AgentTurn["usage"] | undefined;
+  /** The last started leg threw timeout/transport rather than completing. */
+  finalProviderFailure: boolean;
+  explicitReason?: string;
+  fallbackReason: string;
+}): string | undefined {
+  if (input.explicitReason) return input.explicitReason;
+  // A thrown provider leg can expose partial or zero-valued SDK usage even
+  // though the provider request started. It is never a completed usage
+  // record: retain every released subtotal exactly once and mark this final
+  // timeout/transport leg unreconciled rather than fabricating a full cost.
+  if (input.finalProviderFailure) {
+    if (input.providerReplayAttempted && !input.completedProviderReplayUsage) return "provider_replay_leg_usage_unreconciled";
+    if (input.omissionReplayAttempted && !input.completedOmissionReplayUsage) return "scheduling_omission_replay_leg_usage_unreconciled";
+    return input.fallbackReason;
+  }
+  // A transient primary failure may have started a provider request without
+  // releasing usage. Never present a later replay subtotal as reconciliation
+  // for that lost primary leg.
+  if (input.providerReplayAttempted && !input.primaryReplayUsage) return "primary_replay_leg_usage_unreconciled";
+  if (input.providerReplayAttempted && !input.completedProviderReplayUsage && !input.currentLegUsage) return "provider_replay_leg_usage_unreconciled";
+  if (input.omissionReplayAttempted && !input.completedOmissionReplayUsage && !input.currentLegUsage) return "scheduling_omission_replay_leg_usage_unreconciled";
+  if (!input.currentLegUsage && !input.completedUsage) return input.fallbackReason;
+  return undefined;
+}
+
+function isProviderTimeoutOrTransport(error: unknown): boolean {
+  const code = normalizeProviderTechnicalCode(error);
+  return code === "agent_provider_timeout" || code === "agent_provider_transport_error";
+}
+
 /** The SDK keeps usage-detail keys provider-defined, so aggregate only cache-named fields. */
 function cachedInputTokens(details: Array<Record<string, number>>): number {
   return details.reduce(
@@ -470,6 +1018,23 @@ export function normalizeProviderTechnicalCode(error: unknown): AgentTurnTechnic
   return "agent_provider_sdk_error";
 }
 
+/** Only an unambiguous first provider leg is safe to replay statelessly. */
+function isEligibleProviderReplay(
+  error: unknown,
+  input: { toolExecutionStarted: boolean; callerSignal?: AbortSignal },
+): boolean {
+  if (input.toolExecutionStarted || input.callerSignal?.aborted || isEvaluatorControlError(error)) return false;
+  const code = normalizeProviderTechnicalCode(error);
+  return code === "agent_provider_timeout" || code === "agent_provider_transport_error";
+}
+
+/** Provider failures expose only their own released partial usage. */
+function usageFromProviderFailure(error: unknown): AgentTurn["usage"] | undefined {
+  if (error instanceof AgentTurnTechnicalError) return error.usage;
+  if (error instanceof MaxTurnsExceededError) return usageFromMaxTurnsError(error);
+  return usageFromSdkError(error);
+}
+
 /** Local evaluator deadlines/resource caps must remain terminal control flow. */
 function isEvaluatorControlError(error: unknown): boolean {
   if (typeof error !== "object" || error === null || !("code" in error)) return false;
@@ -483,13 +1048,46 @@ function isEvaluatorControlError(error: unknown): boolean {
     code === "total_token_cap_exceeded";
 }
 
-function extractTechnicalToolCause(error: unknown): AgentTurnTechnicalError | undefined {
+function extractTechnicalToolCause(error: unknown, seen = new Set<unknown>()): AgentTurnTechnicalError | undefined {
   if (error instanceof AgentTurnTechnicalError) return error;
-  if (typeof error === "object" && error !== null && "error" in error) {
-    const cause = (error as { error?: unknown }).error;
-    return cause instanceof AgentTurnTechnicalError ? cause : undefined;
+  if (typeof error !== "object" || error === null || seen.has(error)) return undefined;
+  seen.add(error);
+  // The SDK has used both `error` and native `cause` wrappers across tool
+  // paths. Inspect only their object linkage, never messages or payloads, so
+  // an executor fault cannot be relabelled as a provider transport failure.
+  for (const key of ["error", "cause"] as const) {
+    if (key in error) {
+      const technical = extractTechnicalToolCause((error as Record<string, unknown>)[key], seen);
+      if (technical) return technical;
+    }
   }
   return undefined;
+}
+
+/**
+ * The Agents SDK rejects malformed function input before our executor runs.
+ * Identify that typed boundary by its error class and the SDK-owned resolved
+ * function name, never by customer/model text or raw tool arguments.
+ */
+function isInvalidAvailabilityToolInput(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  let hasInvalidToolInput = false;
+  let hasAvailabilityFunction = false;
+  const visit = (value: unknown): void => {
+    if (typeof value !== "object" || value === null || seen.has(value)) return;
+    seen.add(value);
+    if ((value as { name?: unknown }).name === "InvalidToolInputError") hasInvalidToolInput = true;
+    const record = value as Record<string, unknown>;
+    if (record.name === "request_available_slots" && ("parameters" in record || "invoke" in record)) hasAvailabilityFunction = true;
+    for (const key of ["error", "cause", "state", "lastProcessedResponse", "functions"] as const) {
+      const child = record[key];
+      if (Array.isArray(child)) child.forEach(visit);
+      else visit(child);
+    }
+    if (record.tool) visit(record.tool);
+  };
+  visit(error);
+  return hasInvalidToolInput && hasAvailabilityFunction;
 }
 
 function isObjectWithString<K extends string>(value: unknown, key: K): value is Record<K, string> {
@@ -509,13 +1107,18 @@ export class FakeAgentGateway implements AgentGateway {
   async runTurn(input: AgentTurnInput): Promise<AgentTurn> {
     const patch = inferClientDataPatch(input.message);
     const toolResults: AgentToolResult[] = [];
+    const allowed = new Set(input.allowedTools ?? ["update_client_data", "mark_human_needed", "calculate_quote", "request_available_slots", "record_scheduling_decision"] as const);
 
-    const updateOutput = await input.executeTool("update_client_data", { patch });
-    toolResults.push({ name: "update_client_data", output: updateOutput });
+    if (allowed.has("update_client_data")) {
+      const updateOutput = await input.executeTool("update_client_data", { patch });
+      toolResults.push({ name: "update_client_data", output: updateOutput });
+    }
 
     if (containsOutOfScopeSignal(input.message)) {
-      const escalationOutput = await input.executeTool("mark_human_needed", { reason: inferOutOfScopeReason(input.message) });
-      toolResults.push({ name: "mark_human_needed", output: escalationOutput });
+      if (allowed.has("mark_human_needed")) {
+        const escalationOutput = await input.executeTool("mark_human_needed", { reason: inferOutOfScopeReason(input.message) });
+        toolResults.push({ name: "mark_human_needed", output: escalationOutput });
+      }
       return {
         reply: replyForLanguage(input.replyLanguage, "human_needed"),
         toolResults,
@@ -523,8 +1126,8 @@ export class FakeAgentGateway implements AgentGateway {
       };
     }
 
-    if (/\b(slots?|availability|available time|schedule)\b/i.test(input.message)) {
-      const output = await input.executeTool("request_available_slots", {});
+    if (allowed.has("request_available_slots") && /\b(slots?|availability|available time|schedule)\b/i.test(input.message)) {
+      const output = await input.executeTool("request_available_slots", { intent: fakeAvailabilityIntent(input) });
       toolResults.push({ name: "request_available_slots", output });
       return {
         reply: output.ok === true
@@ -535,6 +1138,18 @@ export class FakeAgentGateway implements AgentGateway {
       };
     }
 
+    if (input.schedulingDecisionRequired && allowed.has("record_scheduling_decision")) {
+      const output = await input.executeTool("record_scheduling_decision", { reason: "question_not_about_scheduling" });
+      toolResults.push({ name: "record_scheduling_decision", output });
+    }
+
+    if (!allowed.has("calculate_quote")) {
+      return {
+        reply: replyForLanguage(input.replyLanguage, "missing"),
+        toolResults,
+        steps: toolResults.length,
+      };
+    }
     const quoteOutput = await input.executeTool("calculate_quote", {});
     toolResults.push({ name: "calculate_quote", output: quoteOutput });
 
@@ -596,6 +1211,30 @@ function inferClientDataPatch(message: string): Record<string, unknown> {
   if (/no extras|без дополн/.test(lower)) patch.extras = [];
 
   return patch;
+}
+
+function fakeAvailabilityIntent(input: AgentTurnInput): SchedulingAvailabilityIntent {
+  const lower = input.message.toLocaleLowerCase();
+  const dateReference = /\btomorrow\b|завтра|sutra/u.test(lower)
+    ? "tomorrow"
+    : /\btoday\b|сегодня|danas/u.test(lower)
+    ? "today"
+    : "current_preferred_date";
+  const timePreference = /evening|вечером|uveče|uvece/u.test(lower)
+    ? "evening"
+    : /midday|noon|дн[её]м|обед|podne/u.test(lower)
+    ? "midday"
+    : /morning|утром|ujutru/u.test(lower)
+    ? "morning"
+    : "any";
+  const explicitAny = /(?:any\s+time|в\s+любое\s+время|bilo\s+koje\s+vreme)/u.test(lower);
+  return {
+    dateReference,
+    timePreference,
+    timePreferenceMode: timePreference === "any" && !explicitAny ? "preserve" : "explicit",
+    relation: /later|позже|kasnije/u.test(lower) ? "later_than_last_offer" : "fresh",
+    existingOfferDisposition: input.schedulingSnapshot?.lastOffer ? "retain_until_replacement" : "none",
+  };
 }
 
 function containsOutOfScopeSignal(message: string): boolean {
@@ -714,8 +1353,27 @@ const intakeInstruction = "Process facts in every customer message regardless of
 
 const dateIntakeInstruction = "Treat customer-friendly date language as valid: a Russian date without a year such as \"26 августа\", relative phrases such as \"через 2 дня\", and a weekend request. Do not demand DD.MM.YYYY or another rigid format. Use YYYY-MM-DD only when you save a date in update_client_data; the backend may already have normalised the customer date. If a date phrase is genuinely ambiguous, propose one concrete local date and ask whether it works. A date is optional for an initial estimate and is needed before scheduling. Never ask about an internal urgency field.";
 
+function schedulingInstruction(snapshot: SchedulingSnapshot | undefined, required: boolean): string {
+  if (!snapshot) return "";
+  const context = JSON.stringify(snapshot);
+  if (!required) return `Authoritative scheduling state for context: ${context}`;
+  return `Authoritative scheduling state: ${context}\n\nThis turn is in QUOTED or OFFERED scheduling state. Before writing your final reply, you MUST make one typed scheduling decision. For an availability question, any request for another date/time, or a changed time/date preference, call request_available_slots with exactly {intent:{date,time,relation,existingOfferDisposition}}. Select only a date.kind offered by the function schema. If currentTurnDateCoordinate is present, it is the exclusive current-message-only coordinate: choose only its date reference and do not use an older preferred date or offer in this request. Do not treat it as a durable lead fact. When it is absent, current_preferred_date exists only with a durable preferred date. Use day_after_last_offer only if snapshot.lastOffer contains an actual active offer. lastAvailabilityAttempt is an auditable prior Calendar check, not a durable preference: its candidate exact date remains selectable alongside older durable references. After a no_slots or failure result, a time-only refinement must select that exact candidate date and call Calendar again. time.kind must be preserve, any, morning, midday, evening, after with afterLocalTime, before with beforeLocalTime, or range with ordered afterLocalTime and beforeLocalTime. Use preserve only for a date-only follow-up that keeps the existing time window; use any when the customer explicitly removes that window. relation is fresh or later_than_last_offer. existingOfferDisposition is none only when snapshot has no lastOffer; retain_until_replacement keeps an existing offer until fresh results replace it; reject_now only when the customer clearly rejects the old options. Do not say that you will check later. If the customer's message is genuinely unrelated to availability or only acknowledges an existing offer, call record_scheduling_decision with the truthful reason. First save any new supported order facts with update_client_data. If that invalidates the quote, call calculate_quote and show the revised price; do not mix a new quote with a Calendar offer in the same customer turn.`;
+}
+
 function pricingInstruction(pricingRules: PricingRules): string {
   return `Current deterministic pricing rules for explanation only: ${JSON.stringify(pricingRules)}. You may explain that the exact amount is confirmed by the backend, and that a same-day date applies the configured multiplier. Never do arithmetic, invent an amount, invent availability, or confirm a booking yourself. Use calculate_quote after the base cleaning inputs are available; a date and time window are not required for a first quote. Ask for a date before scheduling, or when a same-day price needs to be confirmed.`;
+}
+
+function usageFromRunResult(result: { runContext: { usage: { requests: number; inputTokens: number; outputTokens: number; totalTokens: number; inputTokensDetails?: unknown } } }): NonNullable<AgentTurn["usage"]> {
+  return {
+    requests: result.runContext.usage.requests,
+    inputTokens: result.runContext.usage.inputTokens,
+    outputTokens: result.runContext.usage.outputTokens,
+    totalTokens: result.runContext.usage.totalTokens,
+    cachedInputTokens: cachedInputTokens(Array.isArray(result.runContext.usage.inputTokensDetails)
+      ? result.runContext.usage.inputTokensDetails.filter((detail): detail is Record<string, number> => typeof detail === "object" && detail !== null)
+      : []),
+  };
 }
 
 function serbianText(language: string, latin: string, cyrillic: string): string {

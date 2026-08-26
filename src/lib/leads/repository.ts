@@ -8,6 +8,48 @@ import type {
   PricingRules,
   Quote,
 } from "@/lib/contracts/domain";
+import { z } from "zod";
+
+/** The stored attempt uses the same 30-minute customer-facing scheduling grid
+ * as the canonical availability intent.  It is audit context, never a loose
+ * archival copy of model arguments. */
+const localTimeSchema = z.string().regex(/^(?:0[89]|1[0-9]):(?:00|30)$/u);
+export const availabilityAttemptResultSchema = z.enum(["exact_offer", "fallback_offer", "no_slots", "failure"]);
+export const storedAvailabilityAttemptSchema = z.object({
+  result: availabilityAttemptResultSchema,
+  candidateDate: z.string().date(),
+  timePreference: z.enum(["any", "morning", "midday", "evening", "after", "before", "range"]),
+  timePreferenceMode: z.enum(["preserve", "explicit"]),
+  afterLocalTime: localTimeSchema.optional(),
+  beforeLocalTime: localTimeSchema.optional(),
+  relation: z.enum(["fresh", "later_than_last_offer"]),
+  checkedAt: z.string().datetime(),
+}).strict().superRefine((value, context) => {
+  const hasAfter = value.afterLocalTime !== undefined;
+  const hasBefore = value.beforeLocalTime !== undefined;
+  if (value.timePreferenceMode === "preserve" && value.timePreference !== "any") {
+    context.addIssue({ code: "custom", message: "preserve requires any" });
+  }
+  if (value.timePreferenceMode === "preserve" && (hasAfter || hasBefore)) {
+    context.addIssue({ code: "custom", message: "preserve cannot carry bounds" });
+  }
+  if (value.timePreference === "after" && (!hasAfter || hasBefore)) {
+    context.addIssue({ code: "custom", message: "after requires only afterLocalTime" });
+  }
+  if (value.timePreference === "before" && (!hasBefore || hasAfter)) {
+    context.addIssue({ code: "custom", message: "before requires only beforeLocalTime" });
+  }
+  if (value.timePreference === "range" && (!hasAfter || !hasBefore || value.afterLocalTime! >= value.beforeLocalTime!)) {
+    context.addIssue({ code: "custom", message: "range requires ordered bounds" });
+  }
+  if (!["after", "range"].includes(value.timePreference) && hasAfter) {
+    context.addIssue({ code: "custom", message: "afterLocalTime is invalid for preference" });
+  }
+  if (!["before", "range"].includes(value.timePreference) && hasBefore) {
+    context.addIssue({ code: "custom", message: "beforeLocalTime is invalid for preference" });
+  }
+});
+export type StoredAvailabilityAttempt = z.infer<typeof storedAvailabilityAttemptSchema>;
 
 export type StoredLead = {
   id: string;
@@ -119,6 +161,10 @@ export interface LeadRepository {
   getCurrentAgentConfig(): Promise<StoredAgentConfig>;
   getAgentConfig(version: number): Promise<StoredAgentConfig>;
   appendActivity(leadId: string, eventType: string, payload?: Record<string, unknown>): Promise<void>;
+  /** Safe typed attempt history is stored in activity_log, never on the lead. */
+  recordAvailabilityAttempt(leadId: string, attempt: StoredAvailabilityAttempt): Promise<void>;
+  /** Returns only a validated latest attempt; malformed historical activity is ignored. */
+  getLastAvailabilityAttempt(leadId: string): Promise<StoredAvailabilityAttempt | null>;
   createIntegrationOperation(input: {
     leadId: string;
     idempotencyKey: string;

@@ -44,6 +44,8 @@ export const humanNeededReasons = [
   "delivery_ambiguous",
   "calendar_unavailable",
   "calendar_ambiguous",
+  /** The requested service cannot fit safely inside the configured workday. */
+  "duration_exceeds_workday",
   "trello_unavailable",
   "trello_ambiguous",
   "trello_terminal",
@@ -128,16 +130,65 @@ export type AgentToolName =
   | "update_client_data"
   | "calculate_quote"
   | "mark_human_needed"
-  | "request_available_slots";
+  | "request_available_slots"
+  /**
+   * Every turn while a quote or an offer is active records an auditable
+   * scheduling decision. This prevents a free-text promise to check the
+   * calendar from becoming a dead end while still allowing unrelated
+   * questions to stay out of the Calendar.
+   */
+  | "record_scheduling_decision";
+
+/**
+ * A date stated in this exact customer message. It is privacy-safe and
+ * deliberately transient: never persist it in the lead, activity log or
+ * durable provider Conversation. The scheduling executor verifies that a
+ * matching availability call cannot silently fall back to an absent durable
+ * preferred date.
+ */
+export type CurrentTurnDateCoordinate = {
+  date: string;
+  recommendedDateReference: "today" | "tomorrow" | "exact_date";
+  source: "relative_today" | "relative_tomorrow" | "relative_day_after" | "relative_in_days" | "absolute";
+  timezone: "Europe/Belgrade";
+};
 
 export type AgentToolResult = {
   name: AgentToolName;
   output: Record<string, unknown>;
 };
 
+/**
+ * Privacy-safe record of the scheduling choice made in a quoted/offered turn.
+ * It intentionally contains no Calendar IDs, slot tokens, provider payloads,
+ * customer text or dates beyond the semantic reference the agent selected.
+ */
+export type SchedulingSemanticAction =
+  | {
+      kind: "availability";
+      dateReference: "current_preferred_date" | "today" | "tomorrow" | "same_day_as_last_offer" | "day_after_last_offer" | "exact_date";
+      timePreference: "any" | "morning" | "midday" | "evening" | "after" | "before" | "range";
+      /** Whether `any` deliberately clears the prior window or preserves it. */
+      timePreferenceMode: "preserve" | "explicit";
+      relation: "fresh" | "later_than_last_offer";
+      /** Validated local bounds only for `after`, `before` or `range`. */
+      afterLocalTime?: string;
+      beforeLocalTime?: string;
+      /** How an existing offered token set is handled for this new search.
+       * Optional only for immutable pre-v34 evaluator fixtures; production
+       * gateway actions always include the required provider intent value. */
+      existingOfferDisposition?: "none" | "retain_until_replacement" | "reject_now";
+    }
+  | {
+      kind: "no_calendar";
+      reason: "question_not_about_scheduling" | "date_or_time_preference_missing" | "awaiting_customer_choice" | "already_reserved" | "human_review_in_progress";
+    };
+
 export type AgentTurn = {
   reply: string;
   toolResults: AgentToolResult[];
+  /** Typed audit trail for evaluation and debugging of scheduling turns. */
+  schedulingActions?: SchedulingSemanticAction[];
   steps: number;
   /** Provider-reported aggregate only; it contains no response IDs or content. */
   usage?: {
@@ -154,6 +205,15 @@ export type AgentTurn = {
    * explicit instead of treating an absent aggregate as zero usage.
    */
   usageUnreconciledReason?: string;
+  /**
+   * A successful stateless recovery or terminal availability tool result
+   * cannot safely extend the durable primary Conversation. The webhook
+   * invalidates it before committing a deferred Calendar offer or completing
+   * the turn operation.
+   */
+  conversationResetRequired?: boolean;
+  /** Safe recovery audit only; never contains provider IDs, prompts or text. */
+  statelessRecovery?: "scheduling_omission_replay" | "provider_failure_replay";
 };
 
 export type IntegrationOperation = {

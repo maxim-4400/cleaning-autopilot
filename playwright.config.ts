@@ -17,7 +17,7 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: `NEXT_PUBLIC_SUPABASE_URL=https://auth.test NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=test-publishable-key NEXT_PUBLIC_TEAM_A_CALENDAR_EMBED_URL=https://calendar.google.com/calendar/embed?src=team-a%40example.test NEXT_PUBLIC_TEAM_B_CALENDAR_EMBED_URL=https://calendar.google.com/calendar/embed?src=team-b%40example.test MIRO_BOARD_URL=https://miro.com/app/board/uXdemo/?share_link_id=104117806222 MIRO_EMBED_URL=https://miro.com/app/board/uXdemo/?share_link_id=104117806222\\&embed=1 ${process.execPath} node_modules/next/dist/bin/next dev --hostname 127.0.0.1 --port ${port}`,
+    command: `NEXT_PUBLIC_SUPABASE_URL=https://auth.test NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=test-publishable-key NEXT_PUBLIC_TEAM_A_CALENDAR_EMBED_URL=https://calendar.google.com/calendar/embed?src=team-a%40example.test NEXT_PUBLIC_TEAM_B_CALENDAR_EMBED_URL=https://calendar.google.com/calendar/embed?src=team-b%40example.test MIRO_BOARD_URL=https://miro.com/app/board/uXdemo/?share_link_id=104117806222 MIRO_EMBED_URL=https://miro.com/app/live-embed/uXdemo/?embedMode=view_only_without_ui\\&moveToViewport=0,0,100,100 ${process.execPath} node_modules/next/dist/bin/next dev --hostname 127.0.0.1 --port ${port}`,
     url: baseURL,
     reuseExistingServer: !process.env.CI,
   },

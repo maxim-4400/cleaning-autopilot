@@ -1,16 +1,21 @@
+import { createHash, randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { readFile, unlink } from "node:fs/promises";
+import { resolve } from "node:path";
 
 import { describe, expect, it, vi } from "vitest";
 
 import { AgentTurnTechnicalError, FakeAgentGateway, type AgentGateway, type AgentTurnInput } from "@/lib/agent/gateway";
-import type { AgentTurn } from "@/lib/contracts/domain";
+import type { AgentTurn, SchedulingSemanticAction } from "@/lib/contracts/domain";
 
 import {
   canonicalLiveEvaluationManifestSha256,
+  buildLiveEvaluationManifest,
   DeadlineBoundAgentGateway,
   defaultLiveEvaluationReportPath,
   EvaluationDeadlineExceededError,
   EvaluationResourceLimitExceededError,
+  ConversationCreateCounter,
   liveEvaluationConfirmation,
   liveEvaluationCustomerTurnDeadlineMs,
   liveEvaluationFocusedScenarioDeadlineMs,
@@ -18,9 +23,14 @@ import {
   liveEvaluationMaxResponsesPerCustomerMessage,
   liveEvaluationProviderRequestTimeoutMs,
   liveEvaluationProviderResponseBudget,
+  liveEvaluationConversationCreateBudget,
+  liveEvaluationAvailabilityTerminal,
+  liveEvaluationAvailabilityProviderEnvelope,
   liveEvaluationSmokeScenarioCount,
   liveEvaluationSuiteDeadlineMs,
   liveEvaluationRubricRevision,
+  liveEvaluationProviderReplay,
+  liveEvaluationSchedulingOmissionReplay,
   liveEvaluationTokenCaps,
   markLiveEvaluationReportFailed,
   loadAcceptedSmokeCheckpoint,
@@ -29,11 +39,12 @@ import {
   reEvaluateStoredLiveReport,
   runLiveConversationEvaluation,
   toScenarioResult,
+  validateLiveEvaluationRequest,
   type LiveEvaluationManifest,
   type LiveEvaluationReport,
 } from "../support/live-conversation-evaluation";
 import { runConversationScenario, type SanitizedConversationArtifact } from "../support/conversation-sandbox";
-import { liveConversationMessageCount, liveConversationScenarioCount, liveConversationScenarios, type LiveConversationScenario } from "../support/conversation-live-scenarios";
+import { assertLiveConversationScenarioManifest, liveConversationMessageCount, liveConversationScenarioCount, liveConversationScenarios, type LiveConversationScenario } from "../support/conversation-live-scenarios";
 
 const manifest = (): LiveEvaluationManifest => {
   const unsignedManifest: Omit<LiveEvaluationManifest, "manifestSha256"> = {
@@ -49,7 +60,7 @@ const manifest = (): LiveEvaluationManifest => {
     maxResponsesPerCustomerMessage: liveEvaluationMaxResponsesPerCustomerMessage,
     providerResponseBudget: liveEvaluationProviderResponseBudget,
     maxResponseAttemptsPerModelTurn: 1,
-    maxConversationCreateRequests: liveConversationScenarioCount,
+    maxConversationCreateRequests: liveEvaluationConversationCreateBudget,
     maxProviderRequestDurationMs: liveEvaluationProviderRequestTimeoutMs,
     maxCustomerTurnDurationMs: liveEvaluationCustomerTurnDeadlineMs,
     focusedScenarioDeadlineMs: liveEvaluationFocusedScenarioDeadlineMs,
@@ -58,6 +69,15 @@ const manifest = (): LiveEvaluationManifest => {
     prompt: { source: "baseline", revision: "prompt-revision", sha256: "prompt-hash" },
     pricingRules: { version: 1, sha256: "pricing-hash" },
     evaluator: { revision: liveEvaluationRubricRevision, sha256: "test-evaluator-hash" },
+    schedulingOmissionReplay: liveEvaluationSchedulingOmissionReplay,
+    providerReplay: {
+      ...liveEvaluationProviderReplay,
+      baseSystemPromptSha256: "prompt-hash",
+      gatewaySourceSha256: createHash("sha256").update(readFileSync(resolve(process.cwd(), "src/lib/agent/gateway.ts"), "utf8")).digest("hex"),
+      webhookSourceSha256: createHash("sha256").update(readFileSync(resolve(process.cwd(), "src/lib/telegram/webhook.ts"), "utf8")).digest("hex"),
+    },
+    availabilityProviderEnvelope: liveEvaluationAvailabilityProviderEnvelope,
+    availabilityTerminal: liveEvaluationAvailabilityTerminal,
     tokenCaps: liveEvaluationTokenCaps,
   };
   return { ...unsignedManifest, manifestSha256: canonicalLiveEvaluationManifestSha256(unsignedManifest) };
@@ -78,15 +98,18 @@ const liveRequest = (overrides = {}) => ({
   ...overrides,
 });
 
+const isolatedReportPath = () => resolve(process.cwd(), ".runtime", "conversation-live-evaluations", `unit-${randomUUID()}.json`);
+
 const validSmokeReport = (currentManifest: LiveEvaluationManifest): LiveEvaluationReport => {
   const fixtures = liveConversationScenarios.slice(0, liveEvaluationSmokeScenarioCount);
   const scenarios = fixtures.map((fixture) => {
     const checkpointEvidence = fixture.customerMessages.map((customer, index) => {
-      const { semanticTools, semanticToolsOneOf, visibleIncludes: _visibleIncludes, ...state } = fixture.checkpointExpectations?.[index] ?? {};
-      void semanticToolsOneOf;
+      const { semanticTools, semanticToolsOneOf, schedulingActions, schedulingActionsOneOf, lastAvailabilityAttempt: _lastAvailabilityAttempt, lastAvailabilityAttemptOneOf: _lastAvailabilityAttemptOneOf, visibleIncludes: _visibleIncludes, ...state } = fixture.checkpointExpectations?.[index] ?? {};
       void _visibleIncludes;
+      void _lastAvailabilityAttempt;
+      void _lastAvailabilityAttemptOneOf;
       const requiredAtFirstCheckpoint = index === 0 ? Object.entries(fixture.requiredToolCounts ?? {}).flatMap(([name, count]) => count === 1 ? [name as "mark_human_needed"] : []) : [];
-      return { provenance: "post_customer_message_checkpoint" as const, customerMessageNumber: index + 1, customer, semanticTools: semanticTools ?? requiredAtFirstCheckpoint, quoteState: fixture.expected.hasQuote ? "active" as const : "none" as const, humanNeeded: fixture.expected.humanNeeded, calendarCreates: fixture.expected.fakeCalendarCreates, slotOfferCount: fixture.expected.slotOffer ? 1 : 0, ...state };
+      return { provenance: "post_customer_message_checkpoint" as const, customerMessageNumber: index + 1, customer, semanticTools: semanticTools ?? semanticToolsOneOf?.[0] ?? requiredAtFirstCheckpoint, ...((schedulingActions ?? schedulingActionsOneOf?.[0]) ? { schedulingActions: schedulingActions ?? schedulingActionsOneOf?.[0] } : {}), quoteState: fixture.expected.hasQuote ? "active" as const : "none" as const, humanNeeded: fixture.expected.humanNeeded, calendarCreates: fixture.expected.fakeCalendarCreates, slotOfferCount: fixture.expected.slotOffer ? 1 : 0, ...state };
     });
     return ({
     id: fixture.id,
@@ -108,12 +131,20 @@ const validSmokeReport = (currentManifest: LiveEvaluationManifest): LiveEvaluati
     summary: { processed: fixtures.length, customerMessagesProcessed: messages, failed: 0, repliesSafe: fixtures.length, quotes: scenarios.filter((scenario) => scenario.outcome.hasQuote).length, humanNeeded: scenarios.filter((scenario) => scenario.outcome.humanNeeded).length, fakeCalendarCreates: scenarios.reduce((total, scenario) => total + scenario.outcome.fakeCalendarCreates, 0) },
     scenarios,
     providerResponses: { started: fixtures.length, limit: liveEvaluationProviderResponseBudget, remaining: liveEvaluationProviderResponseBudget - fixtures.length },
+    conversationCreates: { started: fixtures.length, limit: liveEvaluationConversationCreateBudget, remaining: liveEvaluationConversationCreateBudget - fixtures.length },
     latency: { completedTurns: messages, p50Ms: 10, p95Ms: 10, withinTargets: true },
     usage: { status: "available", completed: { requests: fixtures.length, inputTokens: fixtures.length, outputTokens: fixtures.length, totalTokens: fixtures.length * 2, cachedInputTokens: 0 } },
   };
 };
 
 describe("live conversation evaluation guard", () => {
+  it("keeps the v33 synthetic evidence budget at 20 scenarios, 89 messages, and an immutable 5-scenario smoke", () => {
+    expect(liveConversationScenarioCount).toBe(20);
+    expect(liveConversationMessageCount).toBe(89);
+    expect(liveConversationScenarios.slice(0, liveEvaluationSmokeScenarioCount).reduce((total, scenario) => total + scenario.customerMessages.length, 0)).toBe(31);
+    expect(liveConversationScenarios.slice(liveEvaluationSmokeScenarioCount).reduce((total, scenario) => total + scenario.customerMessages.length, 0)).toBe(58);
+    expect(liveConversationScenarios.filter((scenario) => scenario.customerMessages.length >= 6)).toHaveLength(6);
+  });
   it("keeps the default mode dry and never constructs an OpenAI gateway", async () => {
     const agentFactory = vi.fn(() => new FakeAgentGateway());
     const report = await runLiveConversationEvaluation({ live: false }, agentFactory, manifest());
@@ -130,6 +161,15 @@ describe("live conversation evaluation guard", () => {
     expect(agentFactory).not.toHaveBeenCalled();
   });
 
+  it("rejects a recomputed manifest that weakens the whole-suite Conversation-create cap", async () => {
+    const weakened = manifest();
+    weakened.maxConversationCreateRequests = liveEvaluationConversationCreateBudget - 1;
+    const { manifestSha256: previousHash, ...unsignedWeakened } = weakened;
+    void previousHash;
+    weakened.manifestSha256 = canonicalLiveEvaluationManifestSha256(unsignedWeakened);
+    await expect(runLiveConversationEvaluation({ live: false }, () => new FakeAgentGateway(), weakened)).rejects.toThrow(`exactly ${liveEvaluationConversationCreateBudget} Conversation-create requests`);
+  });
+
   it("binds a paid invocation to the exact dry manifest before constructing an agent", async () => {
     const agentFactory = vi.fn(() => new FakeAgentGateway());
     await expect(runLiveConversationEvaluation(liveRequest({ manifestSha256: "stale" }), agentFactory, manifest())).rejects.toThrow("manifest-sha256");
@@ -140,6 +180,121 @@ describe("live conversation evaluation guard", () => {
     rubricTampered.evaluator.revision = "different-rubric";
     await expect(runLiveConversationEvaluation(liveRequest(), agentFactory, rubricTampered)).rejects.toThrow("manifest hash is invalid");
     expect(agentFactory).not.toHaveBeenCalled();
+  });
+
+  it("changes the immutable manifest when the omission-replay mechanical contract changes", () => {
+    const current = manifest();
+    expect(current.schedulingOmissionReplay).toMatchObject({
+      revision: "v30-stateless-full-primary-scheduling-omission-replay",
+      promptContract: "same_full_primary_instruction",
+      stateless: true,
+      maxReplayAttempts: 1,
+      maxTurns: 4,
+      maxDurationMs: 9_000,
+      instructionRevision: liveEvaluationSchedulingOmissionReplay.instructionRevision,
+    });
+
+    const alteredPrompt = { ...current, schedulingOmissionReplay: { ...current.schedulingOmissionReplay, promptContract: "changed-prompt" as never } };
+    const { manifestSha256: currentPromptHash, ...unsignedPrompt } = alteredPrompt;
+    void currentPromptHash;
+    expect(canonicalLiveEvaluationManifestSha256(unsignedPrompt)).not.toBe(current.manifestSha256);
+
+    const alteredContract = { ...current, schedulingOmissionReplay: { ...current.schedulingOmissionReplay, maxTurns: 2 as never } };
+    const { manifestSha256: currentContractHash, ...unsignedContract } = alteredContract;
+    void currentContractHash;
+    expect(canonicalLiveEvaluationManifestSha256(unsignedContract)).not.toBe(current.manifestSha256);
+
+    const alteredReplayPrompt = { ...current, providerReplay: { ...current.providerReplay, baseSystemPromptSha256: "changed-primary-prompt" } };
+    const { manifestSha256: currentReplayPromptHash, ...unsignedReplayPrompt } = alteredReplayPrompt;
+    void currentReplayPromptHash;
+    expect(canonicalLiveEvaluationManifestSha256(unsignedReplayPrompt)).not.toBe(current.manifestSha256);
+
+    const alteredGatewaySource = { ...current, providerReplay: { ...current.providerReplay, gatewaySourceSha256: "changed-gateway-source" } };
+    const { manifestSha256: currentGatewaySourceHash, ...unsignedGatewaySource } = alteredGatewaySource;
+    void currentGatewaySourceHash;
+    expect(canonicalLiveEvaluationManifestSha256(unsignedGatewaySource)).not.toBe(current.manifestSha256);
+
+    const alteredWebhookSource = { ...current, providerReplay: { ...current.providerReplay, webhookSourceSha256: "changed-webhook-source" } };
+    const { manifestSha256: currentWebhookSourceHash, ...unsignedWebhookSource } = alteredWebhookSource;
+    void currentWebhookSourceHash;
+    expect(canonicalLiveEvaluationManifestSha256(unsignedWebhookSource)).not.toBe(current.manifestSha256);
+
+    const alteredReplayConfig = { ...current, providerReplay: { ...current.providerReplay, replayMaxDurationMs: 1 as never } };
+    const { manifestSha256: currentReplayConfigHash, ...unsignedReplayConfig } = alteredReplayConfig;
+    void currentReplayConfigHash;
+    expect(canonicalLiveEvaluationManifestSha256(unsignedReplayConfig)).not.toBe(current.manifestSha256);
+
+    expect(current.availabilityTerminal).toEqual({
+      toolName: "request_available_slots",
+      toolUseBehavior: { stopAtToolNames: ["request_available_slots"] },
+      terminalAfterSafeExecutorResult: true,
+      resetConversationBeforeDeferredCommit: true,
+    });
+    const alteredAvailabilityTerminal = { ...current, availabilityTerminal: { ...current.availabilityTerminal, terminalAfterSafeExecutorResult: false as never } };
+    const { manifestSha256: currentAvailabilityTerminalHash, ...unsignedAvailabilityTerminal } = alteredAvailabilityTerminal;
+    void currentAvailabilityTerminalHash;
+    expect(canonicalLiveEvaluationManifestSha256(unsignedAvailabilityTerminal)).not.toBe(current.manifestSha256);
+
+    expect(current.availabilityProviderEnvelope).toMatchObject({
+      revision: "v36.2-current-turn-exclusive-last-attempt-exact-alongside-durable-refs",
+      strict: true,
+      preserveNormalization: "any_preserve",
+    });
+    const alteredAvailabilityEnvelope = { ...current, availabilityProviderEnvelope: { ...current.availabilityProviderEnvelope, strict: false as never } };
+    const { manifestSha256: currentEnvelopeHash, ...unsignedEnvelope } = alteredAvailabilityEnvelope;
+    void currentEnvelopeHash;
+    expect(canonicalLiveEvaluationManifestSha256(unsignedEnvelope)).not.toBe(current.manifestSha256);
+  });
+
+  it("binds the actual gateway and webhook sources into the manifest and rejects stale supplied sources", async () => {
+    const current = await buildLiveEvaluationManifest();
+    const actualGatewaySourceSha256 = createHash("sha256")
+      .update(readFileSync(resolve(process.cwd(), "src/lib/agent/gateway.ts"), "utf8"))
+      .digest("hex");
+    const actualWebhookSourceSha256 = createHash("sha256")
+      .update(readFileSync(resolve(process.cwd(), "src/lib/telegram/webhook.ts"), "utf8"))
+      .digest("hex");
+
+    expect(current.providerReplay).toMatchObject({
+      baseSystemPromptSha256: current.prompt.sha256,
+      gatewaySourcePath: "src/lib/agent/gateway.ts",
+      gatewaySourceSha256: actualGatewaySourceSha256,
+      webhookSourcePath: "src/lib/telegram/webhook.ts",
+      webhookSourceSha256: actualWebhookSourceSha256,
+    });
+
+    await expect(runLiveConversationEvaluation({ live: false }, () => new FakeAgentGateway(), current)).resolves.toMatchObject({
+      mode: "dry_run",
+      manifest: { manifestSha256: current.manifestSha256 },
+    });
+
+    await expect(validateLiveEvaluationRequest(liveRequest({
+      manifestSha256: current.manifestSha256,
+      scenarioCount: current.scenarioCount,
+      maxToolSteps: current.maxSemanticToolSteps,
+      model: current.model,
+      reasoningEffort: current.reasoningEffort,
+      maxOutputTokens: current.maxOutputTokens,
+      maxSuiteDurationMs: current.maxSuiteDurationMs,
+    }), current)).resolves.toMatchObject({ kind: "live" });
+
+    const stale = {
+      ...current,
+      providerReplay: { ...current.providerReplay, gatewaySourceSha256: "simulated-changed-gateway-source" },
+    };
+    const { manifestSha256: staleManifestHash, ...unsignedStale } = stale;
+    void staleManifestHash;
+    stale.manifestSha256 = canonicalLiveEvaluationManifestSha256(unsignedStale);
+    await expect(runLiveConversationEvaluation({ live: false }, () => new FakeAgentGateway(), stale)).rejects.toThrow("provider-replay contract is invalid or stale");
+
+    const staleWebhook = {
+      ...current,
+      providerReplay: { ...current.providerReplay, webhookSourceSha256: "simulated-changed-webhook-source" },
+    };
+    const { manifestSha256: staleWebhookManifestHash, ...unsignedStaleWebhook } = staleWebhook;
+    void staleWebhookManifestHash;
+    staleWebhook.manifestSha256 = canonicalLiveEvaluationManifestSha256(unsignedStaleWebhook);
+    await expect(runLiveConversationEvaluation({ live: false }, () => new FakeAgentGateway(), staleWebhook)).rejects.toThrow("provider-replay contract is invalid or stale");
   });
 
   it("uses a real abort signal for a customer-turn deadline instead of a race", async () => {
@@ -198,6 +353,20 @@ describe("live conversation evaluation guard", () => {
     }
   });
 
+  it("counts each Conversation create before its external call and fails closed before request 87", async () => {
+    const counter = new ConversationCreateCounter(liveEvaluationConversationCreateBudget, liveEvaluationConversationCreateBudget - 1);
+    const delegate = { createConversation: vi.fn(async () => ({ id: "conversation-1" })), runTurn: vi.fn() };
+    const bounded = new DeadlineBoundAgentGateway(delegate, {
+      suiteDeadlineAt: Date.now() + 1_000,
+      scopeDeadlineAt: Date.now() + 1_000,
+      customerTurnDeadlineMs: 500,
+    }, Date.now, counter);
+    await bounded.createConversation("lead-1");
+    expect(counter.snapshot()).toEqual({ started: liveEvaluationConversationCreateBudget, limit: liveEvaluationConversationCreateBudget, remaining: 0 });
+    await expect(bounded.createConversation("lead-2")).rejects.toMatchObject({ code: "conversation_create_budget_exceeded_before_request_87" });
+    expect(delegate.createConversation).toHaveBeenCalledOnce();
+  });
+
   it("keeps a completed checkpoint and writes terminal incomplete when request 221 is refused in the evaluator", async () => {
     const path = defaultLiveEvaluationReportPath(new Date("2026-08-24T10:00:00.221Z"));
     let turns = 0;
@@ -247,7 +416,7 @@ describe("live conversation evaluation guard", () => {
     const { writeLiveEvaluationReport } = await import("../support/live-conversation-evaluation");
     await writeLiveEvaluationReport(smokePath, smoke);
     const accepted = await loadAcceptedSmokeCheckpoint(smokePath, currentManifest);
-    expect(accepted).toMatchObject({ manifestSha256: currentManifest.manifestSha256, providerResponsesStarted: 5 });
+    expect(accepted).toMatchObject({ manifestSha256: currentManifest.manifestSha256, providerResponsesStarted: 5, conversationCreatesStarted: 5 });
 
     const factory = vi.fn((input) => {
       input.responseRequestCounter.beforeResponseRequest();
@@ -256,7 +425,7 @@ describe("live conversation evaluation guard", () => {
     await expect(runLiveConversationEvaluation(liveRequest({ phase: "remaining", reportPath: remainingPath, acceptedSmokeReportPath: smokePath }), factory, currentManifest)).rejects.toThrow("stopped before completion");
     expect(factory).toHaveBeenCalledOnce();
     const remaining = JSON.parse(await readFile(remainingPath, "utf8")) as LiveEvaluationReport;
-    expect(remaining).toMatchObject({ phase: "remaining", providerResponses: { started: 6, remaining: liveEvaluationProviderResponseBudget - 6 }, acceptedSmoke: { reportPath: smokePath, providerResponsesStarted: 5 } });
+    expect(remaining).toMatchObject({ phase: "remaining", providerResponses: { started: 6, remaining: liveEvaluationProviderResponseBudget - 6 }, conversationCreates: { started: 5, remaining: liveEvaluationConversationCreateBudget - 5 }, acceptedSmoke: { reportPath: smokePath, providerResponsesStarted: 5, conversationCreatesStarted: 5 } });
     const original = JSON.parse(await readFile(smokePath, "utf8")) as LiveEvaluationReport;
     expect(original.state).toBe("smoke_complete_pending_acceptance");
     await unlink(smokePath); await unlink(remainingPath);
@@ -289,7 +458,7 @@ describe("live conversation evaluation guard", () => {
     await expect(loadAcceptedSmokeCheckpoint(path, currentManifest)).rejects.toThrow("manifest/config does not exactly match");
 
     const incoherentBudget = validSmokeReport(currentManifest);
-    incoherentBudget.providerResponses = { started: 6, limit: liveEvaluationProviderResponseBudget, remaining: liveEvaluationProviderResponseBudget - 6 };
+    incoherentBudget.providerResponses = { started: 4, limit: liveEvaluationProviderResponseBudget, remaining: liveEvaluationProviderResponseBudget - 4 };
     await writeLiveEvaluationReport(path, incoherentBudget);
     await expect(loadAcceptedSmokeCheckpoint(path, currentManifest)).rejects.toThrow("Responses budget evidence");
 
@@ -325,12 +494,29 @@ describe("live conversation evaluation guard", () => {
     await unlink(path);
   });
 
+  it("accepts a bounded two-response usage gap without fabricating usage and preserves the supplied report", async () => {
+    const path = isolatedReportPath();
+    const currentManifest = manifest();
+    const smoke = validSmokeReport(currentManifest);
+    smoke.providerResponses = { started: smoke.usage.completed.requests + 2, limit: liveEvaluationProviderResponseBudget, remaining: liveEvaluationProviderResponseBudget - smoke.usage.completed.requests - 2 };
+    await (await import("../support/live-conversation-evaluation")).writeLiveEvaluationReport(path, smoke);
+    const before = await readFile(path, "utf8");
+    await expect(loadAcceptedSmokeCheckpoint(path, currentManifest)).resolves.toMatchObject({ providerResponsesStarted: smoke.providerResponses.started, usage: smoke.usage.completed });
+    expect(await readFile(path, "utf8")).toBe(before);
+
+    const invalidGap = structuredClone(smoke);
+    invalidGap.providerResponses = { started: invalidGap.usage.completed.requests + liveEvaluationMaxResponsesPerCustomerMessage, limit: liveEvaluationProviderResponseBudget, remaining: liveEvaluationProviderResponseBudget - invalidGap.usage.completed.requests - liveEvaluationMaxResponsesPerCustomerMessage };
+    await (await import("../support/live-conversation-evaluation")).writeLiveEvaluationReport(path, invalidGap);
+    await expect(loadAcceptedSmokeCheckpoint(path, currentManifest)).rejects.toThrow("Responses budget evidence");
+    await unlink(path);
+  });
+
   it("rejects English S3 confirmation, forbidden S2 date-only tools, repeated S4 follow-up, and stale S5 date evidence", async () => {
     const currentManifest = manifest();
     const { writeLiveEvaluationReport } = await import("../support/live-conversation-evaluation");
     const cases: Array<[string, (report: LiveEvaluationReport) => void]> = [
       ["english-s3", (report) => { report.scenarios[2]!.transcript[7]!.visibleText = "Your booking is confirmed."; }],
-      ["s2-date-only-availability", (report) => { report.scenarios[1]!.observed.messageEvidence![4]!.semanticTools = ["request_available_slots"]; }],
+      ["s2-date-only-availability", (report) => { report.scenarios[1]!.observed.messageEvidence![4]!.semanticTools = ["update_client_data"]; }],
       ["s2-date-only-quote", (report) => { report.scenarios[1]!.observed.messageEvidence![4]!.semanticTools = ["calculate_quote"]; }],
       ["s2-date-only-handoff", (report) => { report.scenarios[1]!.observed.messageEvidence![4]!.semanticTools = ["mark_human_needed"]; }],
       ["s2-date-only-booking", (report) => { report.scenarios[1]!.observed.messageEvidence![4]!.calendarCreates = 1; }],
@@ -354,14 +540,14 @@ describe("live conversation evaluation guard", () => {
     const report: LiveEvaluationReport = {
       ...validSmokeReport(currentManifest), state: "running", scenarios: [],
       summary: { processed: 0, customerMessagesProcessed: 0, failed: 0, repliesSafe: 0, quotes: 0, humanNeeded: 0, fakeCalendarCreates: 0 },
-      providerResponses: { started: 0, limit: liveEvaluationProviderResponseBudget, remaining: liveEvaluationProviderResponseBudget },
+      providerResponses: { started: 0, limit: liveEvaluationProviderResponseBudget, remaining: liveEvaluationProviderResponseBudget }, conversationCreates: { started: 0, limit: liveEvaluationConversationCreateBudget, remaining: liveEvaluationConversationCreateBudget },
       usage: { status: "unavailable", completed: { requests: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedInputTokens: 0 }, reason: "no_completed_provider_runs" },
     };
     const fixture = liveConversationScenarios[0]!;
     await expect(persistCustomerMessageCheckpoint({
       report, scenario: fixture,
       artifact: { scenarioId: fixture.id, transcript: [{ customer: fixture.customerMessages[0]!, transportText: "I can help.", visibleText: "I can help.", trustedTransport: true }], turns: [], lead: { status: "qualified", clientData: {}, hasQuote: false, quoteState: "none", humanNeeded: false }, calendarCreates: 0, slotOffer: false, slotOfferCount: 0, messageEvidence: [] },
-      customerTurnDurationsMs: [10], providerResponses: report.providerResponses, reportPath: path,
+      customerTurnDurationsMs: [10], providerResponses: report.providerResponses, conversationCreates: report.conversationCreates, reportPath: path,
       suiteDeadlineAt: 0, scopeDeadlineAt: Date.now() + 1_000,
     })).rejects.toMatchObject({ code: "live_suite_deadline_exceeded" });
     const saved = JSON.parse(await readFile(path, "utf8")) as LiveEvaluationReport;
@@ -371,10 +557,10 @@ describe("live conversation evaluation guard", () => {
 
   it("stops the evaluator as incomplete when a recorded output-token cap is reached", async () => {
     const path = defaultLiveEvaluationReportPath(new Date("2026-08-24T10:00:05.500Z"));
-    const report: LiveEvaluationReport = { ...validSmokeReport(manifest()), state: "running", scenarios: [], summary: { processed: 0, customerMessagesProcessed: 0, failed: 0, repliesSafe: 0, quotes: 0, humanNeeded: 0, fakeCalendarCreates: 0 }, providerResponses: { started: 1, limit: liveEvaluationProviderResponseBudget, remaining: liveEvaluationProviderResponseBudget - 1 }, usage: { status: "available", completed: { requests: 1, inputTokens: 1, outputTokens: 20_001, totalTokens: 20_002, cachedInputTokens: 0 } } };
+    const report: LiveEvaluationReport = { ...validSmokeReport(manifest()), state: "running", scenarios: [], summary: { processed: 0, customerMessagesProcessed: 0, failed: 0, repliesSafe: 0, quotes: 0, humanNeeded: 0, fakeCalendarCreates: 0 }, providerResponses: { started: 1, limit: liveEvaluationProviderResponseBudget, remaining: liveEvaluationProviderResponseBudget - 1 }, conversationCreates: { started: 0, limit: liveEvaluationConversationCreateBudget, remaining: liveEvaluationConversationCreateBudget }, usage: { status: "available", completed: { requests: 1, inputTokens: 1, outputTokens: 20_001, totalTokens: 20_002, cachedInputTokens: 0 } } };
     const fixture = liveConversationScenarios[0]!;
     const artifact = { scenarioId: fixture.id, transcript: [{ customer: fixture.customerMessages[0]!, transportText: "I can help.", visibleText: "I can help.", trustedTransport: true }], turns: [{ knownClientData: {}, pricingRulesVersion: 1, allowedTools: [], semanticTools: [], usage: { requests: 1, inputTokens: 1, outputTokens: 20_001, totalTokens: 20_002, cachedInputTokens: 0 } }], lead: { status: "qualified", clientData: {}, hasQuote: false, quoteState: "none" as const, humanNeeded: false }, calendarCreates: 0, slotOffer: false, slotOfferCount: 0, messageEvidence: [] };
-    await expect(persistCustomerMessageCheckpoint({ report, scenario: fixture, artifact, customerTurnDurationsMs: [10], providerResponses: report.providerResponses, reportPath: path, suiteDeadlineAt: Date.now() + 1_000, scopeDeadlineAt: Date.now() + 1_000 })).rejects.toBeInstanceOf(EvaluationResourceLimitExceededError);
+    await expect(persistCustomerMessageCheckpoint({ report, scenario: fixture, artifact, customerTurnDurationsMs: [10], providerResponses: report.providerResponses, conversationCreates: report.conversationCreates, reportPath: path, suiteDeadlineAt: Date.now() + 1_000, scopeDeadlineAt: Date.now() + 1_000 })).rejects.toBeInstanceOf(EvaluationResourceLimitExceededError);
     await unlink(path);
   });
 
@@ -439,6 +625,49 @@ describe("live conversation evaluation guard", () => {
     const result = toScenarioResult(scenario, artifact);
     expect(result.observed.technicalFailures).toEqual([expect.objectContaining({ code: "agent_provider_timeout", usageUnreconciled: true })]);
     expect(JSON.stringify(result)).not.toContain("provider body");
+  });
+
+  it("does not invent an unreconciled provider reason when a thrown technical turn published complete usage", async () => {
+    let turns = 0;
+    const agent: AgentGateway = {
+      async createConversation() { return { id: `published-${turns}` }; },
+      async runTurn() {
+        if (turns++ === 0) throw new AgentTurnTechnicalError("agent_scheduling_decision_missing", {
+          requests: 2, inputTokens: 10, outputTokens: 2, totalTokens: 12, cachedInputTokens: 8,
+        });
+        return { reply: "What size is the place?", toolResults: [], steps: 0 };
+      },
+    };
+    const scenario: LiveConversationScenario = {
+      id: "published-technical-usage", customerMessages: ["Need cleaning", "It is a flat.", "About 50 m2."], agentTurnLimit: 3,
+      expected: { hasQuote: false, humanNeeded: false, fakeCalendarCreates: 0, slotOffer: false },
+    };
+    const artifact = await runConversationScenario({ id: scenario.id, customerMessages: [...scenario.customerMessages], agentTurnLimit: 3, expected: {} }, { agent });
+    const technicalTurn = artifact.turns.find((turn) => turn.technicalFailureCode === "agent_scheduling_decision_missing");
+    expect(technicalTurn).toMatchObject({ usage: { requests: 2, totalTokens: 12 } });
+    expect(technicalTurn?.usageUnreconciledReason).toBeUndefined();
+    expect(toScenarioResult(scenario, { ...artifact, turns: [technicalTurn!] }).observed).toMatchObject({
+      technicalFailures: [{ code: "agent_scheduling_decision_missing", usageUnreconciled: false }],
+      usage: { status: "available", completed: { requests: 2, inputTokens: 10, outputTokens: 2, totalTokens: 12, cachedInputTokens: 8 } },
+    });
+  });
+
+  it("does not advance a live-style fixture after an unreplayed double provider failure", async () => {
+    let calls = 0;
+    const agent: AgentGateway = {
+      async createConversation() { return { id: "double-provider-failure" }; },
+      async runTurn() {
+        calls += 1;
+        throw new AgentTurnTechnicalError("agent_provider_timeout", undefined, "primary_replay_leg_usage_unreconciled");
+      },
+    };
+    const scenario: LiveConversationScenario = {
+      id: "double-provider-failure-stop", customerMessages: ["Need cleaning", "It is a flat.", "About 50 m2."], agentTurnLimit: 3,
+      expected: { hasQuote: false, humanNeeded: false, fakeCalendarCreates: 0, slotOffer: false },
+    };
+    await expect(runConversationScenario({ id: scenario.id, customerMessages: [...scenario.customerMessages], agentTurnLimit: 3, expected: {} }, { agent, stopAfterTechnicalTurn: true }))
+      .rejects.toThrow("provider_replay_double_failure_message_not_replayed");
+    expect(calls).toBe(1);
   });
 
   it("captures a recovered create-time timeout with its safe operation, code and elapsed evidence end to end", async () => {
@@ -522,12 +751,128 @@ describe("live conversation evaluation guard", () => {
     ]));
   });
 
+  it("accepts only the explicitly bounded generic/date-only scheduling-action variants", () => {
+    const preserve = { kind: "availability" as const, dateReference: "current_preferred_date" as const, timePreference: "any" as const, timePreferenceMode: "preserve" as const, relation: "fresh" as const };
+    const explicit = { ...preserve, timePreferenceMode: "explicit" as const };
+    const scenario: LiveConversationScenario = {
+      id: "bounded-scheduling-actions", customerMessages: ["Show available times.", "Thank you.", "Okay."], agentTurnLimit: 3,
+      expected: { hasQuote: true, humanNeeded: false, fakeCalendarCreates: 0, slotOffer: true },
+      checkpointExpectations: [{
+        preferredTimeWindowAbsent: true,
+        semanticToolsOneOf: [["request_available_slots"], ["update_client_data", "request_available_slots"]],
+        schedulingActionsOneOf: [[preserve], [explicit]],
+      }],
+    };
+    const artifact = (semanticTools: AgentTurn["toolResults"][number]["name"][], schedulingActions: SchedulingSemanticAction[]): SanitizedConversationArtifact => ({
+      scenarioId: scenario.id,
+      transcript: scenario.customerMessages.map((customer) => ({ customer, transportText: "I can help.", visibleText: "I can help.", trustedTransport: true })),
+      turns: [],
+      lead: { status: "qualified", clientData: {}, hasQuote: true, quoteState: "active", humanNeeded: false },
+      calendarCreates: 0, slotOffer: true, slotOfferCount: 1,
+      messageEvidence: scenario.customerMessages.map((customer, index) => ({
+        provenance: "post_customer_message_checkpoint", customerMessageNumber: index + 1, customer,
+        semanticTools: index === 0 ? semanticTools : [],
+        ...(index === 0 ? { schedulingActions } : {}),
+        quoteState: "active", humanNeeded: false, calendarCreates: 0, slotOfferCount: 1,
+      })),
+    });
+
+    expect(toScenarioResult(scenario, artifact(["request_available_slots"], [preserve])).state).toBe("passed");
+    expect(toScenarioResult(scenario, artifact(["update_client_data", "request_available_slots"], [explicit])).state).toBe("passed");
+    const wrongAction = { ...explicit, timePreference: "midday" as const };
+    expect(toScenarioResult(scenario, artifact(["request_available_slots"], [wrongAction])).failures).toEqual(expect.arrayContaining([
+      "unexpected_checkpoint_evidence:checkpoint_1:schedulingActionsOneOf",
+    ]));
+  });
+
+  it("keeps the v36.3 correction and fully-booked alternatives finite", () => {
+    const correction = liveConversationScenarios.find((scenario) => scenario.id === "en-explore-correction-no-booking")!;
+    expect(correction.checkpointExpectations?.[5]).toMatchObject({
+      semanticToolsOneOf: [
+        ["update_client_data", "calculate_quote"],
+        ["update_client_data", "calculate_quote", "record_scheduling_decision"],
+      ],
+      schedulingActionsOneOf: [[], [{ kind: "no_calendar", reason: "question_not_about_scheduling" }]],
+    });
+
+    const fullyBooked = liveConversationScenarios.find((scenario) => scenario.id === "calendar-fully-booked")!;
+    const checkpoint = fullyBooked.checkpointExpectations?.[2];
+    expect(checkpoint).toBeDefined();
+    if (!checkpoint) throw new Error("calendar-fully-booked checkpoint 3 is required");
+    const exactPreserve: SchedulingSemanticAction[] = [{
+      kind: "availability", dateReference: "exact_date", timePreference: "any", timePreferenceMode: "preserve", relation: "fresh", existingOfferDisposition: "none",
+    }];
+    const exactExplicit: SchedulingSemanticAction[] = [{
+      kind: "availability", dateReference: "exact_date", timePreference: "any", timePreferenceMode: "explicit", relation: "fresh", existingOfferDisposition: "none",
+    }];
+    expect(checkpoint.schedulingActionsOneOf).toEqual(expect.arrayContaining([exactPreserve, exactExplicit]));
+    expect(checkpoint.lastAvailabilityAttemptOneOf).toEqual([
+      { result: "no_slots", candidateDate: "2026-08-26", timePreference: "any", timePreferenceMode: "preserve", relation: "fresh" },
+      { result: "no_slots", candidateDate: "2026-08-26", timePreference: "any", timePreferenceMode: "explicit", relation: "fresh" },
+    ]);
+    expect(checkpoint.preferredDate).toBe("2026-08-26");
+  });
+
+  it("accepts only exact structural last-availability-attempt variants", () => {
+    const preserve = { result: "no_slots" as const, candidateDate: "2026-08-26", timePreference: "any" as const, timePreferenceMode: "preserve" as const, relation: "fresh" as const };
+    const explicit = { ...preserve, timePreferenceMode: "explicit" as const };
+    const scenario: LiveConversationScenario = {
+      id: "bounded-last-availability-attempt", customerMessages: ["Show available times.", "Thank you.", "Okay."], agentTurnLimit: 3,
+      expected: { hasQuote: true, humanNeeded: false, fakeCalendarCreates: 0, slotOffer: false },
+      checkpointExpectations: [{ lastAvailabilityAttemptOneOf: [preserve, explicit] }],
+    };
+    const artifact = (lastAvailabilityAttempt: {
+      result: "no_slots"; candidateDate: string; timePreference: "any" | "after";
+      timePreferenceMode: "preserve" | "explicit"; relation: "fresh" | "later_than_last_offer"; afterLocalTime?: string;
+    }): SanitizedConversationArtifact => ({
+      scenarioId: scenario.id,
+      transcript: scenario.customerMessages.map((customer) => ({ customer, transportText: "I can help.", visibleText: "I can help.", trustedTransport: true })),
+      turns: [], lead: { status: "qualified", clientData: {}, hasQuote: true, quoteState: "active", humanNeeded: false },
+      calendarCreates: 0, slotOffer: false, slotOfferCount: 0,
+      messageEvidence: scenario.customerMessages.map((customer, index) => ({
+        provenance: "post_customer_message_checkpoint", customerMessageNumber: index + 1, customer,
+        semanticTools: [], quoteState: "active", humanNeeded: false, calendarCreates: 0, slotOfferCount: 0,
+        ...(index === 0 ? { lastAvailabilityAttempt } : {}),
+      })),
+    });
+
+    expect(toScenarioResult(scenario, artifact(preserve)).state).toBe("passed");
+    expect(toScenarioResult(scenario, artifact(explicit)).state).toBe("passed");
+    for (const wrong of [
+      { ...explicit, result: "exact_offer" as const },
+      { ...explicit, candidateDate: "2026-08-27" },
+      { ...explicit, relation: "later_than_last_offer" as const },
+      { ...explicit, timePreferenceMode: "invalid_mode" as never },
+      { ...explicit, afterLocalTime: "08:30" },
+    ]) {
+      expect(toScenarioResult(scenario, artifact(wrong as unknown as Parameters<typeof artifact>[0])).failures).toEqual(expect.arrayContaining([
+        "unexpected_checkpoint_evidence:checkpoint_1:lastAvailabilityAttemptOneOf",
+      ]));
+    }
+  });
+
+  it("rejects a fixture checkpoint that mixes exact and one-of scheduling actions", () => {
+    const invalid = structuredClone(liveConversationScenarios) as LiveConversationScenario[];
+    const checkpoint = invalid.find((scenario) => scenario.id === "ru-correction-date-booking")?.checkpointExpectations?.[4];
+    expect(checkpoint).toBeDefined();
+    checkpoint!.schedulingActions = [];
+    expect(() => assertLiveConversationScenarioManifest(invalid)).toThrow("both schedulingActions and schedulingActionsOneOf");
+  });
+
+  it("rejects a fixture checkpoint that mixes exact and one-of last availability attempts", () => {
+    const invalid = structuredClone(liveConversationScenarios) as LiveConversationScenario[];
+    const checkpoint = invalid.find((scenario) => scenario.id === "calendar-fully-booked")?.checkpointExpectations?.[1];
+    expect(checkpoint).toBeDefined();
+    checkpoint!.lastAvailabilityAttempt = { result: "no_slots", candidateDate: "2026-08-26", timePreference: "any", timePreferenceMode: "preserve", relation: "fresh" };
+    expect(() => assertLiveConversationScenarioManifest(invalid)).toThrow("both lastAvailabilityAttempt and lastAvailabilityAttemptOneOf");
+  });
+
   it("re-evaluates a saved artifact read-only against the current visibleIncludes rule", () => {
     const fixture = liveConversationScenarios.find((scenario) => scenario.id === "en-commercial")!;
     const report = validSmokeReport(manifest());
     const checkpointEvidence = fixture.customerMessages.map((customer, index) => {
-      const { semanticTools, semanticToolsOneOf: _oneOf, visibleIncludes: _visible, visibleDifferentFromPrevious: _different, preferredDateAbsent: _absent, ...state } = fixture.checkpointExpectations?.[index] ?? {};
-      void _oneOf; void _visible; void _different; void _absent;
+      const { semanticTools, semanticToolsOneOf: _oneOf, schedulingActions: _actions, schedulingActionsOneOf: _actionsOneOf, lastAvailabilityAttempt: _lastAttempt, lastAvailabilityAttemptOneOf: _lastAttemptOneOf, visibleIncludes: _visible, visibleDifferentFromPrevious: _different, preferredDateAbsent: _absent, ...state } = fixture.checkpointExpectations?.[index] ?? {};
+      void _oneOf; void _actions; void _actionsOneOf; void _lastAttempt; void _lastAttemptOneOf; void _visible; void _different; void _absent;
       return { provenance: "post_customer_message_checkpoint" as const, customerMessageNumber: index + 1, customer, semanticTools: semanticTools ?? (index === 0 ? ["mark_human_needed" as const] : []), quoteState: "none" as const, humanNeeded: true, humanNeededReason: "commercial_property" as const, calendarCreates: 0, slotOfferCount: 0, ...state };
     });
     const source = {
@@ -611,7 +956,7 @@ describe("live conversation evaluation guard", () => {
     const report: LiveEvaluationReport = {
       version: 4, mode: "live", phase: "smoke", state: "running", manifest: manifest(),
       summary: { processed: 0, customerMessagesProcessed: 0, failed: 0, repliesSafe: 0, quotes: 0, humanNeeded: 0, fakeCalendarCreates: 0 },
-      scenarios: [], providerResponses: { started: 0, limit: liveEvaluationProviderResponseBudget, remaining: liveEvaluationProviderResponseBudget }, latency: { completedTurns: 0, p50Ms: null, p95Ms: null, withinTargets: null }, usage: { status: "unavailable", completed: { requests: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedInputTokens: 0 }, reason: "no_completed_provider_runs" },
+      scenarios: [], providerResponses: { started: 0, limit: liveEvaluationProviderResponseBudget, remaining: liveEvaluationProviderResponseBudget }, conversationCreates: { started: 0, limit: liveEvaluationConversationCreateBudget, remaining: liveEvaluationConversationCreateBudget }, latency: { completedTurns: 0, p50Ms: null, p95Ms: null, withinTargets: null }, usage: { status: "unavailable", completed: { requests: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedInputTokens: 0 }, reason: "no_completed_provider_runs" },
     };
     markLiveEvaluationReportFailed(report, new EvaluationDeadlineExceededError("live_suite_deadline_exceeded"));
     expect(report).toMatchObject({ state: "failed", terminalFailure: "live_suite_deadline_exceeded", summary: { failed: 1 } });
@@ -621,7 +966,7 @@ describe("live conversation evaluation guard", () => {
     const report: LiveEvaluationReport = {
       version: 4, mode: "live", phase: "smoke", state: "running", manifest: manifest(),
       summary: { processed: 5, customerMessagesProcessed: 31, failed: 1, repliesSafe: 4, quotes: 2, humanNeeded: 1, fakeCalendarCreates: 1 },
-      scenarios: [], providerResponses: { started: 31, limit: liveEvaluationProviderResponseBudget, remaining: liveEvaluationProviderResponseBudget - 31 }, latency: { completedTurns: 31, p50Ms: 10, p95Ms: 10, withinTargets: true },
+      scenarios: [], providerResponses: { started: 31, limit: liveEvaluationProviderResponseBudget, remaining: liveEvaluationProviderResponseBudget - 31 }, conversationCreates: { started: 0, limit: liveEvaluationConversationCreateBudget, remaining: liveEvaluationConversationCreateBudget }, latency: { completedTurns: 31, p50Ms: 10, p95Ms: 10, withinTargets: true },
       usage: { status: "available", completed: { requests: 31, inputTokens: 310, outputTokens: 62, totalTokens: 372, cachedInputTokens: 0 } },
     };
     markLiveEvaluationReportFailed(report, new Error("smoke_acceptance_failed"), true);

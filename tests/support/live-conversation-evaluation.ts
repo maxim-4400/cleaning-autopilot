@@ -2,25 +2,61 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
-import { AgentTurnTechnicalError, maxAgentOutputTokens, maxAgentToolSteps, OpenAiAgentsGateway, type AgentGateway, type AgentTurnTechnicalCode, type ResponseRequestCounter } from "@/lib/agent/gateway";
+import { AgentTurnTechnicalError, availabilityProviderEnvelopeConfig, availabilityTerminalToolConfig, maxAgentOutputTokens, maxAgentToolSteps, OpenAiAgentsGateway, providerReplayConfig, providerReplayInstructionRevision, providerReplayPromptContract, schedulingOmissionReplayConfig, schedulingOmissionReplayInstructionRevision, schedulingOmissionReplayPromptContract, type AgentGateway, type AgentTurnTechnicalCode, type ResponseRequestCounter } from "@/lib/agent/gateway";
 import { getDemoConsoleConfigStore } from "@/lib/runtime-config/demo-console-config";
 
 import { hasStockFillerReply, isFocusedIntakeReply, isTransportAndInternalSafeReply, runConversationScenario, type SanitizedConversationArtifact } from "./conversation-sandbox";
+import type { SchedulingSemanticAction } from "@/lib/contracts/domain";
 import { assertLiveConversationScenarioManifest, liveConversationMessageCount, liveConversationScenarioCount, liveConversationScenarios, requiredLiveConversationScenarioCount, type LiveConversationScenario } from "./conversation-live-scenarios";
 
 export const liveEvaluationConfirmation = "I_UNDERSTAND_THIS_CALLS_OPENAI";
-export const liveEvaluationProviderRequestTimeoutMs = 12_000;
+export const liveEvaluationProviderRequestTimeoutMs = providerReplayConfig.primaryMaxDurationMs;
 export const liveEvaluationCustomerTurnDeadlineMs = 20_000;
 export const liveEvaluationFocusedScenarioDeadlineMs = 45_000;
 export const liveEvaluationLongScenarioDeadlineMs = 120_000;
 export const liveEvaluationSuiteDeadlineMs = 20 * 60_000;
-/** Four semantic tools may require a fifth model response to close the turn. */
+/** Four semantic tools can require a fifth model response to close the turn. */
 export const liveEvaluationMaxResponsesPerCustomerMessage = 5;
 export const liveEvaluationProviderResponseBudget = 220;
+/** A customer message can require at most one fresh provider Conversation. */
+export const liveEvaluationConversationCreateBudget = liveConversationMessageCount;
 export const liveEvaluationSmokeScenarioCount = 5;
 export const liveEvaluationP50TargetMs = 8_000;
 export const liveEvaluationP95TargetMs = 15_000;
-export const liveEvaluationRubricRevision = "visible-text-v15/trusted-typed-telegram-html/intake-groups-handoff-visible-checkpoint-normalization-integrity";
+export const liveEvaluationRubricRevision = "visible-text-v36.3/current-turn-date-coordinate-exclusive-over-stale-durable-refs/date-scoped-negation-multiple-distinct-and-invalid-iso-require-clarification/strict-current-future-iso-coordinate/no-slots-attempt-exact-candidate-alongside-durable-refs/time-only-refinement-rechecks-attempt-coordinate-no-drift/finite-correction-record-decision-then-requote/finite-fully-booked-exact-candidate-alternative/dynamic-availability-date-schema-no-invented-coordinate/executor-coordinate-mismatch-zero-calendar-no-state-drift/finite-pre-offer-no-calendar-audit-alternative/finite-tomorrow-evening-explicit-equivalent/known-subtotal-plus-unreconciled-final-provider-leg/constraint-kind-specific-consent-after-before-range/no-hidden-numeric-bound-fallback/typed-no-slots-constraint-disposition-and-consent-paths/retain-selectable-reject-stale/refused-no-calendar-action-not-audit-evidence/candidate-commit-on-safe-availability/typed-availability-attempt-history-success-flush-after-delivery/confirmed-delivery-failure-offer-rollback/ambiguous-delivery-preserved-and-blocked/strict-attempt-grid-and-conditional-shapes/quoted-offered-attempt-read-scope/safe-last-attempt-checkpoint-evidence/last-attempt-one-of-structural-variants/offer-disposition-token-lifecycle-retain-read-failure-selectable/reject-now-stale/retained-offer-refresh-copy-no-handoff-promise/structural-checkpoint-equality/discriminated-provider-request-available-slots-envelope/state-scoped-scheduling-actions-one-of/sanitized-active-slot-starts-and-replacement-evidence/terminal-backend-rendered-availability-tool/protocol-reset-before-deferred-commit/fresh-offered-snapshot-with-active-quote/stateless-full-primary-scheduling-omission-replay/pricing-input-change-requires-quote-or-human-before-reset/published-technical-usage-not-unreconciled/pre-tool-provider-failure-replay/generic-date-only-no-prior-window-preserve-or-explicit/strict-prior-window-preserve-and-explicit-window-clear/actual-offer-quote-alignment/deferred-token-commit-compensation/calendar-read-failure-separation/trusted-typed-telegram-html/intake-groups-handoff-visible-checkpoint-normalization-integrity/conversation-create-budget-shared-smoke-remaining/gateway-and-webhook-source-binding";
+/**
+ * Binds the one-shot full-primary omission replay into the manifest. It can
+ * make up to four model responses after a zero-tool primary, exactly matching
+ * the five-response evaluator ceiling.
+ */
+export const liveEvaluationSchedulingOmissionReplay = {
+  ...schedulingOmissionReplayConfig,
+  instructionRevision: schedulingOmissionReplayInstructionRevision,
+  promptContract: schedulingOmissionReplayPromptContract,
+  /** Reuses the full primary system prompt independently bound below. */
+  baseSystemPromptBinding: "manifest.prompt.sha256",
+  resetConversationBeforeDeferredCommit: true,
+} as const;
+export const liveEvaluationProviderReplay = {
+  ...providerReplayConfig,
+  instructionRevision: providerReplayInstructionRevision,
+  promptContract: providerReplayPromptContract,
+  /** The base system prompt is independently bound in manifest.prompt. */
+  baseSystemPromptBinding: "manifest.prompt.sha256",
+  /** The production implementation that executes the replay is source-bound. */
+  gatewaySourcePath: "src/lib/agent/gateway.ts",
+  /** Webhook owns protocol reset, deferred commit and fresh Conversation creation. */
+  webhookSourcePath: "src/lib/telegram/webhook.ts",
+} as const;
+/** Strict provider wire contract before canonical scheduling validation. */
+export const liveEvaluationAvailabilityProviderEnvelope = availabilityProviderEnvelopeConfig;
+export type LiveEvaluationProviderReplay = typeof liveEvaluationProviderReplay & {
+  baseSystemPromptSha256: string;
+  gatewaySourceSha256: string;
+  webhookSourceSha256: string;
+};
+/** Binds the one tool that deliberately skips a model closure response. */
+export const liveEvaluationAvailabilityTerminal = availabilityTerminalToolConfig;
 export const liveEvaluationTokenCaps = {
   inputTokens: 500_000,
   outputTokens: 20_000,
@@ -42,6 +78,10 @@ export type LiveEvaluationManifest = {
   maxCustomerTurnDurationMs: number; focusedScenarioDeadlineMs: number; longScenarioDeadlineMs: number; maxSuiteDurationMs: number;
   prompt: { source: "baseline" | "active"; revision: string; sha256: string }; pricingRules: { version: number; sha256: string };
   evaluator: { revision: string; sha256: string };
+  schedulingOmissionReplay: typeof liveEvaluationSchedulingOmissionReplay;
+  providerReplay: LiveEvaluationProviderReplay;
+  availabilityProviderEnvelope: typeof liveEvaluationAvailabilityProviderEnvelope;
+  availabilityTerminal: typeof liveEvaluationAvailabilityTerminal;
   tokenCaps: { inputTokens: number; outputTokens: number; totalTokens: number; cachedInputTokensDetail: true };
 };
 export type CompletedUsage = { requests: number; inputTokens: number; outputTokens: number; totalTokens: number; cachedInputTokens: number };
@@ -50,7 +90,7 @@ export type UsageEvidence =
   | { status: "unreconciled"; completed: CompletedUsage; reason: string }
   | { status: "unavailable"; completed: CompletedUsage; reason: string };
 export type ScenarioObservedEvidence = {
-  pricingRulesVersions: number[]; semanticTools: string[]; slotOffer: boolean; customerTurnDurationsMs: number[]; usage: UsageEvidence;
+  pricingRulesVersions: number[]; semanticTools: string[]; schedulingActions?: SchedulingSemanticAction[]; slotOffer: boolean; customerTurnDurationsMs: number[]; usage: UsageEvidence;
   /** Safe provider/SDK failure categories from started turns; no raw errors. */
   technicalFailures?: Array<{ code: AgentTurnTechnicalCode; elapsedMs: number; usageUnreconciled: boolean }>;
   /** Ordered after-message state/tool evidence, never a final-state dedupe. */
@@ -67,8 +107,9 @@ export type LiveEvaluationScenarioResult = {
   observed: ScenarioObservedEvidence; outcome: LiveEvaluationOutcome;
 };
 export type ProviderResponseEvidence = { started: number; limit: number; remaining: number };
+export type ConversationCreateEvidence = { started: number; limit: number; remaining: number };
 export type AcceptedSmokeEvidence = {
-  reportPath: string; reportSha256: string; manifestSha256: string; providerResponsesStarted: number;
+  reportPath: string; reportSha256: string; manifestSha256: string; providerResponsesStarted: number; conversationCreatesStarted: number;
   /** The remaining phase starts from this immutable whole-suite ledger. */
   usage: CompletedUsage;
 };
@@ -82,8 +123,9 @@ export type LiveEvaluationReport = {
   acceptedSmoke?: AcceptedSmokeEvidence;
   /** Immutable earlier-phase subtotal, included in every remaining ledger. */
   priorUsage?: CompletedUsage;
-  continuation?: { state: "not_evaluated_pending_acceptance" | "capacity_available_after_acceptance"; remainingScenarioCount: number; remainingCustomerMessageCount: number; providerResponsesStarted: number; remainingProviderResponseCapacity: number };
+  continuation?: { state: "not_evaluated_pending_acceptance" | "capacity_available_after_acceptance"; remainingScenarioCount: number; remainingCustomerMessageCount: number; providerResponsesStarted: number; remainingProviderResponseCapacity: number; conversationCreatesStarted: number; remainingConversationCreateCapacity: number };
   providerResponses: ProviderResponseEvidence;
+  conversationCreates: ConversationCreateEvidence;
   latency: { completedTurns: number; p50Ms: number | null; p95Ms: number | null; withinTargets: boolean | null };
   usage: UsageEvidence; terminalFailure?: string;
 };
@@ -98,30 +140,52 @@ export async function buildLiveEvaluationManifest(): Promise<LiveEvaluationManif
   if (!model) throw new Error("OPENAI_MODEL must be non-empty for a live evaluation manifest");
   if (configuredReasoning !== "low") throw new Error("Live evaluation requires OPENAI_REASONING_EFFORT=low");
   const smoke = liveConversationScenarios.slice(0, liveEvaluationSmokeScenarioCount);
+  const baseSystemPromptSha256 = sha256(config.systemPrompt);
+  const gatewaySourceSha256 = await currentSourceSha256(liveEvaluationProviderReplay.gatewaySourcePath);
+  const webhookSourceSha256 = await currentSourceSha256(liveEvaluationProviderReplay.webhookSourcePath);
   const unsignedManifest: Omit<LiveEvaluationManifest, "manifestSha256"> = {
     fixtureSha256: sha256(liveConversationScenarios.map(({ id, customerMessages, agentTurnLimit, sandbox, expected, checkpointExpectations, requiredToolCounts }) => ({ id, customerMessages, agentTurnLimit, sandbox, expected, checkpointExpectations, requiredToolCounts }))),
     scenarioCount: liveConversationScenarioCount, customerMessageCount: liveConversationMessageCount,
     smokeScenarioCount: liveEvaluationSmokeScenarioCount, smokeCustomerMessageCount: smoke.reduce((total, scenario) => total + scenario.customerMessages.length, 0),
     model, reasoningEffort: "low", maxOutputTokens: maxAgentOutputTokens, maxSemanticToolSteps: maxAgentToolSteps,
     maxResponsesPerCustomerMessage: liveEvaluationMaxResponsesPerCustomerMessage, providerResponseBudget: liveEvaluationProviderResponseBudget,
-    maxResponseAttemptsPerModelTurn: 1, maxConversationCreateRequests: liveConversationScenarioCount,
+    maxResponseAttemptsPerModelTurn: 1, maxConversationCreateRequests: liveEvaluationConversationCreateBudget,
     maxProviderRequestDurationMs: liveEvaluationProviderRequestTimeoutMs, maxCustomerTurnDurationMs: liveEvaluationCustomerTurnDeadlineMs,
     focusedScenarioDeadlineMs: liveEvaluationFocusedScenarioDeadlineMs, longScenarioDeadlineMs: liveEvaluationLongScenarioDeadlineMs,
     maxSuiteDurationMs: liveEvaluationSuiteDeadlineMs,
-    prompt: { source: config.source, revision: config.revision ?? sha256(config.systemPrompt).slice(0, 16), sha256: sha256(config.systemPrompt) },
+    prompt: { source: config.source, revision: config.revision ?? baseSystemPromptSha256.slice(0, 16), sha256: baseSystemPromptSha256 },
     pricingRules: { version: config.pricingRules.version, sha256: sha256(config.pricingRules) },
     evaluator: { revision: liveEvaluationRubricRevision, sha256: sha256(liveEvaluationRubricRevision) },
+    schedulingOmissionReplay: liveEvaluationSchedulingOmissionReplay,
+    providerReplay: { ...liveEvaluationProviderReplay, baseSystemPromptSha256, gatewaySourceSha256, webhookSourceSha256 },
+    availabilityProviderEnvelope: liveEvaluationAvailabilityProviderEnvelope,
+    availabilityTerminal: liveEvaluationAvailabilityTerminal,
     tokenCaps: liveEvaluationTokenCaps,
   };
   return { ...unsignedManifest, manifestSha256: canonicalLiveEvaluationManifestSha256(unsignedManifest) };
 }
 
-export function validateLiveEvaluationRequest(request: LiveEvaluationRequest, manifest: LiveEvaluationManifest): { kind: "dry_run" } | LiveGate {
+async function currentSourceSha256(relativePath: string): Promise<string> {
+  return sha256(await readFile(resolve(process.cwd(), ...relativePath.split("/")), "utf8"));
+}
+
+export async function validateLiveEvaluationRequest(request: LiveEvaluationRequest, manifest: LiveEvaluationManifest): Promise<{ kind: "dry_run" } | LiveGate> {
+  const { baseSystemPromptSha256, gatewaySourceSha256, webhookSourceSha256, ...providerReplayConfig } = manifest.providerReplay;
+  if (
+    canonicalJson(providerReplayConfig) !== canonicalJson(liveEvaluationProviderReplay) ||
+    baseSystemPromptSha256 !== manifest.prompt.sha256 ||
+    gatewaySourceSha256 !== await currentSourceSha256(liveEvaluationProviderReplay.gatewaySourcePath) ||
+    webhookSourceSha256 !== await currentSourceSha256(liveEvaluationProviderReplay.webhookSourcePath)
+  ) throw new Error("Live evaluation provider-replay contract is invalid or stale; run dry mode again");
+  if (manifest.maxConversationCreateRequests !== liveEvaluationConversationCreateBudget) throw new Error(`Live evaluation requires exactly ${liveEvaluationConversationCreateBudget} Conversation-create requests`);
   if (!request.live) return { kind: "dry_run" };
   if (request.phase !== "smoke" && request.phase !== "remaining") throw new Error("Live evaluation requires --phase=smoke or --phase=remaining");
   if (manifest.scenarioCount !== requiredLiveConversationScenarioCount) throw new Error(`Live evaluation is fixed to ${requiredLiveConversationScenarioCount} scenarios`);
   if (manifest.smokeScenarioCount !== liveEvaluationSmokeScenarioCount) throw new Error("Live evaluation smoke scope is immutable");
   if (manifest.maxResponsesPerCustomerMessage !== maxAgentToolSteps + 1) throw new Error("Live evaluation requires four semantic tools plus one final closure response");
+  if (canonicalJson(manifest.schedulingOmissionReplay) !== canonicalJson(liveEvaluationSchedulingOmissionReplay)) throw new Error("Live evaluation scheduling-omission-replay contract is invalid or stale; run dry mode again");
+  if (canonicalJson(manifest.availabilityProviderEnvelope) !== canonicalJson(liveEvaluationAvailabilityProviderEnvelope)) throw new Error("Live evaluation availability-provider-envelope contract is invalid or stale; run dry mode again");
+  if (canonicalJson(manifest.availabilityTerminal) !== canonicalJson(liveEvaluationAvailabilityTerminal)) throw new Error("Live evaluation terminal-availability contract is invalid or stale; run dry mode again");
   const { manifestSha256, ...unsignedManifest } = manifest;
   if (manifestSha256 !== canonicalLiveEvaluationManifestSha256(unsignedManifest)) throw new Error("Live evaluation manifest hash is invalid or stale; run dry mode again");
   if (request.confirmation !== liveEvaluationConfirmation) throw new Error("Live evaluation requires the literal confirmation flag");
@@ -151,14 +215,29 @@ export class ProviderResponseCounter implements ResponseRequestCounter {
   snapshot(): ProviderResponseEvidence { return { started: this.startedRequests, limit: this.limit, remaining: this.limit - this.startedRequests }; }
 }
 
+/** Counts every provider Conversation creation immediately before its external call. */
+export class ConversationCreateCounter {
+  private startedRequests: number;
+  constructor(readonly limit: number, initialStarted = 0) {
+    if (!Number.isInteger(limit) || limit < 1 || !Number.isInteger(initialStarted) || initialStarted < 0 || initialStarted > limit) throw new Error("invalid_conversation_create_budget");
+    this.startedRequests = initialStarted;
+  }
+  beforeConversationCreate(): void {
+    if (this.startedRequests >= this.limit) throw new EvaluationResourceLimitExceededError("conversation_create_budget_exceeded_before_request_87");
+    this.startedRequests += 1;
+  }
+  snapshot(): ConversationCreateEvidence { return { started: this.startedRequests, limit: this.limit, remaining: this.limit - this.startedRequests }; }
+}
+
 /** Only the injected agent can be live; all operational adapters remain fake. */
 export async function runLiveConversationEvaluation(request: LiveEvaluationRequest, agentFactory: LiveAgentFactory = createLiveAgentFromEnvironment, suppliedManifest?: LiveEvaluationManifest): Promise<LiveEvaluationReport> {
   const manifest = suppliedManifest ?? await buildLiveEvaluationManifest();
-  const gate = validateLiveEvaluationRequest(request, manifest);
+  const gate = await validateLiveEvaluationRequest(request, manifest);
   if (gate.kind === "dry_run") return emptyReport("dry_run", "planned", manifest);
   const acceptedSmoke = gate.phase === "remaining" ? await loadAcceptedSmokeCheckpoint(request.acceptedSmokeReportPath!, manifest) : undefined;
   const responseCounter = new ProviderResponseCounter(manifest.providerResponseBudget, acceptedSmoke?.providerResponsesStarted ?? 0);
-  const report = emptyReport("live", "running", manifest, gate.phase, responseCounter.snapshot(), acceptedSmoke?.usage);
+  const conversationCreateCounter = new ConversationCreateCounter(manifest.maxConversationCreateRequests, acceptedSmoke?.conversationCreatesStarted ?? 0);
+  const report = emptyReport("live", "running", manifest, gate.phase, responseCounter.snapshot(), acceptedSmoke?.usage, conversationCreateCounter.snapshot());
   if (acceptedSmoke) report.acceptedSmoke = acceptedSmoke;
   await writeLiveEvaluationReport(request.reportPath!, report);
   try {
@@ -168,17 +247,18 @@ export async function runLiveConversationEvaluation(request: LiveEvaluationReque
     for (const scenario of scenarios) {
       assertDeadline(suiteDeadlineAt, "live_suite_deadline_exceeded");
       const scopeDeadlineAt = Date.now() + scenarioDeadlineMs(scenario, manifest);
-      const agent = new DeadlineBoundAgentGateway(delegate, { suiteDeadlineAt, scopeDeadlineAt, customerTurnDeadlineMs: manifest.maxCustomerTurnDurationMs });
+      const agent = new DeadlineBoundAgentGateway(delegate, { suiteDeadlineAt, scopeDeadlineAt, customerTurnDeadlineMs: manifest.maxCustomerTurnDurationMs }, Date.now, conversationCreateCounter);
       const durations: number[] = [];
       try {
-        const artifact = await runConversationScenario({ id: scenario.id, customerMessages: [...scenario.customerMessages], agentTurnLimit: scenario.agentTurnLimit, expected: { calendarFullyBooked: scenario.sandbox?.calendarFullyBooked, evening90m2Slot: scenario.sandbox?.evening90m2Slot } }, {
+        const artifact = await runConversationScenario({ id: scenario.id, customerMessages: [...scenario.customerMessages], agentTurnLimit: scenario.agentTurnLimit, expected: { calendarFullyBooked: scenario.sandbox?.calendarFullyBooked, calendarTransportFails: scenario.sandbox?.calendarTransportFails, evening90m2Slot: scenario.sandbox?.evening90m2Slot, now: scenario.sandbox?.now } }, {
           agent, agentTurnLimit: scenario.agentTurnLimit,
+          stopAfterTechnicalTurn: true,
           beforeCustomerMessage: () => { assertDeadline(suiteDeadlineAt, "live_suite_deadline_exceeded"); assertDeadline(scopeDeadlineAt, "scenario_deadline_exceeded"); },
           afterCustomerMessage: async (checkpoint) => {
             durations.push(checkpoint.customerMessageDurationMs);
             await persistCustomerMessageCheckpoint({
               report, scenario, artifact: checkpoint.artifact, customerTurnDurationsMs: durations,
-              providerResponses: responseCounter.snapshot(), reportPath: request.reportPath!, suiteDeadlineAt, scopeDeadlineAt,
+              providerResponses: responseCounter.snapshot(), conversationCreates: conversationCreateCounter.snapshot(), reportPath: request.reportPath!, suiteDeadlineAt, scopeDeadlineAt,
             });
           },
         });
@@ -193,9 +273,9 @@ export async function runLiveConversationEvaluation(request: LiveEvaluationReque
           report.scenarios.push(failedScenario(scenario, error, durations, partial));
           report.activeCheckpoint = undefined;
         }
-        report.providerResponses = responseCounter.snapshot(); refreshReport(report); await writeLiveEvaluationReport(request.reportPath!, report); throw error;
+        report.providerResponses = responseCounter.snapshot(); report.conversationCreates = conversationCreateCounter.snapshot(); refreshReport(report); await writeLiveEvaluationReport(request.reportPath!, report); throw error;
       }
-      report.providerResponses = responseCounter.snapshot(); refreshReport(report); await writeLiveEvaluationReport(request.reportPath!, report);
+      report.providerResponses = responseCounter.snapshot(); report.conversationCreates = conversationCreateCounter.snapshot(); refreshReport(report); await writeLiveEvaluationReport(request.reportPath!, report);
     }
     refreshReport(report);
     const exceededTokenCap = tokenCapFailure(report.usage, manifest.tokenCaps);
@@ -208,11 +288,12 @@ export async function runLiveConversationEvaluation(request: LiveEvaluationReque
     }
     if (gate.phase === "smoke") {
       report.state = "smoke_complete_pending_acceptance";
-      report.continuation = { state: "not_evaluated_pending_acceptance", remainingScenarioCount: manifest.scenarioCount - manifest.smokeScenarioCount, remainingCustomerMessageCount: manifest.customerMessageCount - manifest.smokeCustomerMessageCount, providerResponsesStarted: responseCounter.snapshot().started, remainingProviderResponseCapacity: responseCounter.snapshot().remaining };
+      report.continuation = { state: "not_evaluated_pending_acceptance", remainingScenarioCount: manifest.scenarioCount - manifest.smokeScenarioCount, remainingCustomerMessageCount: manifest.customerMessageCount - manifest.smokeCustomerMessageCount, providerResponsesStarted: responseCounter.snapshot().started, remainingProviderResponseCapacity: responseCounter.snapshot().remaining, conversationCreatesStarted: conversationCreateCounter.snapshot().started, remainingConversationCreateCapacity: conversationCreateCounter.snapshot().remaining };
     } else report.state = "remaining_complete_pending_acceptance";
-    report.providerResponses = responseCounter.snapshot(); await writeLiveEvaluationReport(request.reportPath!, report); return report;
+    report.providerResponses = responseCounter.snapshot(); report.conversationCreates = conversationCreateCounter.snapshot(); await writeLiveEvaluationReport(request.reportPath!, report); return report;
   } catch (error) {
     report.providerResponses = responseCounter.snapshot();
+    report.conversationCreates = conversationCreateCounter.snapshot();
     if (error instanceof EvaluationResourceLimitExceededError) markLiveEvaluationReportIncomplete(report, error);
     else if (report.state !== "failed") markLiveEvaluationReportFailed(report, error);
     await writeLiveEvaluationReport(request.reportPath!, report);
@@ -233,6 +314,7 @@ export async function loadAcceptedSmokeCheckpoint(path: string, manifest: LiveEv
     reportSha256: sha256(raw),
     manifestSha256: report.manifest.manifestSha256,
     providerResponsesStarted: report.providerResponses.started,
+    conversationCreatesStarted: report.conversationCreates.started,
     usage: report.usage.completed,
   };
 }
@@ -280,8 +362,14 @@ function assertAcceptedSmokeEvidence(report: LiveEvaluationReport, manifest: Liv
   const usage = aggregateUsage(report.scenarios.map((scenario) => scenario.observed.usage));
   if (usage.status !== "available" || report.usage.status !== "available" || canonicalJson(report.usage) !== canonicalJson(usage)) throw new Error("Accepted smoke checkpoint usage is unreconciled or inconsistent");
   if (tokenCapFailure(report.usage, manifest.tokenCaps)) throw new Error("Accepted smoke checkpoint already exceeds a whole-suite token cap");
-  if (!Number.isInteger(report.providerResponses.started) || report.providerResponses.started < 0 || report.providerResponses.limit !== manifest.providerResponseBudget || report.providerResponses.remaining !== report.providerResponses.limit - report.providerResponses.started || report.providerResponses.started !== usage.completed.requests || report.providerResponses.started >= manifest.providerResponseBudget) {
+  const startedResponses = report.providerResponses.started;
+  const publishedUsageRequests = usage.completed.requests;
+  const unpublishedResponseGap = startedResponses - publishedUsageRequests;
+  if (!Number.isInteger(startedResponses) || startedResponses < 0 || report.providerResponses.limit !== manifest.providerResponseBudget || report.providerResponses.remaining !== report.providerResponses.limit - startedResponses || startedResponses >= manifest.providerResponseBudget || !Number.isInteger(publishedUsageRequests) || publishedUsageRequests < 0 || unpublishedResponseGap < 0 || unpublishedResponseGap >= liveEvaluationMaxResponsesPerCustomerMessage) {
     throw new Error("Accepted smoke checkpoint Responses budget evidence is inconsistent or exhausted");
+  }
+  if (!Number.isInteger(report.conversationCreates.started) || report.conversationCreates.started < 0 || report.conversationCreates.limit !== manifest.maxConversationCreateRequests || report.conversationCreates.remaining !== report.conversationCreates.limit - report.conversationCreates.started || report.conversationCreates.started > expectedMessageCount || report.conversationCreates.started >= manifest.maxConversationCreateRequests) {
+    throw new Error("Accepted smoke checkpoint Conversation-create budget evidence is inconsistent or exhausted");
   }
 }
 
@@ -302,12 +390,14 @@ export async function persistCustomerMessageCheckpoint(input: {
   artifact: SanitizedConversationArtifact;
   customerTurnDurationsMs: number[];
   providerResponses: ProviderResponseEvidence;
+  conversationCreates: ConversationCreateEvidence;
   reportPath: string;
   suiteDeadlineAt: number;
   scopeDeadlineAt: number;
 }): Promise<void> {
   input.report.activeCheckpoint = checkpointResult(input.scenario, input.artifact, input.customerTurnDurationsMs);
   input.report.providerResponses = input.providerResponses;
+  input.report.conversationCreates = input.conversationCreates;
   refreshReport(input.report);
   await writeLiveEvaluationReport(input.reportPath, input.report);
   const exceededTokenCap = tokenCapFailure(input.report.usage, input.report.manifest.tokenCaps);
@@ -381,15 +471,32 @@ function checkpointMatchesExpectation(actual: SanitizedConversationArtifact["mes
 }
 function checkpointMismatch(actual: SanitizedConversationArtifact["messageEvidence"][number] | undefined, visibleText: string | undefined, previousVisibleText: string | undefined, expected: CheckpointExpectation): Omit<CheckpointMismatch, "index"> | undefined {
   if (!actual) return { field: "evidence" };
-  const { semanticTools, semanticToolsOneOf, visibleIncludes, visibleDifferentFromPrevious, preferredDateAbsent, ...state } = expected;
-  const stateMismatch = Object.entries(state).find(([key, value]) => actual[key as keyof typeof actual] !== value);
+  const { semanticTools, semanticToolsOneOf, schedulingActions, schedulingActionsOneOf, lastAvailabilityAttempt, lastAvailabilityAttemptOneOf, activeSlotStarts, visibleIncludes, visibleDifferentFromPrevious, preferredDateAbsent, preferredTimeWindowAbsent, ...state } = expected;
+  const stateMismatch = Object.entries(state).find(([key, value]) => !structurallyEqual(actual[key as keyof typeof actual], value));
   if (stateMismatch) return { field: `state.${stateMismatch[0]}` };
   if (preferredDateAbsent && actual.preferredDate !== undefined) return { field: "preferredDateAbsent" };
-  if (semanticTools !== undefined && JSON.stringify(actual.semanticTools) !== JSON.stringify(semanticTools)) return { field: "semanticTools" };
-  if (semanticToolsOneOf !== undefined && !semanticToolsOneOf.some((allowed) => JSON.stringify(actual.semanticTools) === JSON.stringify(allowed))) return { field: "semanticToolsOneOf" };
+  if (preferredTimeWindowAbsent && actual.preferredTimeWindow !== undefined) return { field: "preferredTimeWindowAbsent" };
+  if (semanticTools !== undefined && !structurallyEqual(actual.semanticTools, semanticTools)) return { field: "semanticTools" };
+  if (semanticToolsOneOf !== undefined && !semanticToolsOneOf.some((allowed) => structurallyEqual(actual.semanticTools, allowed))) return { field: "semanticToolsOneOf" };
+  if (schedulingActions !== undefined && !schedulingActionsEqual(actual.schedulingActions ?? [], schedulingActions)) return { field: "schedulingActions" };
+  if (schedulingActionsOneOf !== undefined && !schedulingActionsOneOf.some((allowed) => schedulingActionsEqual(actual.schedulingActions ?? [], allowed))) return { field: "schedulingActionsOneOf" };
+  if (lastAvailabilityAttempt !== undefined && !structurallyEqual(actual.lastAvailabilityAttempt, lastAvailabilityAttempt)) return { field: "lastAvailabilityAttempt" };
+  if (lastAvailabilityAttemptOneOf !== undefined && !lastAvailabilityAttemptOneOf.some((allowed) => structurallyEqual(actual.lastAvailabilityAttempt, allowed))) return { field: "lastAvailabilityAttemptOneOf" };
+  if (activeSlotStarts !== undefined && !structurallyEqual(actual.activeSlotStarts ?? [], activeSlotStarts)) return { field: "activeSlotStarts" };
   if (visibleIncludes !== undefined && !visibleIncludes.every((text) => normalizedVisibleText(visibleText).includes(normalizedVisibleText(text)))) return { field: "visibleIncludes" };
   if (visibleDifferentFromPrevious && !(Boolean(previousVisibleText) && visibleText !== previousVisibleText)) return { field: "visibleDifferentFromPrevious" };
   return undefined;
+}
+/** Exact structural equality for evaluator evidence; object-key insertion order
+ * is transport noise, while array order remains semantically meaningful. */
+function structurallyEqual(left: unknown, right: unknown): boolean {
+  return canonicalJson(left) === canonicalJson(right);
+}
+
+/** V34 evaluator fixtures bind the full provider-owned offer disposition.
+ * Immutable pre-v34 reports are not reinterpreted by this evaluator. */
+function schedulingActionsEqual(actual: SchedulingSemanticAction[], expected: SchedulingSemanticAction[]): boolean {
+  return structurallyEqual(actual, expected);
 }
 /** Only checkpoint substring comparison is normalized; transport/safety keeps raw text. */
 function normalizedVisibleText(value: string | undefined): string {
@@ -401,10 +508,10 @@ function failedScenario(scenario: LiveConversationScenario, error: unknown, cust
 function sanitizedEvaluationFailureCode(error: unknown): string {
   if (error instanceof AgentTurnTechnicalError) return error.code;
   if (error instanceof EvaluationResourceLimitExceededError || error instanceof EvaluationDeadlineExceededError) return error.code;
-  if (error instanceof Error && /^(?:smoke|remaining)_acceptance_failed$|^(?:smoke|remaining)_latency_threshold_failed$/u.test(error.message)) return error.message;
+  if (error instanceof Error && /^(?:smoke|remaining)_(?:acceptance_failed|latency_threshold_failed|usage_unreconciled)$/u.test(error.message)) return error.message;
   return "evaluation_processing_failed";
 }
-function emptyReport(mode: "dry_run" | "live", state: LiveEvaluationReport["state"], manifest: LiveEvaluationManifest, phase?: LiveEvaluationPhase, providerResponses: ProviderResponseEvidence = { started: 0, limit: manifest.providerResponseBudget, remaining: manifest.providerResponseBudget }, initialUsage: CompletedUsage = emptyUsage()): LiveEvaluationReport { return { version: 4, mode, ...(phase ? { phase } : {}), state, manifest, summary: { processed: 0, customerMessagesProcessed: 0, failed: 0, repliesSafe: 0, quotes: 0, humanNeeded: 0, fakeCalendarCreates: 0 }, scenarios: [], providerResponses, latency: { completedTurns: 0, p50Ms: null, p95Ms: null, withinTargets: null }, ...(initialUsage.requests > 0 ? { priorUsage: initialUsage } : {}), usage: initialUsage.requests > 0 ? { status: "available", completed: initialUsage } : { status: "unavailable", completed: initialUsage, reason: "no_completed_provider_runs" } }; }
+function emptyReport(mode: "dry_run" | "live", state: LiveEvaluationReport["state"], manifest: LiveEvaluationManifest, phase?: LiveEvaluationPhase, providerResponses: ProviderResponseEvidence = { started: 0, limit: manifest.providerResponseBudget, remaining: manifest.providerResponseBudget }, initialUsage: CompletedUsage = emptyUsage(), conversationCreates: ConversationCreateEvidence = { started: 0, limit: manifest.maxConversationCreateRequests, remaining: manifest.maxConversationCreateRequests }): LiveEvaluationReport { return { version: 4, mode, ...(phase ? { phase } : {}), state, manifest, summary: { processed: 0, customerMessagesProcessed: 0, failed: 0, repliesSafe: 0, quotes: 0, humanNeeded: 0, fakeCalendarCreates: 0 }, scenarios: [], providerResponses, conversationCreates, latency: { completedTurns: 0, p50Ms: null, p95Ms: null, withinTargets: null }, ...(initialUsage.requests > 0 ? { priorUsage: initialUsage } : {}), usage: initialUsage.requests > 0 ? { status: "available", completed: initialUsage } : { status: "unavailable", completed: initialUsage, reason: "no_completed_provider_runs" } }; }
 /** Preserve reconciled usage for a fully completed acceptance failure. Actual interruptions remain unreconciled. */
 export function markLiveEvaluationReportFailed(report: LiveEvaluationReport, error: unknown, preserveReconciledUsage = false): void { report.terminalFailure = sanitizedEvaluationFailureCode(error); report.state = "failed"; report.summary = { ...report.summary, failed: Math.max(report.summary.failed, 1) }; if (!preserveReconciledUsage && report.usage.status !== "unreconciled") report.usage = { status: "unreconciled", completed: report.usage.completed, reason: "evaluation_terminated_before_reconciliation" }; }
 export function markLiveEvaluationReportIncomplete(report: LiveEvaluationReport, error: EvaluationResourceLimitExceededError): void { report.terminalFailure = error.code; report.state = "incomplete"; }
@@ -422,7 +529,7 @@ function summarizeScenarios(scenarios: LiveEvaluationScenarioResult[], active?: 
     fakeCalendarCreates: scenarios.reduce((total, scenario) => total + scenario.outcome.fakeCalendarCreates, 0) + (activeOutcome?.fakeCalendarCreates ?? 0),
   };
 }
-function observedFromArtifact(artifact: SanitizedConversationArtifact, customerTurnDurationsMs: number[]): ScenarioObservedEvidence { const technicalFailures = artifact.turns.flatMap((turn) => turn.technicalFailureCode ? [{ code: turn.technicalFailureCode, elapsedMs: Math.max(0, Math.round(turn.elapsedMs ?? 0)), usageUnreconciled: Boolean(turn.usageUnreconciledReason) }] : []); return { pricingRulesVersions: [...new Set(artifact.turns.map((turn) => turn.pricingRulesVersion))], semanticTools: [...new Set(artifact.turns.flatMap((turn) => turn.semanticTools))], slotOffer: artifact.slotOffer, customerTurnDurationsMs: [...customerTurnDurationsMs], messageEvidence: structuredClone(artifact.messageEvidence), ...(technicalFailures.length > 0 ? { technicalFailures } : {}), usage: usageFromArtifact(artifact) }; }
+function observedFromArtifact(artifact: SanitizedConversationArtifact, customerTurnDurationsMs: number[]): ScenarioObservedEvidence { const technicalFailures = artifact.turns.flatMap((turn) => turn.technicalFailureCode ? [{ code: turn.technicalFailureCode, elapsedMs: Math.max(0, Math.round(turn.elapsedMs ?? 0)), usageUnreconciled: Boolean(turn.usageUnreconciledReason) }] : []); const schedulingActions = artifact.turns.flatMap((turn) => turn.schedulingActions ?? []); return { pricingRulesVersions: [...new Set(artifact.turns.map((turn) => turn.pricingRulesVersion))], semanticTools: [...new Set(artifact.turns.flatMap((turn) => turn.semanticTools))], ...(schedulingActions.length > 0 ? { schedulingActions } : {}), slotOffer: artifact.slotOffer, customerTurnDurationsMs: [...customerTurnDurationsMs], messageEvidence: structuredClone(artifact.messageEvidence), ...(technicalFailures.length > 0 ? { technicalFailures } : {}), usage: usageFromArtifact(artifact) }; }
 function outcomeFromArtifact(artifact: SanitizedConversationArtifact): LiveEvaluationScenarioResult["outcome"] { return { status: artifact.lead.status, hasQuote: artifact.lead.hasQuote, quoteState: artifact.lead.quoteState, humanNeeded: artifact.lead.humanNeeded, ...(artifact.lead.humanNeededReason ? { humanNeededReason: artifact.lead.humanNeededReason } : {}), fakeCalendarCreates: artifact.calendarCreates, slotOffer: artifact.slotOffer, slotOfferCount: artifact.slotOfferCount }; }
 function usageFromArtifact(artifact: SanitizedConversationArtifact): UsageEvidence { const completed = artifact.turns.reduce<CompletedUsage>((total, turn) => turn.usage ? addUsage(total, turn.usage) : total, emptyUsage()); const unreconciled = artifact.turns.map((turn) => turn.usageUnreconciledReason).find((reason): reason is string => Boolean(reason)); if (unreconciled) return { status: "unreconciled", completed, reason: unreconciled }; if (artifact.turns.some((turn) => turn.usage === undefined)) return { status: "unavailable", completed, reason: "provider_usage_not_reported" }; return { status: "available", completed }; }
 function aggregateUsage(evidence: UsageEvidence[], initial: CompletedUsage = emptyUsage()): UsageEvidence { if (evidence.length === 0 && initial.requests === 0) return { status: "unavailable", completed: emptyUsage(), reason: "no_completed_provider_runs" }; const completed = evidence.reduce<CompletedUsage>((total, entry) => addUsage(total, entry.completed), initial); if (evidence.some((entry) => entry.status === "unreconciled")) return { status: "unreconciled", completed, reason: "one_or_more_provider_turns_aborted_or_failed" }; if (evidence.some((entry) => entry.status === "unavailable")) return { status: "unavailable", completed, reason: "provider_usage_not_reported" }; return { status: "available", completed }; }
@@ -434,13 +541,13 @@ function tokenCapFailure(usage: UsageEvidence, caps: LiveEvaluationManifest["tok
 }
 
 export class EvaluationDeadlineExceededError extends Error { constructor(readonly code: "live_suite_deadline_exceeded" | "scenario_deadline_exceeded" | "customer_turn_deadline_exceeded") { super(code); } }
-export class EvaluationResourceLimitExceededError extends Error { constructor(readonly code: "provider_response_budget_exceeded_before_request_221" | "input_token_cap_exceeded" | "output_token_cap_exceeded" | "total_token_cap_exceeded") { super(code); } }
+export class EvaluationResourceLimitExceededError extends Error { constructor(readonly code: "provider_response_budget_exceeded_before_request_221" | "conversation_create_budget_exceeded_before_request_87" | "input_token_cap_exceeded" | "output_token_cap_exceeded" | "total_token_cap_exceeded") { super(code); } }
 export function assertDeadline(deadlineAt: number, code: EvaluationDeadlineExceededError["code"], now = Date.now()): void { if (now >= deadlineAt) throw new EvaluationDeadlineExceededError(code); }
 /** Genuine signal propagation replaces race-only cancellation. */
 export class DeadlineBoundAgentGateway implements AgentGateway {
   private readonly pendingConversations = new Map<string, TurnAbort>();
-  constructor(private readonly delegate: AgentGateway, private readonly deadlines: { suiteDeadlineAt: number; scopeDeadlineAt: number; customerTurnDeadlineMs: number }, private readonly now: () => number = Date.now) {}
-  async createConversation(leadId: string, signal?: AbortSignal): Promise<{ id: string }> { const turn = this.newTurn(signal); try { const conversation = await this.delegate.createConversation(leadId, turn.signal); this.pendingConversations.set(conversation.id, turn); return conversation; } catch (error) { turn.dispose(); throw error; } }
+  constructor(private readonly delegate: AgentGateway, private readonly deadlines: { suiteDeadlineAt: number; scopeDeadlineAt: number; customerTurnDeadlineMs: number }, private readonly now: () => number = Date.now, private readonly conversationCreateCounter?: ConversationCreateCounter) {}
+  async createConversation(leadId: string, signal?: AbortSignal): Promise<{ id: string }> { const turn = this.newTurn(signal); try { throwIfAborted(turn.signal); this.conversationCreateCounter?.beforeConversationCreate(); const conversation = await this.delegate.createConversation(leadId, turn.signal); this.pendingConversations.set(conversation.id, turn); return conversation; } catch (error) { turn.dispose(); throw error; } }
   async runTurn(input: Parameters<AgentGateway["runTurn"]>[0]) { const turn = this.pendingConversations.get(input.conversationId) ?? this.newTurn(input.signal); this.pendingConversations.delete(input.conversationId); try { throwIfAborted(turn.signal); return await this.delegate.runTurn({ ...input, signal: composeSignals(input.signal, turn.signal) }); } finally { turn.dispose(); } }
   private newTurn(existing: AbortSignal | undefined): TurnAbort { const now = this.now(); const candidates: Array<{ at: number; code: EvaluationDeadlineExceededError["code"] }> = [{ at: now + this.deadlines.customerTurnDeadlineMs, code: "customer_turn_deadline_exceeded" }, { at: this.deadlines.scopeDeadlineAt, code: "scenario_deadline_exceeded" }, { at: this.deadlines.suiteDeadlineAt, code: "live_suite_deadline_exceeded" }]; const earliest = candidates.reduce((first, candidate) => candidate.at < first.at ? candidate : first); if (earliest.at <= now) throw new EvaluationDeadlineExceededError(earliest.code); return new TurnAbort(composeSignals(existing), earliest.at - now, earliest.code); }
 }
@@ -452,7 +559,7 @@ function addUsage(left: CompletedUsage, right: CompletedUsage): CompletedUsage {
 function emptyUsage(): CompletedUsage { return { requests: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedInputTokens: 0 }; }
 function latencyEvidence(durations: number[]): LiveEvaluationReport["latency"] { if (durations.length === 0) return { completedTurns: 0, p50Ms: null, p95Ms: null, withinTargets: null }; const ordered = [...durations].sort((left, right) => left - right); const percentile = (percent: number) => ordered[Math.min(ordered.length - 1, Math.ceil(ordered.length * percent) - 1)]!; const p50Ms = percentile(0.5); const p95Ms = percentile(0.95); return { completedTurns: ordered.length, p50Ms, p95Ms, withinTargets: p50Ms <= liveEvaluationP50TargetMs && p95Ms <= liveEvaluationP95TargetMs && ordered.every((duration) => duration <= liveEvaluationCustomerTurnDeadlineMs) }; }
 function assertLiveReportPath(path: string): string { const destination = resolve(path); const allowedRoot = resolve(process.cwd(), ".runtime", "conversation-live-evaluations"); if (!destination.startsWith(`${allowedRoot}/`)) throw new Error("Live evaluation reports must stay under .runtime/conversation-live-evaluations"); return destination; }
-function isLiveReport(value: unknown): value is LiveEvaluationReport { if (typeof value !== "object" || value === null) return false; const report = value as Partial<LiveEvaluationReport>; return report.version === 4 && report.manifest !== undefined && Array.isArray(report.scenarios) && report.summary !== undefined && report.providerResponses !== undefined; }
+function isLiveReport(value: unknown): value is LiveEvaluationReport { if (typeof value !== "object" || value === null) return false; const report = value as Partial<LiveEvaluationReport>; return report.version === 4 && report.manifest !== undefined && Array.isArray(report.scenarios) && report.summary !== undefined && report.providerResponses !== undefined && report.conversationCreates !== undefined; }
 function sha256(value: unknown): string { return createHash("sha256").update(typeof value === "string" ? value : JSON.stringify(value)).digest("hex"); }
 export function canonicalLiveEvaluationManifestSha256(manifest: Omit<LiveEvaluationManifest, "manifestSha256">): string { return sha256(manifest); }
 function canonicalJson(value: unknown): string {

@@ -13,10 +13,53 @@ export type AvailabilityReason = "exact" | "nonworking_day" | "requested_date_un
 export type SlotOfferOptions = {
   /** Customer's exact clock constraint, in Europe/Belgrade local minutes. */
   minimumLocalStartMinutes?: number;
+  /** Customer's latest acceptable start, in Europe/Belgrade local minutes. */
+  maximumLocalStartMinutes?: number;
   /** A "later" request starts after the final displayed option on that day. */
   minimumStartOnPreferredDate?: string;
   /** The intent changed, so old callbacks must become stale even if Calendar fails. */
   supersedeExisting?: boolean;
+  /**
+   * Typed customer-facing lifecycle choice. `retain_until_replacement` keeps
+   * the last offer selectable until a successful fresh result replaces it;
+   * `reject_now` atomically retires it before Calendar reads. `none` is valid
+   * only when the caller has verified there is no active offer.
+   */
+  existingOfferDisposition?: "none" | "retain_until_replacement" | "reject_now";
+  /**
+   * A date-sensitive price must never sit beside options for another date.
+   * Keep an exact requested day when present; otherwise keep the nearest one
+   * future day only.
+   */
+  singleOfferDate?: boolean;
+  /**
+   * Runs after both team calendars have been read but before fresh slot tokens
+   * are persisted.  The caller can atomically align another durable boundary
+   * (for example, a quote that depends on the actual offered day) with the
+   * resulting token fingerprint.
+   */
+  onAvailabilityResolved?: (resolution: AvailabilityResolution) => Promise<void>;
+  /**
+   * Keep a freshly calculated offer private until the caller has completed
+   * its provider turn. This protects against a model final-response failure
+   * leaving customer-invisible active tokens behind.
+   */
+  deferTokenPersistence?: boolean;
+};
+
+export type AvailabilitySlotCandidate = Omit<AvailabilitySlot, "token" | "offerId" | "displayOrder" | "label">;
+export type AvailabilityResolution = {
+  slots: AvailabilitySlotCandidate[];
+  match: SlotOfferMatch;
+  availabilityReason: AvailabilityReason;
+};
+export type DeferredSlotOffer = {
+  leadId: string;
+  offerId: string;
+  issuedAt: string;
+  tokens: AvailabilitySlot[];
+  expiresAt: string;
+  scheduleFingerprint: string;
 };
 
 export class CalendarReservationService {
@@ -33,7 +76,7 @@ export class CalendarReservationService {
     replyLanguage: ReplyLanguage,
     options: SlotOfferOptions = {},
   ): Promise<
-    | { ok: true; slots: AvailabilitySlot[]; match: SlotOfferMatch; availabilityReason: "exact" | "nonworking_day" | "requested_date_unavailable" | "requested_time_unavailable" }
+    | { ok: true; slots: AvailabilitySlot[]; match: SlotOfferMatch; availabilityReason: "exact" | "nonworking_day" | "requested_date_unavailable" | "requested_time_unavailable"; deferredOffer?: DeferredSlotOffer }
     | { ok: false; error: string; availabilityReason?: Exclude<AvailabilityReason, "exact"> }
   > {
     if (lead.status !== "qualified" || !lead.quote || lead.quoteValidity !== "active" || lead.humanNeeded) {
@@ -47,7 +90,9 @@ export class CalendarReservationService {
     // provider re-query. The existing RPC atomically marks all old tokens
     // superseded; if Calendar then fails, an old button cannot book a time the
     // customer has just rejected.
-    if (options.supersedeExisting) {
+    const shouldRejectExisting = options.existingOfferDisposition === "reject_now" ||
+      (options.existingOfferDisposition === undefined && options.supersedeExisting);
+    if (shouldRejectExisting) {
       try {
         await this.repository.saveCalendarSlotOffer({ leadId: lead.id, offerId: randomUUID(), issuedAt, tokens: [] });
       } catch {
@@ -64,12 +109,13 @@ export class CalendarReservationService {
     } catch {
       return { ok: false, error: "calendar_availability_failed" };
     }
-    let rawSlots: Array<Omit<AvailabilitySlot, "token" | "offerId" | "displayOrder" | "label">>;
+    let rawSlots: AvailabilitySlotCandidate[];
     let match: SlotOfferMatch = "exact";
     let availabilityReason: AvailabilityReason = "exact";
     const hasRequestedTimeConstraint = Boolean(
       lead.clientData.preferredTimeWindow ||
       options.minimumLocalStartMinutes !== undefined ||
+      options.maximumLocalStartMinutes !== undefined ||
       options.minimumStartOnPreferredDate,
     );
     try {
@@ -80,6 +126,9 @@ export class CalendarReservationService {
         minimumLocalStartMinutes: options.minimumLocalStartMinutes,
         minimumStartOnPreferredDate: options.minimumStartOnPreferredDate,
       });
+      if (options.maximumLocalStartMinutes !== undefined) {
+        rawSlots = rawSlots.filter((slot) => localMinutes(slot.start) <= options.maximumLocalStartMinutes!);
+      }
       // The engine searches the safe 14-day horizon. Any returned option on a
       // later calendar day is an alternative, never an exact match for the
       // customer's requested date. Sunday has its own, more specific reason.
@@ -92,17 +141,20 @@ export class CalendarReservationService {
       }
       // When a requested range has no exact slot, show actual closest times
       // rather than reporting a false empty calendar. The response renderer
-      // makes the relaxation explicit.
+      // makes the relaxation explicit. Numeric after/before/range bounds are
+      // hard customer constraints: broadening a named period is useful, but
+      // offering a time outside an explicit clock boundary is not consent.
       if (rawSlots.length === 0 && hasRequestedTimeConstraint) {
         rawSlots = rankNearestAlternatives(this.scheduling.findSlots({
           clientData: { ...lead.clientData, preferredTimeWindow: undefined },
           now,
           busyByTeam: { team_a: teamA, team_b: teamB },
-          // Keep the "later" floor: relaxing a time preference must never
-          // resurrect options which were just rejected from an old offer.
+          // Keep precise bounds and the "later" floor: a fallback must never
+          // resurrect options the customer excluded explicitly.
+          minimumLocalStartMinutes: options.minimumLocalStartMinutes,
           minimumStartOnPreferredDate: options.minimumStartOnPreferredDate,
           limit: 1_000,
-        }), lead.clientData.preferredTimeWindow, options).slice(0, 3);
+        }).filter((slot) => options.maximumLocalStartMinutes === undefined || localMinutes(slot.start) <= options.maximumLocalStartMinutes!), lead.clientData.preferredTimeWindow, options).slice(0, 3);
         if (rawSlots.length > 0) {
           match = "nearest_alternatives";
           availabilityReason = "requested_time_unavailable";
@@ -111,6 +163,43 @@ export class CalendarReservationService {
     } catch (error) {
       if (error instanceof Error && error.message === "cleaning_duration_exceeds_workday") return { ok: false, error: "duration_exceeds_workday" };
       throw error;
+    }
+    if (options.singleOfferDate && rawSlots.length > 0) {
+      const requestedDate = lead.clientData.preferredDate;
+      const exactDate = requestedDate && rawSlots.some((slot) => belgradeDate(slot.start) === requestedDate)
+        ? requestedDate
+        : belgradeDate([...rawSlots].sort((left, right) => left.start.localeCompare(right.start))[0]!.start);
+      rawSlots = rawSlots.filter((slot) => belgradeDate(slot.start) === exactDate);
+      if (exactDate === requestedDate && availabilityReason === "exact") {
+        match = "exact";
+        availabilityReason = "exact";
+      } else {
+        match = "nearest_alternatives";
+        availabilityReason = hasRequestedTimeConstraint ? "requested_time_unavailable" : "requested_date_unavailable";
+      }
+    }
+    // A Calendar result can change a date-dependent quote. Give the caller a
+    // single pre-token hook so the quote is durable before the tokens it will
+    // authorise. This is deliberately after both availability reads and
+    // before the schedule fingerprint is calculated.
+    try {
+      await options.onAvailabilityResolved?.({ slots: rawSlots, match, availabilityReason });
+    } catch {
+      return { ok: false, error: "calendar_slot_offer_persist_failed" };
+    }
+    // A no-slot result is evidence, not an empty replacement offer. In retain
+    // mode the previous customer-visible tokens remain valid; reject_now has
+    // already deliberately retired them before the read above.
+    if (rawSlots.length === 0 && options.existingOfferDisposition !== undefined) {
+      return {
+        ok: false,
+        error: "no_available_slots",
+        availabilityReason: isSunday(lead.clientData.preferredDate)
+          ? "nonworking_day"
+          : hasRequestedTimeConstraint
+          ? "requested_time_unavailable"
+          : "requested_date_unavailable",
+      };
     }
     const expiresAt = new Date(now.getTime() + tokenLifetimeMs).toISOString();
     const offerId = randomUUID();
@@ -122,16 +211,17 @@ export class CalendarReservationService {
       label: formatSlot(slot.team, slot.start, replyLanguage),
     }));
     const scheduleFingerprint = fingerprintSchedule(lead);
-    try {
-      await this.repository.saveCalendarSlotOffer({
-        leadId: lead.id,
-        offerId,
-        issuedAt,
-        tokens: slots.map((slot) => ({ ...slot, leadId: lead.id, expiresAt, scheduleFingerprint })),
-      });
-    } catch {
-      return { ok: false, error: "calendar_slot_offer_persist_failed" };
+    const deferredOffer: DeferredSlotOffer = { leadId: lead.id, offerId, issuedAt, tokens: slots, expiresAt, scheduleFingerprint };
+    if (!options.deferTokenPersistence) {
+      try {
+        await this.persistSlotOffer(deferredOffer);
+      } catch {
+        return { ok: false, error: "calendar_slot_offer_persist_failed" };
+      }
     }
+    // Keep legacy direct callers deterministic while semantic v34 callers
+    // always pass an explicit disposition above. This compatibility branch is
+    // not reachable from the agent path.
     if (slots.length === 0) {
       return {
         ok: false,
@@ -143,7 +233,42 @@ export class CalendarReservationService {
           : "requested_date_unavailable",
       };
     }
-    return { ok: true, slots, match, availabilityReason: availabilityReason as "exact" | "nonworking_day" | "requested_date_unavailable" | "requested_time_unavailable" };
+    return {
+      ok: true,
+      slots,
+      match,
+      availabilityReason: availabilityReason as "exact" | "nonworking_day" | "requested_date_unavailable" | "requested_time_unavailable",
+      ...(options.deferTokenPersistence ? { deferredOffer } : {}),
+    };
+  }
+
+  /** Commits a deferred offer only after the caller can render/deliver it. */
+  async commitDeferredSlotOffer(offer: DeferredSlotOffer): Promise<void> {
+    await this.persistSlotOffer(offer);
+  }
+
+  /**
+   * Atomically makes every token stale after a deferred-commit boundary
+   * failure. This is deliberately the same repository replace primitive as a
+   * normal supersede, so it also covers a completion failure after the token
+   * write succeeded. Callers must not render an offer until this finishes.
+   */
+  async discardDeferredSlotOffer(offer: DeferredSlotOffer): Promise<void> {
+    await this.repository.saveCalendarSlotOffer({
+      leadId: offer.leadId,
+      offerId: randomUUID(),
+      issuedAt: offer.issuedAt,
+      tokens: [],
+    });
+  }
+
+  private async persistSlotOffer(offer: DeferredSlotOffer): Promise<void> {
+    await this.repository.saveCalendarSlotOffer({
+      leadId: offer.leadId,
+      offerId: offer.offerId,
+      issuedAt: offer.issuedAt,
+      tokens: offer.tokens.map((slot) => ({ ...slot, leadId: offer.leadId, expiresAt: offer.expiresAt, scheduleFingerprint: offer.scheduleFingerprint })),
+    });
   }
 
   async reserveSlot(lead: StoredLead, token: string, replyLanguage: ReplyLanguage = "en"): Promise<{ ok: true; eventId: string } | { ok: false; error: string; ambiguous?: boolean }> {
@@ -205,11 +330,19 @@ export class CalendarReservationService {
   }
 
   private async persistReservation(lead: StoredLead, slot: { team: StoredLead["assignedTeam"]; start: string; end: string }, eventId: string, replyLanguage: ReplyLanguage): Promise<void> {
-    lead.assignedTeam = slot.team;
-    lead.bookedStart = slot.start;
-    lead.bookedEnd = slot.end;
-    lead.calendarEventId = eventId;
-    await this.repository.persistCalendarReservationWithTrelloJob({ lead, replyLanguage });
+    // Keep the in-memory lead as a durable-state snapshot until the atomic
+    // reservation/outbox write succeeds. A failed repository transaction must
+    // never make the caller appear booked just because Calendar accepted the
+    // event; recovery can then retry or reconcile from the operation record.
+    const reservedLead: StoredLead = {
+      ...lead,
+      assignedTeam: slot.team,
+      bookedStart: slot.start,
+      bookedEnd: slot.end,
+      calendarEventId: eventId,
+    };
+    await this.repository.persistCalendarReservationWithTrelloJob({ lead: reservedLead, replyLanguage });
+    Object.assign(lead, reservedLead);
     // The durable reservation/outbox boundary remains the source of truth.  As
     // soon as it commits, make the first Trello reconciliation due instead of
     // waiting for the legacy recovery fallback.  This is deliberately a
