@@ -10,6 +10,36 @@ afterEach(() => {
 });
 
 describe("SupabaseLeadRepository", () => {
+  it("invalidates a disposable Conversation through the server-side DELETE boundary", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify([{
+      id: "22222222-2222-4222-8222-222222222222",
+    }]), {
+      headers: { "content-type": "application/json" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const repository = new SupabaseLeadRepository({ url: "https://example.supabase.co", secretKey: "test-secret" });
+
+    await expect(repository.invalidateConversation("11111111-1111-4111-8111-111111111111")).resolves.toBeUndefined();
+
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+      "https://example.supabase.co/rest/v1/conversations?lead_id=eq.11111111-1111-4111-8111-111111111111",
+    );
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ method: "DELETE" });
+    expect(new Headers(fetchMock.mock.calls[0]?.[1]?.headers).get("prefer")).toBe("return=representation");
+  });
+
+  it("surfaces a forbidden Conversation invalidation instead of treating the reset as complete", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ message: "forbidden" }), {
+      status: 403,
+      headers: { "content-type": "application/json" },
+    })));
+    const repository = new SupabaseLeadRepository({ url: "https://example.supabase.co", secretKey: "test-secret" });
+
+    await expect(repository.invalidateConversation("11111111-1111-4111-8111-111111111111")).rejects.toThrow(
+      "invalidate conversation failed with HTTP 403",
+    );
+  });
+
   it("uses the replacement RPC even for an empty offer so prior choices are superseded", async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify([]), {
       headers: { "content-type": "application/json" },
