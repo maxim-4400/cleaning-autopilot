@@ -465,6 +465,193 @@ describe("Telegram webhook", () => {
     expect(await base.repository.getIntegrationOperation(deliveryKey)).toMatchObject({ status: "succeeded", externalId: "already-delivered" });
   });
 
+  it("retries a confirmed-failed technical resend with the same delivery key and no provider turn", async () => {
+    const base = dependencies();
+    const lead = await base.repository.createLead({ telegramChatId: 17711, firstMessageLanguage: "en", agentConfigVersion: 5 });
+    const updateId = 177111;
+    const agentTurnKey = `openai:agent_turn:${lead.id}:${updateId}`;
+    const recoveryKey = `openai:conversation_recovery:${lead.id}`;
+    const deliveryKey = `telegram:reply:${updateId}`;
+    await base.repository.createIntegrationOperation({ leadId: lead.id, idempotencyKey: agentTurnKey, provider: "openai", operationType: "run_turn" });
+    await base.repository.failIntegrationOperation(agentTurnKey, "agent_provider_timeout", "ambiguous");
+    await base.repository.createIntegrationOperation({ leadId: lead.id, idempotencyKey: recoveryKey, provider: "openai", operationType: "conversation_recovery_marker" });
+    await base.repository.completeIntegrationOperation(recoveryKey, String(updateId));
+    await base.repository.createIntegrationOperation({ leadId: lead.id, idempotencyKey: deliveryKey, provider: "telegram", operationType: "send_message" });
+    await base.repository.failIntegrationOperation(deliveryKey, "telegram_delivery_failed", "failed");
+    const agent: AgentGateway = {
+      async createConversation() { throw new Error("same-update recovery must not create a Conversation"); },
+      async runTurn() { throw new Error("same-update recovery must not run the model"); },
+    };
+
+    await expect(processTelegramWebhook(update(updateId, "2 and 1", 17711), { ...base, agent })).resolves.toEqual({ kind: "processed" });
+
+    expect(base.telegram.messages).toHaveLength(1);
+    expect(base.telegram.messages[0]?.text).toContain("last message could not be processed safely");
+    expect(await base.repository.getIntegrationOperation(deliveryKey)).toMatchObject({ status: "succeeded" });
+    expect(base.repository.updates.get(updateId)).toMatchObject({ status: "processed" });
+    await expect(base.repository.getConversation(lead.id)).resolves.toBeNull();
+    expect(base.calendar.availabilityQueries).toHaveLength(0);
+    expect(base.calendar.creates).toHaveLength(0);
+  });
+
+  it("delivers one degraded message for an unexpected application error without replaying business work", async () => {
+    const base = dependencies();
+    let turns = 0;
+    const agent: AgentGateway = {
+      async createConversation() { return { id: "unexpected-app-error" }; },
+      async runTurn() {
+        turns += 1;
+        throw new Error("synthetic application failure");
+      },
+    };
+
+    await expect(processTelegramWebhook(update(17712, "2 и 1"), { ...base, agent })).resolves.toEqual({ kind: "processed" });
+
+    const lead = base.repository.getLead(1001);
+    expect(turns).toBe(1);
+    expect(base.telegram.messages.at(-1)?.text).toContain("last message could not be processed safely");
+    expect(await base.repository.getIntegrationOperation("telegram:degraded:17712")).toMatchObject({ status: "succeeded" });
+    expect(await base.repository.getIntegrationOperation(`openai:agent_turn:${lead?.id}:17712`)).toMatchObject({ status: "ambiguous" });
+    expect(base.calendar.availabilityQueries).toHaveLength(0);
+    expect(base.calendar.creates).toHaveLength(0);
+    expect(base.repository.updates.get(17712)).toMatchObject({ status: "processed" });
+  });
+
+  it("uses the separate reservation-safe degraded copy after a callback application error", async () => {
+    const base = dependencies();
+    const lead = await base.repository.createLead({ telegramChatId: 17713, firstMessageLanguage: "ru", agentConfigVersion: 5 });
+    lead.status = "qualified";
+    lead.quoteValidity = "active";
+    lead.quote = { amountRsd: 6000, baseRsd: 6000, volumeDiscountPercent: 0, bathroomSurchargeRsd: 0, petHairSurchargeRsd: 0, extrasSurchargeRsd: 0, sameDayApplied: false, pricingRulesVersion: 1 };
+    lead.clientData = { cleaningType: "standard", areaM2: 75, rooms: 3, bathrooms: 1, heavyPetHair: false, extras: [], addressOrDistrict: "Vračar", preferredDate: "2026-08-26" };
+    await base.repository.saveLead(lead);
+    base.repository.getCalendarSlotToken = async () => { throw new Error("synthetic callback repository failure"); };
+
+    await expect(processTelegramWebhook(callback(17713, "callback-degraded", "slot:ru:00000000-0000-4000-8000-000000000001", 17713), base)).resolves.toEqual({ kind: "processed" });
+
+    expect(base.telegram.messages).toHaveLength(1);
+    expect(base.telegram.messages[0]?.text).toContain("нельзя безопасно подтвердить");
+    expect(await base.repository.getIntegrationOperation("telegram:degraded:17713")).toMatchObject({ status: "succeeded" });
+    expect(base.calendar.creates).toHaveLength(0);
+    expect(base.repository.updates.get(17713)).toMatchObject({ status: "processed" });
+    expect(base.repository.getLead(17713)).toMatchObject({ id: lead.id, humanNeeded: true, humanNeededReason: "calendar_ambiguous" });
+  });
+
+  it("retries a confirmed-failed callback degraded reply before slot reservation", async () => {
+    const base = dependencies();
+    const lead = await base.repository.createLead({ telegramChatId: 17715, firstMessageLanguage: "ru", agentConfigVersion: 5 });
+    lead.status = "qualified";
+    lead.quoteValidity = "active";
+    lead.quote = { amountRsd: 6000, baseRsd: 6000, volumeDiscountPercent: 0, bathroomSurchargeRsd: 0, petHairSurchargeRsd: 0, extrasSurchargeRsd: 0, sameDayApplied: false, pricingRulesVersion: 1 };
+    lead.clientData = { cleaningType: "standard", areaM2: 75, rooms: 3, bathrooms: 1, heavyPetHair: false, extras: [], addressOrDistrict: "Vračar", preferredDate: "2026-08-26" };
+    await base.repository.saveLead(lead);
+    let slotLookups = 0;
+    base.repository.getCalendarSlotToken = async () => {
+      slotLookups += 1;
+      throw new Error("synthetic callback repository failure");
+    };
+    base.telegram.shouldFail = true;
+    base.telegram.failureOutcome = "failed";
+    const input = callback(17715, "callback-degraded-failed", "slot:ru:00000000-0000-4000-8000-000000000002", 17715);
+
+    await expect(processTelegramWebhook(input, base)).resolves.toEqual({ kind: "failed", failureCode: "processing_error" });
+    expect(slotLookups).toBe(1);
+    expect(base.calendar.creates).toHaveLength(0);
+
+    base.telegram.shouldFail = false;
+    await expect(processTelegramWebhook(input, base)).resolves.toEqual({ kind: "processed" });
+
+    expect(slotLookups).toBe(1);
+    expect(base.calendar.creates).toHaveLength(0);
+    expect(base.telegram.messages.at(-1)?.text).toContain("нельзя безопасно подтвердить");
+    expect(await base.repository.getIntegrationOperation("telegram:degraded:17715")).toMatchObject({ status: "succeeded" });
+  });
+
+  it("does not repeat a callback reservation after an ambiguous degraded delivery", async () => {
+    const base = dependencies();
+    const lead = await base.repository.createLead({ telegramChatId: 17716, firstMessageLanguage: "en", agentConfigVersion: 5 });
+    lead.status = "qualified";
+    lead.quoteValidity = "active";
+    lead.quote = { amountRsd: 6000, baseRsd: 6000, volumeDiscountPercent: 0, bathroomSurchargeRsd: 0, petHairSurchargeRsd: 0, extrasSurchargeRsd: 0, sameDayApplied: false, pricingRulesVersion: 1 };
+    lead.clientData = { cleaningType: "standard", areaM2: 75, rooms: 3, bathrooms: 1, heavyPetHair: false, extras: [], addressOrDistrict: "Vračar", preferredDate: "2026-08-26" };
+    await base.repository.saveLead(lead);
+    let slotLookups = 0;
+    base.repository.getCalendarSlotToken = async () => {
+      slotLookups += 1;
+      throw new Error("synthetic callback repository failure");
+    };
+    base.telegram.shouldFail = true;
+    base.telegram.failureOutcome = "ambiguous";
+    const input = callback(17716, "callback-degraded-ambiguous", "slot:en:00000000-0000-4000-8000-000000000003", 17716);
+
+    await expect(processTelegramWebhook(input, base)).resolves.toEqual({ kind: "failed", failureCode: "processing_error" });
+    expect(slotLookups).toBe(1);
+    expect(base.calendar.creates).toHaveLength(0);
+
+    base.telegram.shouldFail = false;
+    await expect(processTelegramWebhook(input, base)).resolves.toEqual({ kind: "failed", failureCode: "telegram_delivery_failed" });
+
+    expect(slotLookups).toBe(1);
+    expect(base.calendar.creates).toHaveLength(0);
+    expect(base.telegram.messages).toHaveLength(0);
+    expect(await base.repository.getIntegrationOperation("telegram:degraded:17716")).toMatchObject({ status: "ambiguous" });
+    expect(base.repository.getLead(17716)).toMatchObject({ id: lead.id, humanNeeded: true, humanNeededReason: "calendar_ambiguous" });
+  });
+
+  it("does not send a resend when a generic message failure cannot invalidate its Conversation", async () => {
+    const base = dependencies();
+    const agent: AgentGateway = {
+      async createConversation() { return { id: "unresettable-conversation" }; },
+      async runTurn() { throw new Error("synthetic application failure"); },
+    };
+    base.repository.invalidateConversation = async () => { throw new Error("synthetic invalidation failure"); };
+
+    await expect(processTelegramWebhook(update(17717, "2 и 1"), { ...base, agent })).resolves.toEqual({ kind: "processed" });
+
+    expect(base.telegram.messages.at(-1)?.text).toContain("team");
+    expect(base.telegram.messages.at(-1)?.text).not.toContain("last message could not");
+    expect(base.repository.getLead(1001)).toMatchObject({ humanNeeded: true, humanNeededReason: "conversation_ambiguous" });
+    expect(await base.repository.getIntegrationOperation("telegram:degraded:17717")).toMatchObject({ status: "succeeded" });
+  });
+
+  it("does not add a degraded reply after the ordinary response was already delivered", async () => {
+    const base = dependencies();
+    const markProcessed = base.repository.markTelegramUpdateProcessed.bind(base.repository);
+    let processedCalls = 0;
+    base.repository.markTelegramUpdateProcessed = async (updateId) => {
+      processedCalls += 1;
+      if (processedCalls === 1) throw new Error("synthetic post-delivery update write failure");
+      await markProcessed(updateId);
+    };
+    const agent: AgentGateway = {
+      async createConversation() { return { id: "delivered-before-late-error" }; },
+      async runTurn() { return { reply: "One more detail, please.", toolResults: [], steps: 1 }; },
+    };
+
+    await expect(processTelegramWebhook(update(17718, "Need cleaning"), { ...base, agent })).resolves.toEqual({ kind: "processed" });
+
+    expect(base.telegram.messages).toHaveLength(1);
+    expect(await base.repository.getIntegrationOperation("telegram:reply:17718")).toMatchObject({ status: "succeeded" });
+    expect(await base.repository.getIntegrationOperation("telegram:degraded:17718")).toBeNull();
+    expect(base.repository.updates.get(17718)).toMatchObject({ status: "processed" });
+  });
+
+  it("leaves a degraded reply retryable after a confirmed delivery failure without creating another key", async () => {
+    const base = dependencies();
+    base.telegram.shouldFail = true;
+    base.telegram.failureOutcome = "failed";
+    const agent: AgentGateway = {
+      async createConversation() { return { id: "degraded-delivery-failure" }; },
+      async runTurn() { throw new Error("synthetic application failure"); },
+    };
+
+    await expect(processTelegramWebhook(update(17714, "2 и 1"), { ...base, agent })).resolves.toEqual({ kind: "failed", failureCode: "processing_error" });
+
+    expect(await base.repository.getIntegrationOperation("telegram:degraded:17714")).toMatchObject({ status: "failed" });
+    expect(await base.repository.getIntegrationOperation("telegram:reply:17714")).toBeNull();
+    expect(base.repository.updates.get(17714)).toMatchObject({ status: "failed", failureCode: "processing_error" });
+  });
+
   it.each([
     ["a different update", "17720"],
     ["a legacy marker without an update id", undefined],
@@ -2677,25 +2864,23 @@ describe("Telegram webhook", () => {
       await persist(input);
     };
 
-    await expect(processTelegramWebhook(callback(873, "callback-persist-failure", callbackData), deps)).resolves.toEqual({
-      kind: "failed",
-      failureCode: "processing_error",
-    });
+    await expect(processTelegramWebhook(callback(873, "callback-persist-failure", callbackData), deps)).resolves.toEqual({ kind: "processed" });
     const leadAfterFailure = repository.getLead(1001);
     const token = callbackData.split(":").at(-1);
     if (!leadAfterFailure || !token) throw new Error("lead or token missing after persistence failure");
     expect(calendar.creates).toHaveLength(1);
     expect(leadAfterFailure.calendarEventId).toBeUndefined();
+    expect(leadAfterFailure).toMatchObject({ humanNeeded: true, humanNeededReason: "calendar_ambiguous" });
     expect(repository.slotTokens.get(token)?.consumedAt).toBeDefined();
     expect(repository.operations.get(`google_calendar:reservation:${leadAfterFailure.id}:${token}`)).toMatchObject({
       status: "succeeded",
       externalId: "fake-calendar-event-1",
     });
 
-    await expect(processTelegramWebhook(callback(873, "callback-persist-failure", callbackData), deps)).resolves.toEqual({ kind: "processed" });
+    await expect(processTelegramWebhook(callback(873, "callback-persist-failure", callbackData), deps)).resolves.toEqual({ kind: "duplicate" });
     expect(calendar.creates).toHaveLength(1);
-    expect(repository.getLead(1001)).toMatchObject({ status: "qualified", calendarEventId: "fake-calendar-event-1" });
-    expect(telegram.messages.at(-1)?.text).toContain("<b>Your time is confirmed.</b>");
+    expect(repository.getLead(1001)).toMatchObject({ status: "qualified", humanNeeded: true, humanNeededReason: "calendar_ambiguous" });
+    expect(telegram.messages.at(-1)?.text).toContain("could not safely confirm");
   });
 
   it("contains a syntactically valid token from a different lead before any Trello or booking work", async () => {

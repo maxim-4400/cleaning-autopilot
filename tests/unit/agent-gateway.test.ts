@@ -151,6 +151,25 @@ describe("OpenAiAgentsGateway", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("passes the configured medium reasoning effort to the Responses request", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(completedResponse([{
+      id: "msg-medium-reasoning", type: "message", role: "assistant", status: "completed",
+      content: [{ type: "output_text", text: "I can help with that.", annotations: [] }],
+    }])));
+    vi.stubGlobal("fetch", fetchMock);
+    const gateway = new OpenAiAgentsGateway("test-key", "gpt-5.6-terra", "medium", 4, {
+      maxResponseRetries: 0,
+      maxConversationCreateAttempts: 1,
+    });
+
+    await gateway.runTurn({
+      conversationId: "conv-medium-reasoning", systemPrompt: "Test prompt", message: "Hello", replyLanguage: "en", knownClientData: {}, executeTool: async () => ({ ok: true }),
+    });
+
+    const request = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(request.reasoning).toMatchObject({ effort: "medium" });
+  });
+
   it("does not expose availability to the SDK when the webhook has not granted scheduling capability", async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(completedResponse([{
       id: "msg-capability", type: "message", role: "assistant", status: "completed",

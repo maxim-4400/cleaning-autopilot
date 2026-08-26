@@ -424,7 +424,7 @@ export class OpenAiAgentsGateway implements AgentGateway {
   constructor(
     private readonly apiKey: string,
     private readonly model: string,
-    private readonly reasoningEffort: "low" = "low",
+    private readonly reasoningEffort: "low" | "medium" = "low",
     private readonly maxToolSteps = maxAgentToolSteps,
     options: OpenAiAgentsGatewayOptions = {},
   ) {

@@ -225,8 +225,14 @@ export class InMemoryLeadRepository implements LeadRepository {
         (existing.status === "failed" || existing.status === "succeeded");
       const retryableBookingDelivery = input.provider === "telegram" && input.operationType === "send_message" &&
         input.idempotencyKey.startsWith("telegram:booking_confirmed:") && existing.status === "failed";
+      // A failed Telegram HTTP response is a confirmed non-delivery. Retrying
+      // the same update-owned reply is safe and prevents a technical recovery
+      // from becoming a permanent silent dead-end. Ambiguous sends are never
+      // retried because Telegram may already have accepted them.
+      const retryableTechnicalDelivery = input.provider === "telegram" && input.operationType === "send_message" &&
+        /^(?:telegram:reply|telegram:degraded):/u.test(input.idempotencyKey) && existing.status === "failed";
       const retryableAgentTurn = input.provider === "openai" && input.operationType === "run_turn" && existing.status === "failed";
-      if (((existing.status !== "failed" || input.provider === "google_calendar") && !retryableBookingDelivery && !retryableAgentTurn) && !retryableDesiredState) {
+      if (((existing.status !== "failed" || input.provider === "google_calendar") && !retryableBookingDelivery && !retryableTechnicalDelivery && !retryableAgentTurn) && !retryableDesiredState) {
         return { ...existing, isNew: false };
       }
       existing.status = "pending";
