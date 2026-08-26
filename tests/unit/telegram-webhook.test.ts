@@ -410,6 +410,109 @@ describe("Telegram webhook", () => {
     expect(deps.repository.getLead(1001)).toMatchObject({ clientData: { areaM2: 50 }, humanNeeded: false });
   });
 
+  it("recovers an ambiguous agent operation before runTurn and records the update-owned recovery marker", async () => {
+    const base = dependencies();
+    const lead = await base.repository.createLead({ telegramChatId: 1770, firstMessageLanguage: "en", agentConfigVersion: 5 });
+    await base.repository.saveConversation({ leadId: lead.id, telegramChatId: 1770, openAiConversationId: "ambiguous-provider-turn" });
+    const agentTurnKey = `openai:agent_turn:${lead.id}:17701`;
+    await base.repository.createIntegrationOperation({ leadId: lead.id, idempotencyKey: agentTurnKey, provider: "openai", operationType: "run_turn" });
+    await base.repository.failIntegrationOperation(agentTurnKey, "agent_provider_timeout", "ambiguous");
+    const agent: AgentGateway = {
+      async createConversation() { throw new Error("ambiguous turn recovery must not create a provider Conversation"); },
+      async runTurn() { throw new Error("ambiguous turn recovery must not replay the model"); },
+    };
+    const deps = { ...base, agent };
+
+    await expect(processTelegramWebhook(update(17701, "Need cleaning", 1770), deps)).resolves.toEqual({ kind: "processed" });
+
+    expect(base.telegram.messages).toHaveLength(1);
+    expect(base.telegram.messages[0]?.text).toContain("last message could not be processed safely");
+    expect(await base.repository.getIntegrationOperation(agentTurnKey)).toMatchObject({ status: "ambiguous" });
+    expect(await base.repository.getIntegrationOperation(`openai:conversation_recovery:${lead.id}`)).toMatchObject({
+      status: "succeeded", externalId: "17701",
+    });
+    expect(await base.repository.getIntegrationOperation("telegram:reply:17701")).toMatchObject({ status: "succeeded" });
+    await expect(base.repository.getConversation(lead.id)).resolves.toBeNull();
+    expect(base.calendar.availabilityQueries).toHaveLength(0);
+    expect(base.calendar.creates).toHaveLength(0);
+    expect(base.repository.getLead(1770)).toMatchObject({ humanNeeded: false, clientData: {} });
+  });
+
+  it("resumes the same update-owned technical resend without a second model call or Human Needed", async () => {
+    const base = dependencies();
+    const lead = await base.repository.createLead({ telegramChatId: 1771, firstMessageLanguage: "en", agentConfigVersion: 5 });
+    await base.repository.saveConversation({ leadId: lead.id, telegramChatId: 1771, openAiConversationId: "same-update-recovery" });
+    const updateId = 17711;
+    const agentTurnKey = `openai:agent_turn:${lead.id}:${updateId}`;
+    await base.repository.createIntegrationOperation({ leadId: lead.id, idempotencyKey: agentTurnKey, provider: "openai", operationType: "run_turn" });
+    await base.repository.failIntegrationOperation(agentTurnKey, "agent_provider_timeout", "ambiguous");
+    const recoveryKey = `openai:conversation_recovery:${lead.id}`;
+    await base.repository.createIntegrationOperation({ leadId: lead.id, idempotencyKey: recoveryKey, provider: "openai", operationType: "conversation_recovery_marker" });
+    await base.repository.completeIntegrationOperation(recoveryKey, String(updateId));
+    const deliveryKey = `telegram:reply:${updateId}`;
+    await base.repository.createIntegrationOperation({ leadId: lead.id, idempotencyKey: deliveryKey, provider: "telegram", operationType: "send_message" });
+    await base.repository.completeIntegrationOperation(deliveryKey, "already-delivered");
+    const agent: AgentGateway = {
+      async createConversation() { throw new Error("same update recovery must not create a provider Conversation"); },
+      async runTurn() { throw new Error("same update recovery must not replay the model"); },
+    };
+
+    await expect(processTelegramWebhook(update(updateId, "Need cleaning", 1771), { ...base, agent })).resolves.toEqual({ kind: "processed" });
+
+    expect(base.telegram.messages).toEqual([]);
+    expect(base.repository.getLead(1771)).toMatchObject({ humanNeeded: false });
+    expect(base.repository.updates.get(updateId)).toMatchObject({ status: "processed" });
+    expect(await base.repository.getIntegrationOperation(deliveryKey)).toMatchObject({ status: "succeeded", externalId: "already-delivered" });
+  });
+
+  it.each([
+    ["a different update", "17720"],
+    ["a legacy marker without an update id", undefined],
+  ] as const)("keeps the existing consecutive-error Human Needed boundary for %s", async (_label, markerUpdateId) => {
+    const base = dependencies();
+    const lead = await base.repository.createLead({ telegramChatId: 1772, firstMessageLanguage: "en", agentConfigVersion: 5 });
+    await base.repository.saveConversation({ leadId: lead.id, telegramChatId: 1772, openAiConversationId: "consecutive-error-recovery" });
+    const updateId = 17721;
+    const agentTurnKey = `openai:agent_turn:${lead.id}:${updateId}`;
+    await base.repository.createIntegrationOperation({ leadId: lead.id, idempotencyKey: agentTurnKey, provider: "openai", operationType: "run_turn" });
+    await base.repository.failIntegrationOperation(agentTurnKey, "agent_provider_timeout", "ambiguous");
+    const recoveryKey = `openai:conversation_recovery:${lead.id}`;
+    await base.repository.createIntegrationOperation({ leadId: lead.id, idempotencyKey: recoveryKey, provider: "openai", operationType: "conversation_recovery_marker" });
+    await base.repository.completeIntegrationOperation(recoveryKey, markerUpdateId);
+    const agent: AgentGateway = {
+      async createConversation() { throw new Error("consecutive-error boundary must not create a provider Conversation"); },
+      async runTurn() { throw new Error("consecutive-error boundary must not replay the model"); },
+    };
+
+    await expect(processTelegramWebhook(update(updateId, "Need cleaning", 1772), { ...base, agent })).resolves.toEqual({ kind: "processed" });
+
+    expect(base.repository.getLead(1772)).toMatchObject({ humanNeeded: true, humanNeededReason: "conversation_ambiguous" });
+    expect(base.telegram.messages.at(-1)?.text).toContain("check a couple of details with the team");
+    expect(base.calendar.availabilityQueries).toHaveLength(0);
+    expect(base.calendar.creates).toHaveLength(0);
+  });
+
+  it("keeps an ambiguous update failed when Conversation invalidation cannot be proven", async () => {
+    const base = dependencies();
+    const lead = await base.repository.createLead({ telegramChatId: 1773, firstMessageLanguage: "en", agentConfigVersion: 5 });
+    await base.repository.saveConversation({ leadId: lead.id, telegramChatId: 1773, openAiConversationId: "must-be-deleted" });
+    const updateId = 17731;
+    const agentTurnKey = `openai:agent_turn:${lead.id}:${updateId}`;
+    await base.repository.createIntegrationOperation({ leadId: lead.id, idempotencyKey: agentTurnKey, provider: "openai", operationType: "run_turn" });
+    await base.repository.failIntegrationOperation(agentTurnKey, "agent_provider_timeout", "ambiguous");
+    base.repository.invalidateConversation = async () => { throw new Error("synthetic invalidation failure"); };
+    const agent: AgentGateway = {
+      async createConversation() { throw new Error("must not create a provider Conversation"); },
+      async runTurn() { throw new Error("must not replay the model"); },
+    };
+
+    await expect(processTelegramWebhook(update(updateId, "Need cleaning", 1773), { ...base, agent })).resolves.toEqual({ kind: "failed", failureCode: "processing_error" });
+
+    expect(base.telegram.messages).toEqual([]);
+    expect(base.repository.updates.get(updateId)).toMatchObject({ status: "failed", failureCode: "processing_error" });
+    expect(await base.repository.getIntegrationOperation(`openai:conversation_recovery:${lead.id}`)).toBeNull();
+  });
+
   it("rolls back the one update from a duplicate provider tool call and invalidates its Conversation", async () => {
     const base = dependencies();
     const deps = { ...base, agent: {
