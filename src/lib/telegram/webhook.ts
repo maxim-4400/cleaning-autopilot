@@ -576,11 +576,30 @@ export async function processTelegramWebhook(
       provider: "openai",
       operationType: "run_turn",
     });
+    if (!agentTurnOperation.isNew && agentTurnOperation.status === "ambiguous") {
+      // An ambiguous agent turn must never be replayed: it might already have
+      // reached a provider or tool boundary.  It is nevertheless a recoverable
+      // Telegram delivery state.  Resume the server-owned technical response
+      // before `runTurn`, preserving the original ambiguous operation rather
+      // than trapping every Telegram retry behind a generic 500.
+      try {
+        return await recoverTechnicalConversationFailure({
+          updateId: update.update_id,
+          lead,
+          replyLanguage,
+          dependencies,
+        });
+      } catch {
+        // The reset is a precondition for any recovery reply. If it cannot be
+        // proven, keep the Telegram update retryable and do not create a
+        // recovery marker or customer-visible message.
+        await dependencies.repository.markTelegramUpdateFailed(update.update_id, "processing_error");
+        return { kind: "failed", failureCode: "processing_error" };
+      }
+    }
     if (!agentTurnOperation.isNew && agentTurnOperation.status !== "succeeded") {
-      // A failed or ambiguous technical turn is not a customer-supported
-      // escalation reason. Do not reuse its server-managed Conversation and do
-      // not manufacture a Human Needed label; recovery must start from a
-      // separately diagnosed technical boundary.
+      // A failed agent operation is retried by the repository's existing
+      // idempotency rule. A pending state is still owned by an active worker.
       throw new Error("OpenAI agent turn is not reusable after technical failure");
     }
     let turn: AgentTurn;
@@ -2333,6 +2352,21 @@ async function recoverTechnicalConversationFailure(input: {
   const recoveryKey = `openai:conversation_recovery:${lead.id}`;
   const previousRecovery = await dependencies.repository.getIntegrationOperation(recoveryKey);
   if (previousRecovery?.status === "succeeded") {
+    if (previousRecovery.externalId === String(updateId)) {
+      // A process can fail after Telegram accepted this response but before
+      // marking the update processed. Reuse the same server-owned resend and
+      // its per-update delivery key; do not turn that one customer message
+      // into a false Human Needed escalation or invoke the model again.
+      const delivered = await deliverReply({ updateId, lead, reply: renderTechnicalResendReply(replyLanguage), dependencies });
+      if (delivered === "succeeded") {
+        await dependencies.repository.markTelegramUpdateProcessed(updateId);
+        return { kind: "processed" };
+      }
+      await dependencies.repository.markTelegramUpdateFailed(updateId, "telegram_delivery_failed");
+      return { kind: "failed", failureCode: "telegram_delivery_failed" };
+    }
+    // A recovery marker from a different update (or a pre-v37 marker without
+    // its update id) remains the established consecutive-error boundary.
     lead.humanNeeded = true;
     lead.humanNeededReason = "conversation_ambiguous";
     clearPendingSchedulingConsent(lead);
@@ -2352,7 +2386,7 @@ async function recoverTechnicalConversationFailure(input: {
     operationType: "conversation_recovery_marker",
   });
   if (recoveryMarker.isNew || recoveryMarker.status !== "succeeded") {
-    await dependencies.repository.completeIntegrationOperation(recoveryKey);
+    await dependencies.repository.completeIntegrationOperation(recoveryKey, String(updateId));
   }
   await dependencies.repository.appendActivity(lead.id, "conversation_invalidated_after_technical_turn", { outcome: "first_recovery" });
   await dependencies.repository.saveLead(lead);
