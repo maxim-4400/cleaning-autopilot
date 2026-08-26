@@ -139,6 +139,12 @@ export async function processTelegramWebhook(
   if (claim === "duplicate") return { kind: "duplicate" };
   if (claim === "in_progress") return { kind: "failed", failureCode: "processing_in_progress" };
 
+  // The broad outer recovery below is intentionally available only after a
+  // valid customer message has been associated with a lead and locale.  It
+  // must never invent a lead or act on an opaque callback payload.
+  let degradedRecoveryLead: StoredLead | null = null;
+  let degradedRecoveryLanguage: ReplyLanguage = "en";
+
   try {
     const incomingMessage = update.message ?? update.callback_query?.message;
     if (!incomingMessage || (!update.callback_query && !incomingMessage.text?.trim())) {
@@ -158,6 +164,7 @@ export async function processTelegramWebhook(
         agentConfigVersion: config.version,
         ...telegramProfile(incomingMessage.from),
       });
+      degradedRecoveryLead = lead;
       await dependencies.repository.appendActivity(lead.id, "new_address_started");
       const outcome = await deliverReply({
         updateId: update.update_id,
@@ -174,16 +181,41 @@ export async function processTelegramWebhook(
     }
 
     lead = await dependencies.repository.findLeadByTelegramChatId(incomingMessage.chat.id);
+    degradedRecoveryLead = lead;
+
+    // A degraded reply is an update-owned, delivery-only recovery. Resolve
+    // just enough trusted transport context to render it, then fence it before
+    // callback reservation, numeric slot selection, lead mutations, config or
+    // Conversation work. Replaying any of those boundaries would turn an
+    // earlier application failure into a duplicate business action.
+    const initialSlotCallback = update.callback_query ? parseSlotCallbackData(update.callback_query.data) : undefined;
+    const initialMessageText = update.message?.text?.trim() ?? "";
+    let initialReplyLanguage = initialSlotCallback?.replyLanguage ?? resolveReplyLanguage(initialMessageText);
+    if (lead && !initialSlotCallback && isReplyLocale(lead.firstMessageLanguage) && !isReplyLanguageConfident(initialMessageText, initialReplyLanguage)) {
+      initialReplyLanguage = lead.firstMessageLanguage;
+    }
+    degradedRecoveryLanguage = initialReplyLanguage;
+    if (lead) {
+      const degradedResume = await resumeDegradedReply({
+        updateId: update.update_id,
+        lead,
+        replyLanguage: initialReplyLanguage,
+        isCallback: Boolean(update.callback_query),
+        dependencies,
+      });
+      if (degradedResume) return degradedResume;
+    }
 
     if (update.callback_query) {
       const callbackAcknowledged = await acknowledgeCallback(dependencies.telegram, update.callback_query.id);
       if (!callbackAcknowledged) await recordCallbackAcknowledgementFailure(lead, dependencies);
-      const slotCallback = parseSlotCallbackData(update.callback_query.data);
+      const slotCallback = initialSlotCallback;
       if (!lead || !slotCallback || !dependencies.calendarReservation) {
         await dependencies.repository.markTelegramUpdateProcessed(update.update_id);
         return { kind: "ignored" };
       }
       const { slotToken, replyLanguage } = slotCallback;
+      degradedRecoveryLanguage = replyLanguage;
       await sendTyping(dependencies.telegram, lead.telegramChatId);
       const callbackResult = await reserveSelectedSlot({
         updateId: update.update_id,
@@ -206,12 +238,13 @@ export async function processTelegramWebhook(
       return callbackResult;
     }
 
-    const messageText = incomingMessage.text?.trim() ?? "";
+    const messageText = initialMessageText;
     const selectedSlot = parseSlotSelection(messageText);
-    let replyLanguage = selectedSlot?.replyLanguage ?? resolveReplyLanguage(messageText);
+    let replyLanguage = selectedSlot?.replyLanguage ?? initialReplyLanguage;
     if (lead && selectedSlot && !selectedSlot.replyLanguage && isReplyLocale(lead.firstMessageLanguage)) {
       replyLanguage = lead.firstMessageLanguage;
     }
+    degradedRecoveryLanguage = replyLanguage;
     if (lead && selectedSlot !== undefined && dependencies.calendarReservation) {
       if (lead.calendarEventId) {
         const delivered = await deliverReply({ updateId: update.update_id, lead, reply: renderReservedAcknowledgementReply(replyLanguage), dependencies });
@@ -272,6 +305,7 @@ export async function processTelegramWebhook(
     } else {
       config = await dependencies.repository.getAgentConfig(lead.agentConfigVersion);
     }
+    degradedRecoveryLead = lead;
     if (lead.firstMessageLanguage === "und" && isReplyLanguageConfident(messageText, replyLanguage)) {
       lead.firstMessageLanguage = replyLanguage;
       await dependencies.repository.saveLead(lead);
@@ -279,6 +313,7 @@ export async function processTelegramWebhook(
     if ((!isReplyLanguageConfident(messageText, replyLanguage) || isAmbiguousMessage(messageText)) && isReplyLocale(lead.firstMessageLanguage)) {
       replyLanguage = lead.firstMessageLanguage;
     }
+    degradedRecoveryLanguage = replyLanguage;
     if (lead.calendarEventId) {
       const delivered = await deliverReply({ updateId: update.update_id, lead, reply: renderReservedAcknowledgementReply(replyLanguage), dependencies });
       if (delivered !== "succeeded") { await dependencies.repository.markTelegramUpdateFailed(update.update_id, "telegram_delivery_failed"); return { kind: "failed", failureCode: "telegram_delivery_failed" }; }
@@ -440,6 +475,26 @@ export async function processTelegramWebhook(
     // deterministic transport boundaries. All other availability requests,
     // changed dates and changed time preferences must become a typed semantic
     // tool decision below rather than matching an ever-growing phrase list.
+
+    const currentUpdateRecovery = await dependencies.repository.getIntegrationOperation(`openai:conversation_recovery:${lead.id}`);
+    if (currentUpdateRecovery?.status === "succeeded" && currentUpdateRecovery.externalId === String(update.update_id)) {
+      // The first technical recovery already invalidated the provider
+      // Conversation. A retry of this exact Telegram update is delivery-only:
+      // creating a replacement Conversation or invoking the agent would make
+      // a safe resend a new application turn with duplicate-risk side effects.
+      const delivered = await deliverReply({
+        updateId: update.update_id,
+        lead,
+        reply: renderTechnicalResendReply(replyLanguage),
+        dependencies,
+      });
+      if (delivered === "succeeded") {
+        await dependencies.repository.markTelegramUpdateProcessed(update.update_id);
+        return { kind: "processed" };
+      }
+      await dependencies.repository.markTelegramUpdateFailed(update.update_id, "telegram_delivery_failed");
+      return { kind: "failed", failureCode: "telegram_delivery_failed" };
+    }
 
     let conversation = await dependencies.repository.getConversation(lead.id);
     if (!conversation) {
@@ -1143,6 +1198,74 @@ export async function processTelegramWebhook(
       updateKind: update.callback_query ? "callback" : "message",
       error: error instanceof Error ? error.message : "unknown_error",
     });
+    if (degradedRecoveryLead) {
+      try {
+        // A later best-effort operation can throw after the ordinary reply is
+        // already durably accepted by Telegram. Do not manufacture a second
+        // customer message for that completed update.
+        const ordinaryReply = await dependencies.repository.getIntegrationOperation(`telegram:reply:${update.update_id}`);
+        if (ordinaryReply?.status === "succeeded") {
+          try {
+            await dependencies.repository.markTelegramUpdateProcessed(update.update_id);
+          } catch {
+            // Telegram delivery is already durable. Returning the accepted
+            // outcome avoids a false second reply; the update-claim store can
+            // reconcile this idempotently on a later webhook delivery.
+          }
+          return { kind: "processed" };
+        }
+        // This last-chance response is deliberately delivery-only.  It never
+        // replays an opaque application failure, model turn, Calendar action,
+        // Trello projection, booking operation or pricing mutation.  A normal
+        // message tells the customer their last detail remains pending; a
+        // callback gets the stricter reservation/manual-review wording.
+        let degradedReply: TelegramRenderedReply;
+        if (update.callback_query && !degradedRecoveryLead.humanNeeded) {
+          // A callback can fail after a reservation boundary. Do not retry an
+          // unknown booking action automatically; make the durable lifecycle
+          // honest before sending the separate reservation-safe copy.
+          degradedRecoveryLead.humanNeeded = true;
+          degradedRecoveryLead.humanNeededReason = "calendar_ambiguous";
+          clearPendingSchedulingConsent(degradedRecoveryLead);
+          await dependencies.repository.saveLead(degradedRecoveryLead);
+        }
+        if (update.callback_query) {
+          degradedReply = renderCalendarReservationFailedReply(degradedRecoveryLanguage);
+        } else {
+          try {
+            // A normal-message resend is safe only after its provider
+            // Conversation has been invalidated. Otherwise the opaque failed
+            // turn could still be replayed by a later customer message.
+            await dependencies.repository.invalidateConversation(degradedRecoveryLead.id);
+            degradedReply = renderTechnicalResendReply(degradedRecoveryLanguage);
+          } catch {
+            // Do not claim that the customer can resend into a Conversation we
+            // could not reset. Escalate with a truthful backend-owned reply.
+            degradedRecoveryLead.humanNeeded = true;
+            degradedRecoveryLead.humanNeededReason = "conversation_ambiguous";
+            clearPendingSchedulingConsent(degradedRecoveryLead);
+            await dependencies.repository.saveLead(degradedRecoveryLead);
+            degradedReply = renderHumanNeededReply(degradedRecoveryLanguage);
+          }
+        }
+        const delivered = await deliverReply({
+          updateId: update.update_id,
+          lead: degradedRecoveryLead,
+          reply: degradedReply,
+          kind: "degraded",
+          dependencies,
+        });
+        if (delivered === "succeeded") {
+          await dependencies.repository.markTelegramUpdateProcessed(update.update_id);
+          return { kind: "processed" };
+        }
+      } catch (recoveryError) {
+        console.error("Telegram degraded recovery delivery failed", {
+          updateId: update.update_id,
+          error: recoveryError instanceof Error ? recoveryError.message : "unknown_error",
+        });
+      }
+    }
     await dependencies.repository.markTelegramUpdateFailed(update.update_id, "processing_error");
     return { kind: "failed", failureCode: "processing_error" };
   } finally {
@@ -2113,11 +2236,49 @@ async function deliverStaleSlotReply(input: {
   }
 }
 
+/**
+ * Resume only the durable server-owned degraded response for this exact
+ * Telegram update. This fence intentionally lives before every callback or
+ * selection mutation in `processTelegramWebhook`.
+ */
+async function resumeDegradedReply(input: {
+  updateId: number;
+  lead: StoredLead;
+  replyLanguage: ReplyLanguage;
+  isCallback: boolean;
+  dependencies: Stage2Dependencies;
+}): Promise<TelegramWebhookResult | null> {
+  const operation = await input.dependencies.repository.getIntegrationOperation(`telegram:degraded:${input.updateId}`);
+  if (!operation) return null;
+  if (operation.status === "succeeded") {
+    await input.dependencies.repository.markTelegramUpdateProcessed(input.updateId);
+    return { kind: "processed" };
+  }
+  const reply = input.isCallback
+    ? renderCalendarReservationFailedReply(input.replyLanguage)
+    : input.lead.humanNeeded && input.lead.humanNeededReason === "conversation_ambiguous"
+    ? renderHumanNeededReply(input.replyLanguage)
+    : renderTechnicalResendReply(input.replyLanguage);
+  const delivered = await deliverReply({
+    updateId: input.updateId,
+    lead: input.lead,
+    reply,
+    kind: "degraded",
+    dependencies: input.dependencies,
+  });
+  if (delivered === "succeeded") {
+    await input.dependencies.repository.markTelegramUpdateProcessed(input.updateId);
+    return { kind: "processed" };
+  }
+  await input.dependencies.repository.markTelegramUpdateFailed(input.updateId, "telegram_delivery_failed");
+  return { kind: "failed", failureCode: "telegram_delivery_failed" };
+}
+
 async function deliverReply(input: {
   updateId: number;
   lead: StoredLead;
   reply: TelegramRenderedReply;
-  kind?: "reply" | "reservation_pending" | "booking_confirmed" | "reservation_manual" | "slot_stale";
+  kind?: "reply" | "degraded" | "reservation_pending" | "booking_confirmed" | "reservation_manual" | "slot_stale";
   idempotencyKey?: string;
   dependencies: Stage2Dependencies;
 }): Promise<"succeeded" | "failed" | "ambiguous"> {

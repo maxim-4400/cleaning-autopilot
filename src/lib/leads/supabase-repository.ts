@@ -238,8 +238,13 @@ export class SupabaseLeadRepository implements LeadRepository {
         (existing.status === "failed" || existing.status === "succeeded");
       const retryableBookingDelivery = input.provider === "telegram" && input.operationType === "send_message" &&
         input.idempotencyKey.startsWith("telegram:booking_confirmed:") && existing.status === "failed";
+      // Only a confirmed Telegram rejection may be retried under the same
+      // update key. An ambiguous transport outcome may already be visible to
+      // the customer, so it remains non-retryable.
+      const retryableTechnicalDelivery = input.provider === "telegram" && input.operationType === "send_message" &&
+        /^(?:telegram:reply|telegram:degraded):/u.test(input.idempotencyKey) && existing.status === "failed";
       const retryableAgentTurn = input.provider === "openai" && input.operationType === "run_turn" && existing.status === "failed";
-      if (((existing.status !== "failed" || input.provider === "google_calendar") && !retryableBookingDelivery && !retryableAgentTurn) && !retryableDesiredState) {
+      if (((existing.status !== "failed" || input.provider === "google_calendar") && !retryableBookingDelivery && !retryableTechnicalDelivery && !retryableAgentTurn) && !retryableDesiredState) {
         return { ...existing, isNew: false };
       }
 

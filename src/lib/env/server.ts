@@ -15,7 +15,7 @@ const telegramEnvironmentSchema = z.object({
 const openAiEnvironmentSchema = z.object({
   OPENAI_API_KEY: nonEmpty,
   OPENAI_MODEL: nonEmpty.default("gpt-5.6-terra"),
-  OPENAI_REASONING_EFFORT: z.literal("low").default("low"),
+  OPENAI_REASONING_EFFORT: z.enum(["low", "medium"]).default("low"),
 });
 
 const supabaseEnvironmentSchema = z.object({
