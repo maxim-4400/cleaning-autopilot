@@ -18,7 +18,7 @@ import { liveConversationScenarios } from "../support/conversation-live-scenario
 
 const full = (patch = {}) => ({ ...standardDetails, ...patch });
 const turn = (reply: string, patch?: SandboxAgentTurn["patch"], action?: SandboxAgentTurn["action"]): SandboxAgentTurn => ({ reply, patch, action });
-const fixture = (id: string, customerMessages: string[], agentTurns: SandboxAgentTurn[], expected: ConversationScenario["expected"], agentTurnLimit = Math.min(8, Math.max(agentTurns.length, 1))): ConversationScenario => ({
+const fixture = (id: string, customerMessages: string[], agentTurns: SandboxAgentTurn[], expected: ConversationScenario["expected"], agentTurnLimit = Math.min(8, Math.max(customerMessages.length, 1))): ConversationScenario => ({
   id, customerMessages, agentTurns, agentTurnLimit, expected,
 });
 
@@ -35,9 +35,10 @@ const scenarios: ConversationScenario[] = [
     turn("Записал параметры квартиры и сразу посчитал стоимость.", { cleaningType: "standard", areaM2: 50, rooms: 2, bathrooms: 1, heavyPetHair: false, extras: [], addressOrDistrict: "Врачар" }, "quote"),
     turn("Да, базовая цена остаётся актуальной, пока параметры не изменятся."),
     turn("Исправляю площадь на 90 м² и пересчитываю сумму.", { areaM2: 90 }, "quote"),
-    turn("Дата через два дня записана. Могу подобрать время, когда будете готовы."),
-    // The explicit evening request and numeric selection are backend-owned
-    // scheduling steps; the post-booking acknowledgement is deterministic.
+    // A changed date invalidates the previous quote. The scripted deterministic
+    // stand-in mirrors the allowed terminal re-quote; the following evening
+    // question is then a typed semantic Calendar request.
+    turn("Дата через два дня записана, пересчитываю сумму.", { preferredDate: "2026-08-26" }, "quote"),
   ], { quote: true, calendarCreates: 1, slotOffer: true, replyLanguage: "ru", checkpoints: ["quote", "slots", "reservation"], evening90m2Slot: true }, 8),
   fixture("ru-conversational-availability", ["Хочу уборку квартиры.", "Обычная, 75 м², Врачар.", "Три комнаты.", "Один санузел.", "Без шерсти и допуслуг, 26 августа.", "А в середине дня есть?", "А вечером?", "2"], [
     turn("Конечно. Это обычная или генеральная уборка, и какая примерно площадь?"), turn("Сколько комнат и санузлов в квартире?", { cleaningType: "standard", areaM2: 75, addressOrDistrict: "Врачар" }), turn("Сколько санузлов в квартире?", { rooms: 3 }), turn("Осталось уточнить шерсть и дополнительные услуги.", { bathrooms: 1 }), turn("Сейчас посчитаю точную стоимость.", full({ addressOrDistrict: "Врачар" }), "quote"),
@@ -63,7 +64,7 @@ const scenarios: ConversationScenario[] = [
   fixture("sr-latn-da", ["Treba mi čišćenje za vikend.", "Da.", "Standardno 50 m2, jedna soba, jedno kupatilo, Dorćol, bez dodataka."], [turn("Sada mogu da zabeležim detalje za procenu.")], { quote: false, calendarCreates: 0, replyLanguage: "sr-Latn" }),
   fixture("identity", ["Ты человек?", "Хорошо, нужна обычная уборка 50 м².", "Одна комната, один санузел, Дорчол, без шерсти и допуслуг, 26 августа."], [turn("Я цифровой помощник Sherlock Cleaning, но помогу оформить уборку. Какая площадь и тип уборки нужны?"), turn("Для 50 м² сколько комнат и санузлов?", { cleaningType: "standard", areaM2: 50 }), turn("Сейчас посчитаю точную стоимость.", full({ areaM2: 50, rooms: 1, bathrooms: 1, addressOrDistrict: "Дорчол" }), "quote")], { quote: true, calendarCreates: 0, replyLanguage: "ru", checkpoints: ["quote"] }),
   fixture("off-topic", ["Какая сегодня погода?", "Ладно, мне нужна уборка 50 м².", "Обычная, одна комната, один санузел, Врачар, без шерсти и допуслуг, 26 августа."], [turn("Я помогаю с уборкой и бронированием. Какой тип уборки и какая примерно площадь вам нужны?"), turn("Для 50 м² это обычная или генеральная уборка?", { areaM2: 50 }), turn("Сейчас посчитаю стоимость.", full({ areaM2: 50, rooms: 1, bathrooms: 1, addressOrDistrict: "Врачар" }), "quote")], { quote: true, calendarCreates: 0, replyLanguage: "ru", checkpoints: ["quote"] }),
-  fixture("calendar-failure", ["Standard 75 m2, 3 rooms, one bathroom, no pet hair or extras, Vracar, 26 August.", "Please show available times.", "Can someone help find another date?"], [turn("I’ll calculate the estimate first.", full(), "quote"), turn("I can help check another date.")], { quote: true, calendarCreates: 0, replyLanguage: "en", checkpoints: ["quote"], calendarFullyBooked: true }),
+  fixture("calendar-transport-failure", ["Standard 75 m2, 3 rooms, one bathroom, no pet hair or extras, Vracar, 26 August.", "Please show available times.", "Can someone help find another date?"], [turn("I’ll calculate the estimate first.", full(), "quote"), turn("I am checking the live calendar now.", undefined, "slots"), turn("The team has the request and will check another date.")], { quote: true, humanNeeded: true, calendarCreates: 0, replyLanguage: "en", checkpoints: ["quote", "human_needed"], calendarTransportFails: true }),
   fixture("provider-tool-limit", ["Нужна уборка 75 м² в Врачаре.", "Обычная, три комнаты, один санузел, без шерсти и допуслуг, 26 августа.", "Хорошо."], [turn("Сохраню детали и передам заявку команде, чтобы она продолжила без риска ошибки.", { areaM2: 75, addressOrDistrict: "Врачар" }, "human"), turn("Добавлю остальные детали для команды.", full({ addressOrDistrict: "Врачар" })), turn("Команда продолжит с сохранёнными деталями.")], { humanNeeded: true, calendarCreates: 0, replyLanguage: "ru", checkpoints: ["human_needed"] }),
 ];
 
@@ -182,19 +183,101 @@ describe("conversation sandbox", () => {
     expect(artifact.messageEvidence[1]).toMatchObject({ quoteAmountRsd: 4_000, quoteState: "active", calendarCreates: 0, slotOfferCount: 0 });
     expect(artifact.messageEvidence[2]).toMatchObject({ quoteAmountRsd: 4_000, quoteState: "active", calendarCreates: 0, slotOfferCount: 0 });
     expect(artifact.messageEvidence[3]).toMatchObject({ quoteAmountRsd: 7_200, quoteState: "active", calendarCreates: 0, slotOfferCount: 0 });
-    expect(artifact.messageEvidence[4]).toMatchObject({ preferredDate: "2026-08-26", calendarCreates: 0, slotOfferCount: 0 });
-    expect(artifact.messageEvidence[5]).toMatchObject({ preferredDate: "2026-08-26", calendarCreates: 0, slotOfferCount: 1 });
-    expect(artifact.messageEvidence[6]).toMatchObject({ calendarCreates: 1, slotOfferCount: 1 });
-    expect(artifact.messageEvidence[7]).toMatchObject({ calendarCreates: 1, slotOfferCount: 1 });
-    expect(artifact.turns[4]?.allowedTools).toEqual(["update_client_data"]);
-    expect(artifact.messageEvidence[4]?.semanticTools).toEqual([]);
-    expect(artifact.messageEvidence[5]?.semanticTools).toEqual([]);
+    expect(artifact.messageEvidence[4]).toMatchObject({ preferredDate: "2026-08-26", calendarCreates: 0, calendarAvailabilityQueries: 2, slotOfferCount: 1, schedulingActions: [{ kind: "availability", dateReference: "exact_date", timePreference: "any", timePreferenceMode: "preserve", relation: "fresh" }] });
+    expect(artifact.messageEvidence[5]).toMatchObject({ preferredDate: "2026-08-26", calendarCreates: 0, calendarAvailabilityQueries: 4, slotOfferCount: 2, schedulingActions: [{ kind: "availability", dateReference: "current_preferred_date", timePreference: "evening", timePreferenceMode: "explicit", relation: "fresh" }] });
+    // Each semantic availability search reads Team A and Team B. Explicit
+    // selection then rechecks the selected team's token before Calendar create.
+    expect(artifact.messageEvidence[6]).toMatchObject({ calendarCreates: 1, calendarAvailabilityQueries: 5, slotOfferCount: 2 });
+    expect(artifact.messageEvidence[7]).toMatchObject({ calendarCreates: 1, calendarAvailabilityQueries: 5, slotOfferCount: 2 });
+    expect(artifact.turns[4]?.allowedTools).toContain("request_available_slots");
+    expect(artifact.messageEvidence[4]?.semanticTools).toEqual(["request_available_slots"]);
+    expect(artifact.messageEvidence[5]?.semanticTools).toEqual(["request_available_slots"]);
     expect(artifact.messageEvidence[6]?.semanticTools).toEqual([]);
     expect(artifact.messageEvidence[7]?.semanticTools).toEqual([]);
     expect(artifact.transcript[6]?.visibleText).toContain("26 августа");
     expect(artifact.transcript[6]?.visibleText).toContain("Команда А");
     expect(artifact.transcript[6]?.visibleText).toContain("7 200 RSD");
     expect(artifact.transcript[7]?.visibleText).toContain("уже зарезервировано");
+  });
+  it("requires the English 55 m² correction to replace the active quote before any booking flow", async () => {
+    const artifact = await runConversationScenario(scenarios.find((scenario) => scenario.id === "en-explore-correction-no-booking")!);
+    expect(artifact.messageEvidence[5]).toMatchObject({
+      quoteAmountRsd: 4_400,
+      quoteState: "active",
+      calendarCreates: 0,
+      slotOfferCount: 0,
+      semanticTools: expect.toSatisfy((tools: string[]) =>
+        JSON.stringify(tools) === JSON.stringify(["update_client_data", "calculate_quote"]) ||
+        JSON.stringify(tools) === JSON.stringify(["update_client_data", "record_scheduling_decision", "calculate_quote"])),
+    });
+    expect(artifact.transcript[5]?.visibleText).toContain("4,400 RSD");
+    expect(artifact.calendarCreates).toBe(0);
+    expect(artifact.slotOffer).toBe(false);
+  });
+  it("retains only safe, sorted active slot starts while replacing prior availability generations", async () => {
+    const laterSameDay = fixture("v33-later-same-day", [
+      "Standard 75 m2, three rooms, one bathroom, no pet hair or extras, Vracar, 26 August, evening.",
+      "Tomorrow.",
+      "Tomorrow any time.",
+      "None of those. Anything later on the same day?",
+    ], [turn("I’ll calculate the estimate.", full({ preferredDate: "2026-08-26", preferredTimeWindow: "evening" }), "quote")], {
+      quote: true, calendarCreates: 0, slotOffer: true, replyLanguage: "en",
+    }, 4);
+    const laterArtifact = await runConversationScenario(laterSameDay);
+    expect(laterArtifact.calendarCreates).toBe(0);
+    expect(laterArtifact.messageEvidence[3]).toMatchObject({
+      calendarAvailabilityQueries: 6,
+      schedulingActions: [{ kind: "availability", dateReference: "same_day_as_last_offer", timePreference: "any", timePreferenceMode: "preserve", relation: "later_than_last_offer" }],
+    });
+    expect(laterArtifact.messageEvidence[3]?.activeSlotStarts).toEqual([
+      "2026-08-25T07:00:00.000Z", "2026-08-25T07:00:00.000Z", "2026-08-25T07:30:00.000Z",
+    ]);
+    expect(laterArtifact.messageEvidence[3]?.activeSlotStarts).toEqual([...laterArtifact.messageEvidence[3]?.activeSlotStarts ?? []].sort());
+    expect(laterArtifact.messageEvidence[3]?.activeSlotStarts).not.toEqual(laterArtifact.messageEvidence[2]?.activeSlotStarts);
+    expect(laterArtifact.messageEvidence[3]?.activeSlotStarts?.every((start) => !laterArtifact.messageEvidence[2]?.activeSlotStarts?.includes(start))).toBe(true);
+
+    const afterHours = fixture("v33-after-hours", [
+      "Нужна обычная уборка 50 м², одна комната, один санузел, Врачар, без шерсти и допуслуг, сегодня.",
+      "Покажи свободные слоты сегодня.",
+      "А если на завтра?",
+      "А в этот же день после 19:00 есть?",
+    ], [turn("Посчитаю стоимость.", full({ areaM2: 50, rooms: 1, bathrooms: 1, addressOrDistrict: "Врачар", preferredDate: "2026-08-24" }), "quote")], {
+      quote: true, calendarCreates: 0, slotOffer: true, replyLanguage: "ru", now: "2026-08-24T19:42:00.000Z",
+    }, 4);
+    const afterArtifact = await runConversationScenario(afterHours);
+    expect(afterArtifact.calendarCreates).toBe(0);
+    expect(afterArtifact.messageEvidence[3]).toMatchObject({
+      calendarAvailabilityQueries: 6,
+      schedulingActions: [{ kind: "availability", dateReference: "same_day_as_last_offer", timePreference: "after", timePreferenceMode: "explicit", afterLocalTime: "19:00", relation: "fresh" }],
+    });
+    expect(afterArtifact.transcript[3]?.visibleText).toContain("В заданный промежуток в ближайшие две недели свободных слотов нет");
+    // An explicit after-19 bound cannot fit this job. Keep the previously
+    // offered generation selectable rather than silently substituting 17:30.
+    expect(afterArtifact.messageEvidence[3]?.activeSlotStarts).toEqual(afterArtifact.messageEvidence[2]?.activeSlotStarts);
+
+    const boundedRange = fixture("v33-bounded-range", [
+      "Standard 55 m2, one room, one bathroom, no pet hair or extras, Dorcol, 26 August.",
+      "What about between 10:00 and 16:00?",
+      "No booking yet.",
+    ], [turn("I’ll calculate the estimate.", full({ areaM2: 55, rooms: 1, bathrooms: 1, addressOrDistrict: "Dorcol", preferredDate: "2026-08-26" }), "quote")], {
+      quote: true, calendarCreates: 0, slotOffer: true, replyLanguage: "en",
+    }, 3);
+    const rangeArtifact = await runConversationScenario(boundedRange);
+    expect(rangeArtifact.calendarCreates).toBe(0);
+    expect(rangeArtifact.messageEvidence[1]).toMatchObject({
+      calendarAvailabilityQueries: 2,
+      schedulingActions: [{ kind: "availability", dateReference: "current_preferred_date", timePreference: "range", timePreferenceMode: "explicit", afterLocalTime: "10:00", beforeLocalTime: "16:00", relation: "fresh" }],
+    });
+    expect(rangeArtifact.messageEvidence[1]?.activeSlotStarts).toEqual([
+      "2026-08-26T08:00:00.000Z", "2026-08-26T08:00:00.000Z", "2026-08-26T08:30:00.000Z",
+    ]);
+    expect(rangeArtifact.messageEvidence[1]?.activeSlotStarts).toEqual([...rangeArtifact.messageEvidence[1]?.activeSlotStarts ?? []].sort());
+    for (const evidence of rangeArtifact.messageEvidence) {
+      expect(Object.keys(evidence).every((key) => [
+        "provenance", "customerMessageNumber", "customer", "semanticTools", "schedulingActions", "quoteAmountRsd", "quoteState", "preferredDate", "preferredTimeWindow", "humanNeeded", "humanNeededReason", "calendarCreates", "calendarAvailabilityQueries", "slotOfferCount", "activeSlotStarts", "lastAvailabilityAttempt",
+      ].includes(key))).toBe(true);
+      expect(JSON.stringify(evidence.activeSlotStarts ?? [])).not.toMatch(/(?:token|offer|provider|payload|calendar[_-]?id)/iu);
+    }
   });
   it("runs the typed scheduling-recovery matrix without losing quote facts or booking before final selection", async () => {
     const recovery = fixture("typed-recovery-matrix", [
@@ -209,7 +292,8 @@ describe("conversation sandbox", () => {
     ], { quote: true, slotOffer: true, calendarCreates: 1, replyLanguage: "ru", checkpoints: ["quote", "slots", "reservation"] });
     const artifact = await runConversationScenario(recovery);
 
-    expect(artifact.turns).toHaveLength(1);
+    expect(artifact.turns).toHaveLength(5);
+    expect(artifact.messageEvidence.slice(1, 5).every((evidence) => evidence.semanticTools.includes("request_available_slots"))).toBe(true);
     expect(artifact.lead.clientData).toMatchObject({
       cleaningType: "standard", areaM2: 75, rooms: 3, bathrooms: 1,
       heavyPetHair: false, extras: [], addressOrDistrict: "Врачар",
@@ -218,7 +302,7 @@ describe("conversation sandbox", () => {
     // New availability queries supersede old buttons, but none can create a
     // Calendar event until the customer explicitly selects the final option.
     expect(artifact.messageEvidence.slice(0, 5).map((evidence) => evidence.calendarCreates)).toEqual([0, 0, 0, 0, 0]);
-    expect(artifact.messageEvidence.slice(0, 5).map((evidence) => evidence.slotOfferCount)).toEqual([0, 1, 2, 3, 4]);
+    expect(artifact.messageEvidence.slice(0, 5).map((evidence) => evidence.slotOfferCount)).toEqual([0, 1, 2, 2, 3]);
     expect(artifact.messageEvidence[4]).toMatchObject({ preferredDate: "2026-08-27", calendarCreates: 0 });
     expect(artifact.messageEvidence[5]).toMatchObject({ calendarCreates: 1, preferredDate: "2026-08-27" });
 
@@ -274,6 +358,18 @@ describe("conversation sandbox", () => {
     const history = await runConversationScenario(scenarios.find((scenario) => scenario.id === "ru-conversational-availability")!);
     expect(history.turns[2]?.knownClientData).toMatchObject({ cleaningType: "standard", areaM2: 75, addressOrDistrict: "Врачар" });
     expect(history.turns[4]?.knownClientData).toMatchObject({ rooms: 3, bathrooms: 1 });
+    expect(history.messageEvidence[5]).toMatchObject({
+      semanticTools: ["request_available_slots"],
+      schedulingActions: [{ kind: "availability", dateReference: "current_preferred_date", timePreference: "midday", timePreferenceMode: "explicit", relation: "fresh" }],
+      calendarAvailabilityQueries: 2,
+      calendarCreates: 0,
+    });
+    expect(history.messageEvidence[6]).toMatchObject({
+      semanticTools: ["request_available_slots"],
+      schedulingActions: [{ kind: "availability", dateReference: "current_preferred_date", timePreference: "evening", timePreferenceMode: "explicit", relation: "fresh" }],
+      calendarAvailabilityQueries: 4,
+      calendarCreates: 0,
+    });
     const sameDay = await runConversationScenario(scenarios.find((scenario) => scenario.id === "same-day")!);
     expect(sameDay.lead.clientData).toMatchObject({ preferredDate: "2026-08-24", urgency: "same_day" });
     expect(hasSemanticTool(sameDay, "calculate_quote")).toBe(true);

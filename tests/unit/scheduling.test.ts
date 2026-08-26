@@ -196,23 +196,124 @@ describe("CalendarReservationService", () => {
     expect(calendar.creates).toHaveLength(0);
   });
 
-  it("ranks relaxed after-19 alternatives nearest to 19:00 from the same busy snapshot", async () => {
+  it("keeps a retained callback selectable after a read failure, but reject_now makes it stale", async () => {
+    const repository = new InMemoryLeadRepository();
+    const calendar = new FakeCalendarGateway();
+    const service = new CalendarReservationService(repository, calendar, engine, () => now);
+    const lead = await qualifiedLead(repository, 781);
+    const first = await service.offerSlots(lead, "en");
+    if (!first.ok) throw new Error(first.error);
+    const oldToken = first.slots[0]!.token;
+    const originalGetBusyIntervals = calendar.getBusyIntervals.bind(calendar);
+    calendar.getBusyIntervals = async () => { throw new Error("synthetic_calendar_read_failure"); };
+    await expect(service.offerSlots(lead, "en", { existingOfferDisposition: "retain_until_replacement" })).resolves.toMatchObject({ ok: false, error: "calendar_availability_failed" });
+    expect(await repository.getCalendarSlotToken({ leadId: lead.id, token: oldToken })).not.toHaveProperty("supersededAt");
+    calendar.getBusyIntervals = originalGetBusyIntervals;
+    await expect(service.reserveSlot(lead, oldToken)).resolves.toMatchObject({ ok: true, eventId: "fake-calendar-event-1" });
+
+    const rejectedLead = await qualifiedLead(repository, 782);
+    const rejectedOffer = await service.offerSlots(rejectedLead, "en");
+    if (!rejectedOffer.ok) throw new Error(rejectedOffer.error);
+    calendar.getBusyIntervals = async () => { throw new Error("synthetic_calendar_read_failure"); };
+    await expect(service.offerSlots(rejectedLead, "en", { existingOfferDisposition: "reject_now" })).resolves.toMatchObject({ ok: false, error: "calendar_availability_failed" });
+    expect(await repository.getCalendarSlotToken({ leadId: rejectedLead.id, token: rejectedOffer.slots[0]!.token })).toMatchObject({ supersededAt: expect.any(String) });
+    calendar.getBusyIntervals = originalGetBusyIntervals;
+    await expect(service.reserveSlot(rejectedLead, rejectedOffer.slots[0]!.token)).resolves.toMatchObject({ ok: false, error: "slot_offer_superseded" });
+    expect(calendar.creates).toHaveLength(1);
+  });
+
+  it("keeps explicit after-19 as a hard bound and returns no slots without creating an offer", async () => {
     const repository = new InMemoryLeadRepository();
     const calendar = new FakeCalendarGateway();
     const service = new CalendarReservationService(repository, calendar, engine, () => now);
     const lead = await qualifiedLead(repository, 79);
     lead.clientData = { ...lead.clientData, preferredTimeWindow: "evening" };
 
-    const offer = await service.offerSlots(lead, "en", { minimumLocalStartMinutes: 19 * 60, supersedeExisting: true });
-    if (!offer.ok) throw new Error(offer.error);
-    expect(offer.match).toBe("nearest_alternatives");
-    // A 4h clean + buffer cannot start at 19:00. The closest real option is
-    // 15:30 Belgrade (13:30Z), not an unrelated morning slot.
-    expect(offer.slots.map((slot) => slot.start)).toEqual([
-      "2026-08-24T13:30:00.000Z",
-      "2026-08-24T13:30:00.000Z",
-      "2026-08-25T13:30:00.000Z",
-    ]);
+    await expect(service.offerSlots(lead, "en", {
+      minimumLocalStartMinutes: 19 * 60,
+      existingOfferDisposition: "none",
+      singleOfferDate: true,
+    })).resolves.toEqual({ ok: false, error: "no_available_slots", availabilityReason: "requested_time_unavailable" });
+    expect(await repository.listActiveCalendarSlotTokens({ leadId: lead.id, now: now.toISOString() })).toEqual([]);
+    expect(calendar.availabilityQueries).toHaveLength(2);
+  });
+
+  it("retains a prior callback for an unmet hard bound, while reject_now makes it stale", async () => {
+    const repository = new InMemoryLeadRepository();
+    const calendar = new FakeCalendarGateway();
+    const service = new CalendarReservationService(repository, calendar, engine, () => now);
+    const retainedLead = await qualifiedLead(repository, 792);
+    const retainedOffer = await service.offerSlots(retainedLead, "en");
+    if (!retainedOffer.ok) throw new Error(retainedOffer.error);
+    const retainedToken = retainedOffer.slots[0]!.token;
+    await expect(service.offerSlots(retainedLead, "en", {
+      minimumLocalStartMinutes: 19 * 60,
+      existingOfferDisposition: "retain_until_replacement",
+      singleOfferDate: true,
+    })).resolves.toEqual({ ok: false, error: "no_available_slots", availabilityReason: "requested_time_unavailable" });
+    expect(await repository.getCalendarSlotToken({ leadId: retainedLead.id, token: retainedToken })).not.toHaveProperty("supersededAt");
+    await expect(service.reserveSlot(retainedLead, retainedToken)).resolves.toMatchObject({ ok: true });
+
+    const rejectedLead = await qualifiedLead(repository, 793);
+    const rejectedOffer = await service.offerSlots(rejectedLead, "en");
+    if (!rejectedOffer.ok) throw new Error(rejectedOffer.error);
+    const rejectedToken = rejectedOffer.slots[0]!.token;
+    await expect(service.offerSlots(rejectedLead, "en", {
+      minimumLocalStartMinutes: 19 * 60,
+      existingOfferDisposition: "reject_now",
+      singleOfferDate: true,
+    })).resolves.toEqual({ ok: false, error: "no_available_slots", availabilityReason: "requested_time_unavailable" });
+    expect(await repository.getCalendarSlotToken({ leadId: rejectedLead.id, token: rejectedToken })).toMatchObject({ supersededAt: expect.any(String) });
+    await expect(service.reserveSlot(rejectedLead, rejectedToken)).resolves.toMatchObject({ ok: false, error: "slot_offer_superseded" });
+    expect(calendar.creates).toHaveLength(1);
+  });
+
+  it("keeps explicit before and range bounds when searching a later compliant day", async () => {
+    const repository = new InMemoryLeadRepository();
+    const calendar = new FakeCalendarGateway();
+    const service = new CalendarReservationService(repository, calendar, engine, () => now);
+    const lead = await qualifiedLead(repository, 790);
+    // Both teams are unavailable on the requested day, so the bounded
+    // 14-day search must move only to a future day that still meets `before`.
+    const requestedDayBusy = [{ start: "2026-08-24T06:00:00.000Z", end: "2026-08-24T18:00:00.000Z" }];
+    calendar.busyByTeam = { team_a: requestedDayBusy, team_b: requestedDayBusy };
+    const before = await service.offerSlots(lead, "en", {
+      maximumLocalStartMinutes: 12 * 60,
+      existingOfferDisposition: "none",
+      singleOfferDate: true,
+    });
+    if (!before.ok) throw new Error(before.error);
+    expect(before.match).toBe("nearest_alternatives");
+    expect(before.slots.every((slot) => slot.start.startsWith("2026-08-25T") && new Date(slot.start).getUTCHours() < 10)).toBe(true);
+
+    const rangeLead = await qualifiedLead(repository, 791);
+    const range = await service.offerSlots(rangeLead, "en", {
+      minimumLocalStartMinutes: 10 * 60,
+      maximumLocalStartMinutes: 16 * 60,
+      existingOfferDisposition: "none",
+      singleOfferDate: true,
+    });
+    if (!range.ok) throw new Error(range.error);
+    expect(range.slots.every((slot) => {
+      const localHour = new Date(slot.start).getUTCHours() + 2;
+      return localHour >= 10 && localHour <= 16;
+    })).toBe(true);
+  });
+
+  it("returns typed requested-time no-slots for an exhausted before-only bound without an offer write", async () => {
+    const repository = new InMemoryLeadRepository();
+    const calendar = new FakeCalendarGateway();
+    const service = new CalendarReservationService(repository, calendar, engine, () => now);
+    const lead = await qualifiedLead(repository, 794);
+    const allHorizonBusy = [{ start: "2026-08-24T06:00:00.000Z", end: "2026-09-08T18:00:00.000Z" }];
+    calendar.busyByTeam = { team_a: allHorizonBusy, team_b: allHorizonBusy };
+
+    await expect(service.offerSlots(lead, "en", {
+      maximumLocalStartMinutes: 12 * 60,
+      existingOfferDisposition: "none",
+      singleOfferDate: true,
+    })).resolves.toEqual({ ok: false, error: "no_available_slots", availabilityReason: "requested_time_unavailable" });
+    expect(await repository.listActiveCalendarSlotTokens({ leadId: lead.id, now: now.toISOString() })).toEqual([]);
     expect(calendar.availabilityQueries).toHaveLength(2);
   });
 

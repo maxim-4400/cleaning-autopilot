@@ -1,17 +1,20 @@
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
 
-import { AgentTurnTechnicalError, type AgentGateway } from "@/lib/agent/gateway";
+import { AgentTurnTechnicalError, schedulingAvailabilityIntentSchema, type AgentGateway, type SchedulingAvailabilityIntent, type SchedulingSnapshot } from "@/lib/agent/gateway";
 import { CalendarReservationService } from "@/lib/calendar/reservation-service";
-import type { SlotOfferOptions } from "@/lib/calendar/reservation-service";
-import { clientDataPatchSchema, humanNeededReasons, type AgentToolName, type AgentTurn, type AvailabilitySlot, type ClientData, type HumanNeededReason, type PricingRules, type Quote } from "@/lib/contracts/domain";
-import type { LeadRepository, StoredAgentConfig, StoredCalendarSlotToken, StoredLead } from "@/lib/leads/repository";
+import type { AvailabilityResolution, DeferredSlotOffer, SlotOfferOptions } from "@/lib/calendar/reservation-service";
+import { clientDataPatchSchema, humanNeededReasons, type AgentToolName, type AgentTurn, type AvailabilitySlot, type ClientData, type CurrentTurnDateCoordinate, type HumanNeededReason, type PricingRules, type Quote } from "@/lib/contracts/domain";
+import type { LeadRepository, StoredAgentConfig, StoredAvailabilityAttempt, StoredCalendarSlotToken, StoredLead } from "@/lib/leads/repository";
 import { calculatePricingDecision } from "@/lib/pricing/engine";
 import { getEffectiveAgentConfig } from "@/lib/runtime-config/effective-agent-config";
 import { TelegramDeliveryError, type TelegramGateway, type TelegramReplyMarkup } from "@/lib/telegram/gateway";
 import {
   renderAgentReply,
+  renderAvailabilityDateRequiredReply,
+  renderAvailabilityRequestUnavailableReply,
   renderCalendarAvailabilityFailedReply,
+  renderRetainedOfferRefreshFailedReply,
   renderCalendarReservationFailedReply,
   renderHumanNeededReply,
   renderHumanNeededAlreadyHandedOffReply,
@@ -20,6 +23,7 @@ import {
   renderSchedulingConsentNeedsDateReply,
   renderNewAddressDivider,
   renderNoAvailabilityReply,
+  renderRetainedOfferConstraintUnavailableReply,
   renderNearestSlotAlternativesReply,
   renderQuoteReply,
   renderReservationPendingReply,
@@ -65,6 +69,7 @@ const updateClientDataSchema = z.object({
     extras: z.unknown().optional(),
     addressOrDistrict: z.unknown().optional(),
     preferredDate: z.unknown().optional(),
+    preferredTimeWindow: z.unknown().optional(),
     urgency: z.unknown().optional(),
   }).strict(),
 }).strict();
@@ -74,6 +79,30 @@ const newAddressKeyboard: TelegramReplyMarkup = {
   resize_keyboard: true,
   is_persistent: true,
 };
+
+const requestAvailableSlotsSchema = z.object({ intent: schedulingAvailabilityIntentSchema }).strict();
+const schedulingDecisionSchema = z.object({
+  reason: z.enum([
+    "question_not_about_scheduling",
+    "date_or_time_preference_missing",
+    "awaiting_customer_choice",
+    "already_reserved",
+    "human_review_in_progress",
+  ]),
+}).strict();
+
+/**
+ * The model turn has produced a private offer, but the durable delivery
+ * boundary could not be completed. It is a Calendar-operation handoff, not a
+ * malformed Telegram update or an opaque processing error.
+ */
+class DeferredSlotOfferBoundaryError extends Error {
+  constructor(
+    readonly code: "calendar_slot_offer_persist_failed" | "agent_turn_operation_complete_failed" | "calendar_slot_offer_compensation_failed",
+  ) {
+    super(code);
+  }
+}
 
 export type Stage2Dependencies = {
   repository: LeadRepository;
@@ -270,7 +299,7 @@ export async function processTelegramWebhook(
       clearPendingSchedulingConsent(lead);
       await dependencies.repository.saveLead(lead);
       const reply = lead.clientData.preferredDate && dependencies.calendarReservation && isEligibleForSlotReservation(lead)
-        ? await renderAvailabilityOffer({ lead, replyLanguage, dependencies, calendarReservation: dependencies.calendarReservation, options: { supersedeExisting: true } })
+        ? await renderAvailabilityOffer({ lead, replyLanguage, dependencies, calendarReservation: dependencies.calendarReservation, pricingRules: config.pricingRules, now, options: { supersedeExisting: true } })
         : renderSchedulingConsentNeedsDateReply(replyLanguage);
       const delivered = await deliverReply({ updateId: update.update_id, lead, reply, dependencies });
       if (delivered !== "succeeded") {
@@ -285,8 +314,12 @@ export async function processTelegramWebhook(
     // established cleaning context, a short follow-up such as "tomorrow" is
     // still a valid date answer.
     const dateContext = hasCleaningOrSchedulingContext(messageText, lead);
+    const hadActiveQualifiedQuoteBeforeDate = hasActiveQualifiedQuote(lead);
     const weekendDate = dateContext ? weekendProposalDate(messageText, now) : undefined;
     const resolvedDateCandidate = resolveRelativePreferredDate(messageText, now);
+    const currentTurnDateCoordinate = (dateContext || hasStandaloneSchedulingDateIntent(messageText)) && !isIncidentalTimeQuestion(messageText)
+      ? resolveCurrentTurnDateCoordinate(messageText, now)
+      : undefined;
     const relativePreferredDate = (dateContext || hasStandaloneSchedulingDateIntent(messageText)) && !isIncidentalTimeQuestion(messageText)
       ? resolvedDateCandidate
       : undefined;
@@ -304,10 +337,26 @@ export async function processTelegramWebhook(
       await dependencies.repository.appendActivity(lead.id, "handoff_location_recorded", { district: knownHandoffDistrict });
     }
     const requestedTimeWindow = resolveTimeWindow(messageText);
-    if (requestedTimeWindow && lead.clientData.preferredTimeWindow !== requestedTimeWindow) {
+    // Before a quote exists this is a harmless intake fact. Once there is an
+    // active quote, scheduling language must be interpreted by the agent and
+    // recorded through its typed semantic tool instead of this convenience
+    // parser becoming a second routing authority.
+    if (requestedTimeWindow && !hadActiveQualifiedQuoteBeforeDate && lead.clientData.preferredTimeWindow !== requestedTimeWindow) {
       lead.clientData = { ...lead.clientData, preferredTimeWindow: requestedTimeWindow };
       await dependencies.repository.saveLead(lead);
       await dependencies.repository.appendActivity(lead.id, "time_window_requested", { window: requestedTimeWindow });
+    }
+    // The reply in this turn may be generated by the model, but this narrow
+    // factual answer is not. Once the normal intake has reached its explicit
+    // pet-hair question, a customer saying that a shedding pet is at home is
+    // enough to record the surcharge input before the model can miss it.
+    const backendPetHairAnswer = resolveActivePetHairAnswer(messageText, lead.clientData);
+    if (backendPetHairAnswer !== undefined) {
+      const nextClientData = mergeClientData(lead.clientData, { heavyPetHair: backendPetHairAnswer }, now);
+      if (pricingInputsChanged(lead.clientData, nextClientData)) supersedeQuote(lead, now);
+      lead.clientData = nextClientData;
+      await dependencies.repository.saveLead(lead);
+      await dependencies.repository.appendActivity(lead.id, "pet_hair_recorded", { heavy_pet_hair: backendPetHairAnswer });
     }
     const hasActiveDateProposal = Boolean(lead.pendingPreferredDate && lead.dateProposalExpiresAt && new Date(lead.dateProposalExpiresAt).getTime() > now.getTime());
     if (hasActiveDateProposal && prefersSunday(messageText)) {
@@ -336,7 +385,7 @@ export async function processTelegramWebhook(
       // backend object. A bare "да" can only take this path, never infer an
       // availability promise from model prose or a Conversation id.
       const offerReply = dependencies.calendarReservation && isEligibleForSlotReservation(lead)
-        ? await renderAvailabilityOffer({ lead, replyLanguage, dependencies, calendarReservation: dependencies.calendarReservation, options: { supersedeExisting: true } })
+        ? await renderAvailabilityOffer({ lead, replyLanguage, dependencies, calendarReservation: dependencies.calendarReservation, pricingRules: config.pricingRules, now, options: { supersedeExisting: true } })
         : undefined;
       const delivered = await deliverReply({
         updateId: update.update_id,
@@ -348,7 +397,12 @@ export async function processTelegramWebhook(
       await dependencies.repository.markTelegramUpdateProcessed(update.update_id);
       return { kind: "processed" };
     }
-    if (relativePreferredDate) {
+    // An already quoted customer may be asking to *check* a relative date.
+    // Keep the deterministic parser as a date-format guard for intake, but
+    // let the state-scoped agent choose the canonical availability intent so
+    // it can immediately query real calendars rather than silently reciting
+    // a re-priced quote.
+    if (relativePreferredDate && !hadActiveQualifiedQuoteBeforeDate) {
       const nextClientData = mergeClientData(lead.clientData, { preferredDate: relativePreferredDate }, now);
       if (lead.clientData.preferredDate !== relativePreferredDate && pricingInputsChanged(lead.clientData, nextClientData)) supersedeQuote(lead, now);
       lead.clientData = nextClientData;
@@ -381,44 +435,27 @@ export async function processTelegramWebhook(
     }
     config = await getEffectiveAgentConfig(config);
 
-    // Availability is a backend-owned scheduling intent. Keep an unambiguous,
-    // qualified availability-only request out of the OpenAI and Trello paths:
-    // neither provider is needed to calculate the next offered slots.
-    let scheduleRecovery = dependencies.calendarReservation && isEligibleForSlotReservation(lead)
-      ? await resolveScheduleRecoveryRequest({ message: messageText, lead, now, repository: dependencies.repository })
-      : undefined;
-    if (scheduleRecovery?.clientDataChanged) {
-      if (pricingInputsChanged(lead.clientData, scheduleRecovery.clientData)) {
-        // A same-day request can become a later date (or the reverse), which
-        // changes the deterministic price. Never offer a slot against that
-        // stale quote; the normal quote path will show the new amount first.
-        supersedeQuote(lead, now);
-      }
-      lead.clientData = scheduleRecovery.clientData;
-      clearDateProposal(lead);
-      await dependencies.repository.saveLead(lead);
-      await dependencies.repository.appendActivity(lead.id, "schedule_recovery_requested", { preferred_date: lead.clientData.preferredDate, preferred_window: lead.clientData.preferredTimeWindow, kind: scheduleRecovery.kind });
-      if (!isEligibleForSlotReservation(lead)) scheduleRecovery = undefined;
-    }
-    const strictSchedulingIntent = Boolean(scheduleRecovery) || isStrictTimeWindowRequest(messageText) || isStrictAvailabilityRequest(messageText);
-    const explicitSchedulingIntent = strictSchedulingIntent || hasExplicitSchedulingIntent(messageText);
-    if (strictSchedulingIntent && dependencies.calendarReservation && isEligibleForSlotReservation(lead) && !lead.calendarEventId) {
-      const response = await renderAvailabilityOffer({ lead, replyLanguage, dependencies, calendarReservation: dependencies.calendarReservation, options: scheduleRecovery?.offerOptions });
-      const delivered = await deliverReply({ updateId: update.update_id, lead, reply: response, dependencies });
-      if (delivered !== "succeeded") { await dependencies.repository.markTelegramUpdateFailed(update.update_id, "telegram_delivery_failed"); return { kind: "failed", failureCode: "telegram_delivery_failed" }; }
-      await dependencies.repository.markTelegramUpdateProcessed(update.update_id);
-      return { kind: "processed" };
-    }
+    // Natural-language scheduling stays inside the one state-scoped agent.
+    // Callback choices and the one-turn bare quote consent above are still
+    // deterministic transport boundaries. All other availability requests,
+    // changed dates and changed time preferences must become a typed semantic
+    // tool decision below rather than matching an ever-growing phrase list.
 
     let conversation = await dependencies.repository.getConversation(lead.id);
     if (!conversation) {
       // Each invalidated provider Conversation gets one new, durable creation
-      // operation. Reusing the original succeeded idempotency key would put
-      // the poisoned external id straight back into the next Runner turn.
+      // operation. A terminal availability function call has no provider
+      // closure message to make its function-output context safe to reuse, so
+      // reusing the original succeeded idempotency key would put that protocol
+      // state straight back into the next Runner turn.
       const recoveryOperation = await dependencies.repository.getIntegrationOperation(`openai:conversation_recovery:${lead.id}`);
+      const initialConversationKey = `openai:conversation:${lead.id}:initial`;
+      const initialConversationOperation = await dependencies.repository.getIntegrationOperation(initialConversationKey);
       const idempotencyKey = recoveryOperation?.status === "succeeded"
         ? `openai:conversation:${lead.id}:recovery:${update.update_id}`
-        : `openai:conversation:${lead.id}:initial`;
+        : initialConversationOperation?.status === "succeeded"
+        ? `openai:conversation:${lead.id}:reset:${update.update_id}`
+        : initialConversationKey;
       const operation = await dependencies.repository.createIntegrationOperation({
         leadId: lead.id,
         idempotencyKey,
@@ -470,20 +507,27 @@ export async function processTelegramWebhook(
     // open Calendar availability. The customer must see the quote first and
     // later make an explicit scheduling request. This protects the sequence
     // even if a model tries to call both tools in one turn.
-    const hadActiveQuoteBeforeTurn = isEligibleForSlotReservation(lead);
+    // QUOTED includes a date-less estimate. The agent must still make an
+    // explicit semantic scheduling decision when the customer asks about
+    // availability, because it can resolve a date such as “today” through
+    // request_available_slots. Requiring a pre-existing date here recreated
+    // the old dead-end where a compact time question never reached Calendar.
+    const hadActiveQuoteBeforeTurn = hasActiveQualifiedQuote(lead);
     const wasHumanNeededBeforeTurn = lead.humanNeeded;
-    // Supplying a date after an already active base quote changes scheduling
-    // readiness, not the price or booking state. Let the model save an
-    // additional valid fact if needed, but keep quote/availability/handoff
-    // tools out of this date-only turn.
-    const isDateOnlyQuoteFollowup = hadActiveQuoteBeforeTurn && Boolean(relativePreferredDate) && !explicitSchedulingIntent;
+    const schedulingDecisionRequired = hadActiveQuoteBeforeTurn && !lead.calendarEventId;
     const allowedTools: AgentToolName[] = wasHumanNeededBeforeTurn
       ? hasHandoffFollowupFact(messageText, relativePreferredDate)
         ? ["update_client_data"]
         : []
-      : isDateOnlyQuoteFollowup
-      ? ["update_client_data"]
-      : ["update_client_data", "mark_human_needed", "calculate_quote", ...(hadActiveQuoteBeforeTurn && explicitSchedulingIntent && !lead.calendarEventId ? ["request_available_slots" as const] : [])];
+      : schedulingDecisionRequired
+      ? ["update_client_data", "mark_human_needed", "calculate_quote", "request_available_slots", "record_scheduling_decision"]
+      : ["update_client_data", "mark_human_needed", "calculate_quote"];
+    const schedulingSnapshot = await buildSchedulingSnapshot({
+      lead,
+      now,
+      repository: dependencies.repository,
+      currentTurnDateCoordinate,
+    });
     // A provider error can occur after a semantic tool has returned. Restore
     // this exact snapshot before persisting recovery so partial quote/lifecycle
     // or Human Needed mutations never become a later customer fact.
@@ -491,14 +535,40 @@ export async function processTelegramWebhook(
     let quote: Quote | undefined;
     let humanNeededReason: HumanNeededReason | undefined;
     let updateClientDataCalls = 0;
+    // In a quoted/offered turn a pricing-input patch immediately supersedes
+    // the durable quote. Do not allow a later reset/deferred-offer boundary to
+    // make that mutated state durable unless this same turn has produced a new
+    // backend quote or a completed Human Needed result.
+    let pricingInputChangedInSchedulingTurn = false;
     // Customer-facing Human Needed copy may claim a specific detail was saved
     // only after this turn has proved a persisted data change. A raw message
     // by itself is not such proof.
     let persistedHandoffFact = wasHumanNeededBeforeTurn && (backendHandoffLocationPersisted || (Boolean(relativePreferredDate) && lead.clientData.preferredDate === relativePreferredDate));
     let calendarFailure = false;
+    // A Calendar-read transport fault can be reported honestly while a prior
+    // customer-visible offer remains selectable.  It is deliberately not a
+    // Human Needed lifecycle transition: that transition would invalidate the
+    // retained callbacks we have just promised to keep.
+    let calendarRetainedOfferFailure = false;
+    let calendarRetainedOfferConstraintUnavailable = false;
+    let calendarRetainedOfferConstraintKind: "after" | "before" | "range" | undefined;
     let noAvailableSlots = false;
     let noAvailableSlotsReason: "nonworking_day" | "requested_date_unavailable" | "requested_time_unavailable" | undefined;
     let offeredSlots: AvailabilitySlot[] | undefined;
+    let deferredSlotOffer: DeferredSlotOffer | undefined;
+    let deferredAvailabilityAttempt: {
+      intent: SchedulingAvailabilityIntent;
+      candidateDate: string;
+      result: Extract<StoredAvailabilityAttempt["result"], "exact_offer" | "fallback_offer">;
+    } | undefined;
+    let offeredSlotsAreNearestAlternatives = false;
+    let offeredSlotsAvailabilityReason: "requested_date_unavailable" | "requested_time_unavailable" | "nonworking_day" | undefined;
+    /**
+     * A terminal availability tool result cannot use SDK finalOutput: it is
+     * serialized tool JSON. Keep only a safe backend-owned outcome for the
+     * deterministic renderer below.
+     */
+    let availabilityTerminalFailure: "date_required" | "validation" | "business_refusal" | undefined;
     await sendTyping(dependencies.telegram, lead.telegramChatId);
     const agentTurnOperation = await dependencies.repository.createIntegrationOperation({
       leadId: lead.id,
@@ -524,6 +594,8 @@ export async function processTelegramWebhook(
       knownClientData: lead.clientData,
       pricingRules: config.pricingRules,
       allowedTools,
+      schedulingDecisionRequired,
+      schedulingSnapshot,
       executeTool: async (name, argumentsJson) => {
         if (quoteCalculatedThisTurn) {
           return { ok: false, error: "quote_is_terminal_for_customer_turn" };
@@ -536,14 +608,48 @@ export async function processTelegramWebhook(
           if (!updateData.success) return { ok: false, error: "invalid_client_data_patch" };
           const patch = clientDataPatchSchema.safeParse(normalizeCustomerDatePatch(updateData.data.patch, now));
           if (!patch.success) return { ok: false, error: "invalid_client_data_patch" };
+          // QUOTED/OFFERED date and time language is not ordinary client-data
+          // intake.  It is a scheduling request whose only authority is the
+          // typed availability tool, otherwise a model can silently re-quote
+          // and never read the real calendars.  Keep unrelated price facts in
+          // the same patch, but isolate these two fields from the mutation.
+          const schedulingPatchRequested = schedulingDecisionRequired && (
+            Object.hasOwn(patch.data, "preferredDate") || Object.hasOwn(patch.data, "preferredTimeWindow")
+          );
+          const patchWithoutSchedulingPreference = schedulingPatchRequested
+            ? (() => {
+                const isolated = { ...patch.data };
+                delete isolated.preferredDate;
+                delete isolated.preferredTimeWindow;
+                return isolated;
+              })()
+            : patch.data;
           const previousClientData = lead.clientData;
-          const nextClientData = mergeClientData(lead.clientData, patch.data, now);
-          if (pricingInputsChanged(lead.clientData, nextClientData)) supersedeQuote(lead, now);
+          // A backend-confirmed answer from this exact customer message is
+          // immutable for this turn. The model still receives the resulting
+          // full data projection, but cannot overwrite the deterministic fact.
+          const modelPatch = backendPetHairAnswer === undefined
+            ? patchWithoutSchedulingPreference
+            : (() => {
+                const withoutPetHair = { ...patchWithoutSchedulingPreference };
+                delete withoutPetHair.heavyPetHair;
+                return withoutPetHair;
+              })();
+          const nextClientData = mergeClientData(lead.clientData, modelPatch, now);
+          const pricingChanged = pricingInputsChanged(lead.clientData, nextClientData);
+          if (pricingChanged) {
+            supersedeQuote(lead, now);
+            if (schedulingDecisionRequired) pricingInputChangedInSchedulingTurn = true;
+          }
           lead.clientData = nextClientData;
           if (wasHumanNeededBeforeTurn && JSON.stringify(previousClientData) !== JSON.stringify(nextClientData)) {
             persistedHandoffFact = true;
           }
-          return { ok: true, client_data: lead.clientData };
+          return {
+            ok: true,
+            client_data: lead.clientData,
+            ...(schedulingPatchRequested ? { scheduling_preference_requires_availability_tool: true } : {}),
+          };
         }
 
         if (name === "mark_human_needed") {
@@ -554,39 +660,188 @@ export async function processTelegramWebhook(
         }
 
         if (name === "request_available_slots") {
-          if (!dependencies.calendarReservation) return { ok: false, error: "calendar_not_configured" };
-          if (!hadActiveQuoteBeforeTurn || !explicitSchedulingIntent || lead.calendarEventId) {
-            return { ok: false, error: "availability_requires_prior_active_quote_and_explicit_scheduling_intent" };
+          if (!dependencies.calendarReservation) {
+            humanNeededReason = "calendar_unavailable";
+            calendarFailure = true;
+            await dependencies.repository.appendActivity(lead.id, "calendar_availability_failed", { error_code: "calendar_not_configured" });
+            return { ok: false, error: "calendar_not_configured" };
           }
-          const result = await dependencies.calendarReservation.offerSlots(lead, replyLanguage);
+          if (!hadActiveQuoteBeforeTurn || lead.calendarEventId || lead.quoteValidity !== "active") {
+            availabilityTerminalFailure = "business_refusal";
+            return { ok: false, error: "availability_requires_prior_active_quote" };
+          }
+          const parsedIntent = requestAvailableSlotsSchema.safeParse(argumentsJson);
+          if (!parsedIntent.success) {
+            availabilityTerminalFailure = "validation";
+            return { ok: false, error: "invalid_availability_intent" };
+          }
+          if (!availabilityIntentMatchesCurrentTurnCoordinate(parsedIntent.data.intent, schedulingSnapshot)) {
+            const missingDate = parsedIntent.data.intent.dateReference === "current_preferred_date" &&
+              !schedulingSnapshot.preferredDate && !schedulingSnapshot.currentTurnDateCoordinate;
+            availabilityTerminalFailure = missingDate ? "date_required" : "validation";
+            return { ok: false, error: missingDate ? "availability_date_required" : "availability_date_coordinate_mismatch" };
+          }
+          const resolved = await resolveSemanticAvailabilityIntent({
+            intent: parsedIntent.data.intent,
+            lead,
+            now,
+            repository: dependencies.repository,
+          });
+          if (!resolved.ok) {
+            availabilityTerminalFailure = resolved.error === "availability_date_required" ? "date_required" : "validation";
+            return { ok: false, error: resolved.error };
+          }
+          let availabilityQuote: Quote | undefined;
+          const result = await dependencies.calendarReservation.offerSlots(resolved.candidateLead, replyLanguage, {
+            ...resolved.offerOptions,
+            // A live provider can fail after this semantic tool has returned
+            // but before it produces final prose. Keep tokens private until
+            // that final model boundary succeeds; direct backend paths still
+            // commit immediately through renderAvailabilityOffer.
+            deferTokenPersistence: true,
+            onAvailabilityResolved: async (resolution) => {
+              // No result means no authoritative scheduling mutation. On a
+              // non-empty result this completes the candidate before the
+              // reservation service derives the deferred-token fingerprint.
+              if (resolution.slots.length === 0) return;
+              availabilityQuote = await commitAvailabilityCandidateOffer({
+                lead,
+                candidateLead: resolved.candidateLead,
+                persistedLeadBeforeTurn,
+                resolution,
+                now,
+                pricingRules: config.pricingRules,
+                repository: dependencies.repository,
+              });
+              if (availabilityQuote) quote = availabilityQuote;
+            },
+          });
+          const retainsExistingOffer = resolved.offerOptions.existingOfferDisposition === "retain_until_replacement";
           if (!result.ok && (
-            result.error === "duration_exceeds_workday" ||
             result.error === "calendar_availability_failed" ||
             result.error === "calendar_slot_offer_persist_failed"
           )) {
-            humanNeededReason = "calendar_unavailable";
-            calendarFailure = true;
-            await dependencies.repository.appendActivity(lead.id, "calendar_availability_failed", { error_code: result.error });
+            if (result.error === "calendar_availability_failed" && retainsExistingOffer) {
+              calendarRetainedOfferFailure = true;
+              await dependencies.repository.appendActivity(lead.id, "calendar_availability_failed", {
+                error_code: result.error,
+                retained_offer: true,
+              });
+            } else {
+              humanNeededReason = "calendar_unavailable";
+              calendarFailure = true;
+              await dependencies.repository.appendActivity(lead.id, "calendar_availability_failed", { error_code: result.error });
+            }
+          }
+          if (!result.ok && result.error === "duration_exceeds_workday") {
+            humanNeededReason = "duration_exceeds_workday";
+            await dependencies.repository.appendActivity(lead.id, "duration_exceeds_workday");
           }
           if (!result.ok) {
+            const attemptResult: StoredAvailabilityAttempt["result"] = result.error === "no_available_slots" ? "no_slots" : "failure";
+            // An unavailable or technical result becomes durable evidence but
+            // never commits the candidate scheduling coordinate. This write is
+            // required: silently losing it would make the next stateless turn
+            // reason from an invented offer history.
+            await recordAvailabilityAttemptRequired({
+              repository: dependencies.repository,
+              leadId: lead.id,
+              intent: parsedIntent.data.intent,
+              candidateDate: resolved.candidateDate,
+              result: attemptResult,
+              now,
+            });
             if (result.error === "no_available_slots") {
               noAvailableSlots = true;
               noAvailableSlotsReason = result.availabilityReason;
+              calendarRetainedOfferConstraintUnavailable = retainsExistingOffer &&
+                result.availabilityReason === "requested_time_unavailable";
+              calendarRetainedOfferConstraintKind = calendarRetainedOfferConstraintUnavailable &&
+                (parsedIntent.data.intent.timePreference === "after" ||
+                  parsedIntent.data.intent.timePreference === "before" ||
+                  parsedIntent.data.intent.timePreference === "range")
+                ? parsedIntent.data.intent.timePreference
+                : undefined;
               await dependencies.repository.appendActivity(lead.id, "calendar_no_availability", { error_code: result.error });
+            } else if (!calendarFailure && !calendarRetainedOfferFailure && result.error !== "duration_exceeds_workday") {
+              availabilityTerminalFailure = result.error === "preferred_date_required" ? "date_required" : "business_refusal";
+            }
+            // Keep a typed, bounded explanation available to the Agent audit
+            // surface. It reports only the deterministic constraint that
+            // failed and the two consented ways to broaden it; it never
+            // converts an explicit after/before/range request into a hidden
+            // backend fallback.
+            if (result.error === "no_available_slots" && result.availabilityReason === "requested_time_unavailable") {
+              const hardTimeConstraint = parsedIntent.data.intent.timePreference === "after"
+                ? { kind: "after" as const, afterLocalTime: parsedIntent.data.intent.afterLocalTime }
+                : parsedIntent.data.intent.timePreference === "before"
+                ? { kind: "before" as const, beforeLocalTime: parsedIntent.data.intent.beforeLocalTime }
+                : parsedIntent.data.intent.timePreference === "range"
+                ? {
+                    kind: "range" as const,
+                    afterLocalTime: parsedIntent.data.intent.afterLocalTime,
+                    beforeLocalTime: parsedIntent.data.intent.beforeLocalTime,
+                  }
+                : undefined;
+              const allowedNextUserConsentPaths = hardTimeConstraint?.kind === "after"
+                ? ["earlier_time", "different_date"] as const
+                : hardTimeConstraint?.kind === "before"
+                ? ["later_time", "different_date"] as const
+                : hardTimeConstraint?.kind === "range"
+                ? ["outside_requested_range", "different_date"] as const
+                : ["different_time", "different_date"] as const;
+              return {
+                ok: false,
+                error: result.error,
+                availabilityReason: result.availabilityReason,
+                existingOfferDisposition: resolved.offerOptions.existingOfferDisposition,
+                ...(hardTimeConstraint ? { hardTimeConstraint } : {}),
+                allowedNextUserConsentPaths,
+              };
             }
             return { ok: false, error: result.error };
           }
           offeredSlots = result.slots;
+          deferredSlotOffer = result.deferredOffer;
+          offeredSlotsAreNearestAlternatives = result.match === "nearest_alternatives";
+          offeredSlotsAvailabilityReason = result.availabilityReason === "exact" ? undefined : result.availabilityReason;
+          // An exact/fallback attempt is true only after the private token
+          // offer, operation acknowledgement and customer delivery boundary
+          // have all succeeded.  Stage it here; the best-effort audit flush
+          // below never survives a deferred-offer rollback as a false fact.
+          deferredAvailabilityAttempt = {
+            intent: parsedIntent.data.intent,
+            candidateDate: resolved.candidateDate,
+            result: result.match === "exact" ? "exact_offer" : "fallback_offer",
+          };
           return {
             ok: true,
             options: result.slots.map((slot) => ({ option: slot.displayOrder, label: slot.label })),
           };
         }
 
+        if (name === "record_scheduling_decision") {
+          const decision = schedulingDecisionSchema.safeParse(argumentsJson);
+          if (!decision.success) return { ok: false, error: "invalid_scheduling_decision" };
+          if (!schedulingDecisionRequired) return { ok: false, error: "scheduling_decision_not_required" };
+          await dependencies.repository.appendActivity(lead.id, "scheduling_no_calendar_decision", { reason: decision.data.reason });
+          return { ok: true, decision: "no_calendar", reason: decision.data.reason };
+        }
+
+        if (hadActiveQuoteBeforeTurn && lead.quoteValidity === "active" && lead.quote) {
+          return { ok: false, error: "active_quote_does_not_need_recalculation" };
+        }
         const decision = calculatePricingDecision(lead.clientData, config.pricingRules);
         if (decision.kind === "quote") {
           quote = decision.quote;
           quoteCalculatedThisTurn = true;
+          // A changed customer fact invalidated the previous quote. Rendering
+          // the newly calculated quote is the authoritative no-Calendar
+          // decision for this turn: a customer must see the revised amount
+          // before a later availability search can be trusted.
+          if (schedulingDecisionRequired) {
+            await dependencies.repository.appendActivity(lead.id, "scheduling_quote_recalculated");
+          }
           return { ok: true, kind: "quote", quote: { amountRsd: quote.amountRsd } };
         }
         if (decision.kind === "human_needed") {
@@ -596,9 +851,95 @@ export async function processTelegramWebhook(
         return { ok: true, kind: "missing_data", missing_fields: decision.missingFields };
       },
       });
-      await dependencies.repository.completeIntegrationOperation(agentTurnOperation.idempotencyKey);
+      if (pricingInputChangedInSchedulingTurn && !quoteCalculatedThisTurn && !humanNeededReason) {
+        throw new AgentTurnTechnicalError("agent_quote_recalculation_missing");
+      }
+      if (turn.conversationResetRequired) {
+        // A stateless recovery or terminal availability function result cannot
+        // be reused as durable customer context. Invalidate before any private
+        // offer commit or turn acknowledgement so the next message starts from
+        // the authoritative lead/offer snapshot instead of SDK tool output.
+        try {
+          await dependencies.repository.invalidateConversation(lead.id);
+        } catch {
+          // A repair result is not safe to continue with if its poisoned
+          // Conversation cannot be invalidated. Supersede a private offer if
+          // one exists, then let the existing technical recovery restore the
+          // pre-turn lead projection and produce server-owned resend copy.
+          if (deferredSlotOffer) {
+            try {
+              await dependencies.calendarReservation!.discardDeferredSlotOffer(deferredSlotOffer);
+            } catch {
+              throw new DeferredSlotOfferBoundaryError("calendar_slot_offer_compensation_failed");
+            }
+          }
+          throw new AgentTurnTechnicalError("agent_provider_sdk_error");
+        }
+      }
+      if (deferredSlotOffer) {
+        try {
+          await dependencies.calendarReservation!.commitDeferredSlotOffer(deferredSlotOffer);
+        } catch {
+          // `saveCalendarSlotOffer` is the atomically-authoritative token
+          // lifecycle boundary. Compensate even when this write reports a
+          // failure: a provider/database transport fault must not leave a
+          // customer-invisible offer selectable on a later callback.
+          try {
+            await dependencies.calendarReservation!.discardDeferredSlotOffer(deferredSlotOffer);
+          } catch {
+            throw new DeferredSlotOfferBoundaryError("calendar_slot_offer_compensation_failed");
+          }
+          throw new DeferredSlotOfferBoundaryError("calendar_slot_offer_persist_failed");
+        }
+      }
+      try {
+        await dependencies.repository.completeIntegrationOperation(agentTurnOperation.idempotencyKey);
+      } catch {
+        // The token write may have succeeded while the agent-turn operation
+        // acknowledgement failed. Supersede that new offer before rollback so
+        // no OFFERED state exists without a successfully completed provider
+        // turn and backend continuation boundary.
+        if (deferredSlotOffer) {
+          try {
+            await dependencies.calendarReservation!.discardDeferredSlotOffer(deferredSlotOffer);
+          } catch {
+            throw new DeferredSlotOfferBoundaryError("calendar_slot_offer_compensation_failed");
+          }
+        }
+        throw new DeferredSlotOfferBoundaryError("agent_turn_operation_complete_failed");
+      }
     } catch (error) {
       if (isEvaluatorControlFence(error)) throw error;
+      if (error instanceof DeferredSlotOfferBoundaryError) {
+        // We have either confirmed the deferred write did not commit or
+        // superseded it with an empty offer. Restore the pre-turn coordinate,
+        // then use server-owned Calendar handoff copy rather than reporting an
+        // opaque webhook failure. Existing tokens were superseded before the
+        // new query and deliberately remain stale.
+        await dependencies.repository.failIntegrationOperation(agentTurnOperation.idempotencyKey, error.code, "ambiguous");
+        Object.assign(lead, persistedLeadBeforeTurn);
+        await dependencies.repository.invalidateConversation(lead.id);
+        return recoverDeferredSlotOfferBoundaryFailure({
+          updateId: update.update_id,
+          lead,
+          replyLanguage,
+          dependencies,
+          now,
+          errorCode: error.code,
+        });
+      }
+      // If the provider failed after a terminal availability tool produced a
+      // private deferred offer, its final customer-visible intent is unknown.
+      // This is the deliberately conservative exception to retain-until-
+      // replacement: invalidate every offer rather than leave an option whose
+      // surrounding lead/quote rollback may no longer match.
+      if (deferredSlotOffer) {
+        try {
+          await dependencies.calendarReservation!.discardDeferredSlotOffer(deferredSlotOffer);
+        } catch {
+          throw new DeferredSlotOfferBoundaryError("calendar_slot_offer_compensation_failed");
+        }
+      }
       await dependencies.repository.failIntegrationOperation(agentTurnOperation.idempotencyKey, "openai_agent_turn_failed", "ambiguous");
       Object.assign(lead, persistedLeadBeforeTurn);
       await dependencies.repository.saveLead(lead);
@@ -612,6 +953,14 @@ export async function processTelegramWebhook(
     // whether the model chose to calculate a quote or ask for a handoff.
     // This runs only after a successful turn, so failed-turn rollback remains
     // authoritative.
+    if (calendarFailure) {
+      // `resolveSemanticAvailabilityIntent` temporarily applies the requested
+      // date/window so the real Calendar query is meaningful. A transport or
+      // persistence failure cannot leave that unverified coordinate beside an
+      // earlier active quote, so retain the pre-turn scheduling/quote facts
+      // and only add the separate technical Human Needed outcome below.
+      restoreSchedulingSnapshot(lead, persistedLeadBeforeTurn);
+    }
     const backendPricingDecision = calculatePricingDecision(lead.clientData, config.pricingRules);
     if (backendPricingDecision.kind === "human_needed") {
       humanNeededReason = backendPricingDecision.reason;
@@ -635,13 +984,7 @@ export async function processTelegramWebhook(
       // delivered price. The model may still explicitly flag it for a human.
       if (!calendarFailure && !noAvailableSlots) supersedeQuote(lead);
     } else if (quote) {
-      lead.quote = quote;
-      lead.quoteValidity = "active";
-      lead.quoteInvalidatedAt = undefined;
-      lead.quotedAt = now.toISOString();
-      lead.pricingRulesSnapshot = config.pricingRules;
-      lead.humanNeeded = false;
-      lead.humanNeededReason = undefined;
+      activateQuote(lead, quote, config.pricingRules, now);
     }
     await dependencies.repository.saveLead(lead);
 
@@ -654,9 +997,19 @@ export async function processTelegramWebhook(
       ? normalIntakeReply(turn.reply, lead.clientData, config.pricingRules, replyLanguage)
       : undefined;
     const reply = offeredSlots
-      ? renderSlotOfferReply(replyLanguage, offeredSlots)
+      ? offeredSlotsAreNearestAlternatives
+        ? renderNearestSlotAlternativesReply(replyLanguage, offeredSlots, offeredSlotsAvailabilityReason ?? "requested_date_unavailable", lead.quote?.amountRsd)
+        : renderSlotOfferReply(replyLanguage, offeredSlots, lead.quote?.amountRsd)
       : noAvailableSlots
-      ? renderNoAvailabilityReply(replyLanguage, noAvailableSlotsReason)
+      ? calendarRetainedOfferConstraintUnavailable
+        ? renderRetainedOfferConstraintUnavailableReply(replyLanguage, calendarRetainedOfferConstraintKind ?? "after")
+        : renderNoAvailabilityReply(replyLanguage, noAvailableSlotsReason)
+      : calendarRetainedOfferFailure
+      ? renderRetainedOfferRefreshFailedReply(replyLanguage)
+      : availabilityTerminalFailure === "date_required"
+      ? renderAvailabilityDateRequiredReply(replyLanguage)
+      : availabilityTerminalFailure === "validation" || availabilityTerminalFailure === "business_refusal"
+      ? renderAvailabilityRequestUnavailableReply(replyLanguage)
       : quote && !humanNeededReason
       ? renderQuoteReply(replyLanguage, quote.amountRsd, quoteReplyOptions(lead.clientData, config.pricingRules))
       : wasHumanNeededBeforeTurn
@@ -670,7 +1023,7 @@ export async function processTelegramWebhook(
       : humanNeededReason
       ? calendarFailure
         ? renderCalendarAvailabilityFailedReply(replyLanguage)
-        : renderHumanNeededReply(replyLanguage)
+        : renderHumanNeededReply(replyLanguage, humanNeededReason)
       : conversationalReply
       ?? renderAgentReply(turn.reply, replyLanguage);
     const deliveryOutcome = await deliverReply({
@@ -680,15 +1033,56 @@ export async function processTelegramWebhook(
       dependencies,
     });
     if (deliveryOutcome !== "succeeded") {
+      let confirmedOfferRollback = false;
+      if (deferredSlotOffer && deliveryOutcome === "failed") {
+        // A confirmed Telegram rejection means the customer did not receive
+        // this private/new offer. Retire its tokens and restore the exact
+        // pre-turn scheduling coordinate and aligned quote before recording
+        // delivery Human Needed. This is intentionally distinct from an
+        // ambiguous transport outcome below.
+        try {
+          await dependencies.calendarReservation!.discardDeferredSlotOffer(deferredSlotOffer);
+          Object.assign(lead, persistedLeadBeforeTurn);
+          confirmedOfferRollback = true;
+        } catch {
+          // If the token retirement itself is unknown, use the same
+          // conservative ambiguous-delivery policy: retain state for audit,
+          // block automatic reservation via Human Needed, and never claim a
+          // rollback that was not confirmed.
+        }
+      }
       if (!lead.humanNeeded) {
         lead.humanNeeded = true;
-        lead.humanNeededReason = deliveryOutcome === "ambiguous" ? "delivery_ambiguous" : "delivery_failed";
+        lead.humanNeededReason = deliveryOutcome === "ambiguous" || (deferredSlotOffer !== undefined && !confirmedOfferRollback)
+          ? "delivery_ambiguous"
+          : "delivery_failed";
         clearPendingSchedulingConsent(lead);
       }
       await dependencies.repository.saveLead(lead);
-      await dependencies.repository.appendActivity(lead.id, "telegram_delivery_failed", { outcome: deliveryOutcome });
+      await dependencies.repository.appendActivity(lead.id, "telegram_delivery_failed", {
+        outcome: deliveryOutcome,
+        ...(deferredSlotOffer ? {
+          // Ambiguous sends deliberately preserve the committed offer but
+          // Human Needed prevents any callback from booking it automatically.
+          availability_offer_policy: confirmedOfferRollback ? "rolled_back_after_confirmed_failure" : "preserved_and_blocked_after_ambiguous_delivery",
+        } : {}),
+      });
       await dependencies.repository.markTelegramUpdateFailed(update.update_id, "telegram_delivery_failed");
       return { kind: "failed", failureCode: "telegram_delivery_failed" };
+    }
+
+    // Success observability is intentionally outside the agent/deferred-token
+    // transaction.  If any earlier boundary failed the catch path rolled the
+    // lead back and this diagnostic is never written.
+    if (deferredAvailabilityAttempt) {
+      await recordAvailabilityAttemptBestEffort({
+        repository: dependencies.repository,
+        leadId: lead.id,
+        intent: deferredAvailabilityAttempt.intent,
+        candidateDate: deferredAvailabilityAttempt.candidateDate,
+        result: deferredAvailabilityAttempt.result,
+        now,
+      });
     }
 
     if (quote && !humanNeededReason) {
@@ -750,15 +1144,45 @@ async function renderAvailabilityOffer(input: {
   replyLanguage: ReplyLanguage;
   dependencies: Stage2Dependencies;
   calendarReservation: CalendarReservationService;
+  pricingRules: PricingRules;
+  now: Date;
   options?: SlotOfferOptions;
+  onAvailabilityResolved?: (resolution: AvailabilityResolution) => Promise<Quote | undefined>;
 }): Promise<TelegramRenderedReply> {
-  const offer = await input.calendarReservation.offerSlots(input.lead, input.replyLanguage, input.options);
+  let availabilityQuote: Quote | undefined;
+  const existingOnAvailabilityResolved = input.options?.onAvailabilityResolved;
+  const offer = await input.calendarReservation.offerSlots(input.lead, input.replyLanguage, {
+    ...input.options,
+    // Every customer-visible direct offer must be homogeneous by day. This
+    // shared boundary also covers bare quote consent and date-proposal `да`.
+    singleOfferDate: true,
+    onAvailabilityResolved: async (resolution) => {
+      await existingOnAvailabilityResolved?.(resolution);
+      availabilityQuote = await alignAvailabilityQuote({
+        lead: input.lead,
+        resolution,
+        now: input.now,
+        pricingRules: input.pricingRules,
+        repository: input.dependencies.repository,
+      });
+      const externalQuote = await input.onAvailabilityResolved?.(resolution);
+      if (externalQuote) availabilityQuote = externalQuote;
+    },
+  });
   if (offer.ok) return offer.match === "nearest_alternatives"
-    ? renderNearestSlotAlternativesReply(input.replyLanguage, offer.slots, offer.availabilityReason === "exact" ? "requested_date_unavailable" : offer.availabilityReason)
-    : renderSlotOfferReply(input.replyLanguage, offer.slots);
+    ? renderNearestSlotAlternativesReply(input.replyLanguage, offer.slots, offer.availabilityReason === "exact" ? "requested_date_unavailable" : offer.availabilityReason, availabilityQuote?.amountRsd)
+    : renderSlotOfferReply(input.replyLanguage, offer.slots, availabilityQuote?.amountRsd);
   if (offer.error === "no_available_slots") {
     await input.dependencies.repository.appendActivity(input.lead.id, "calendar_no_availability", { error_code: offer.error });
     return renderNoAvailabilityReply(input.replyLanguage, offer.availabilityReason);
+  }
+  if (offer.error === "duration_exceeds_workday") {
+    input.lead.humanNeeded = true;
+    input.lead.humanNeededReason = "duration_exceeds_workday";
+    clearPendingSchedulingConsent(input.lead);
+    await input.dependencies.repository.saveLead(input.lead);
+    await input.dependencies.repository.appendActivity(input.lead.id, "duration_exceeds_workday");
+    return renderHumanNeededReply(input.replyLanguage, "duration_exceeds_workday");
   }
   input.lead.humanNeeded = true;
   input.lead.humanNeededReason = "calendar_unavailable";
@@ -766,6 +1190,141 @@ async function renderAvailabilityOffer(input: {
   await input.dependencies.repository.saveLead(input.lead);
   await input.dependencies.repository.appendActivity(input.lead.id, "calendar_availability_failed", { error_code: offer.error });
   return renderCalendarAvailabilityFailedReply(input.replyLanguage);
+}
+
+/**
+ * A Calendar search is authoritative about the date a customer can actually
+ * select. Align the durable preferred date and quote after every successful
+ * availability read, even when the semantic intent did not itself change an
+ * input. This prevents a late same-day request from retaining a +20% quote
+ * beside only future alternatives (and vice versa). The callback is awaited
+ * before slot tokens are persisted.
+ */
+async function alignAvailabilityQuote(input: {
+  lead: StoredLead;
+  resolution: AvailabilityResolution;
+  now: Date;
+  pricingRules: PricingRules;
+  repository: LeadRepository;
+  /** Candidate commits compare to the durable coordinate they are replacing. */
+  previousAuthoritativeDate?: string;
+}): Promise<Quote | undefined> {
+  if (input.resolution.slots.length === 0) return undefined;
+  const firstOfferedDate = [...input.resolution.slots]
+    .sort((left, right) => left.start.localeCompare(right.start))[0];
+  if (!firstOfferedDate) return undefined;
+  const offeredDate = belgradeDate(new Date(firstOfferedDate.start));
+  const previousDate = input.previousAuthoritativeDate ?? input.lead.clientData.preferredDate;
+  input.lead.clientData = mergeClientData(input.lead.clientData, { preferredDate: offeredDate }, input.now);
+  const decision = calculatePricingDecision(input.lead.clientData, input.pricingRules);
+  if (decision.kind !== "quote") return undefined;
+  const quoteChanged = input.lead.quote?.amountRsd !== decision.quote.amountRsd ||
+    input.lead.quote?.sameDayApplied !== decision.quote.sameDayApplied ||
+    previousDate !== offeredDate;
+  if (!quoteChanged && input.lead.quote) return input.lead.quote;
+  activateQuote(input.lead, decision.quote, input.pricingRules, input.now);
+  await input.repository.saveLead(input.lead);
+  await input.repository.appendActivity(input.lead.id, "quote_recalculated", {
+    amount_rsd: decision.quote.amountRsd,
+    reason: decision.quote.sameDayApplied ? "same_day_availability" : "future_availability",
+  });
+  return decision.quote;
+}
+
+/**
+ * Makes a previously private scheduling candidate authoritative only after
+ * both Team calendars produced real selectable slots. For a nearest fallback
+ * the actual offered date is saved, while an unmatched requested time window
+ * stays non-authoritative: it must not turn a labelled alternative into a
+ * customer preference on a later turn.
+ */
+async function commitAvailabilityCandidateOffer(input: {
+  lead: StoredLead;
+  candidateLead: StoredLead;
+  persistedLeadBeforeTurn: StoredLead;
+  resolution: AvailabilityResolution;
+  now: Date;
+  pricingRules: PricingRules;
+  repository: LeadRepository;
+}): Promise<Quote | undefined> {
+  const firstSlot = [...input.resolution.slots].sort((left, right) => left.start.localeCompare(right.start))[0];
+  if (!firstSlot) return undefined;
+  const offeredDate = belgradeDate(new Date(firstSlot.start));
+  if (input.resolution.match === "nearest_alternatives") {
+    const retainedWindow = input.persistedLeadBeforeTurn.clientData.preferredTimeWindow;
+    input.candidateLead.clientData = mergeClientData(
+      { ...input.candidateLead.clientData, preferredTimeWindow: retainedWindow },
+      { preferredDate: offeredDate },
+      input.now,
+    );
+  }
+  // Keep the candidate object and the reservation-service input aligned. The
+  // service derives its slot fingerprint only after this callback returns.
+  Object.assign(input.lead, structuredClone(input.candidateLead));
+  const quote = await alignAvailabilityQuote({
+    lead: input.lead,
+    resolution: input.resolution,
+    now: input.now,
+    pricingRules: input.pricingRules,
+    repository: input.repository,
+    previousAuthoritativeDate: input.persistedLeadBeforeTurn.clientData.preferredDate,
+  });
+  input.candidateLead.clientData = structuredClone(input.lead.clientData);
+  input.candidateLead.quote = input.lead.quote ? structuredClone(input.lead.quote) : undefined;
+  input.candidateLead.quoteValidity = input.lead.quoteValidity;
+  input.candidateLead.quoteInvalidatedAt = input.lead.quoteInvalidatedAt;
+  input.candidateLead.quotedAt = input.lead.quotedAt;
+  input.candidateLead.pricingRulesSnapshot = input.lead.pricingRulesSnapshot;
+  return quote;
+}
+
+function availabilityAttemptFromIntent(input: {
+  intent: SchedulingAvailabilityIntent;
+  candidateDate: string;
+  result: StoredAvailabilityAttempt["result"];
+  now: Date;
+}): StoredAvailabilityAttempt {
+  return {
+    result: input.result,
+    candidateDate: input.candidateDate,
+    timePreference: input.intent.timePreference,
+    timePreferenceMode: input.intent.timePreferenceMode,
+    ...(input.intent.afterLocalTime ? { afterLocalTime: input.intent.afterLocalTime } : {}),
+    ...(input.intent.beforeLocalTime ? { beforeLocalTime: input.intent.beforeLocalTime } : {}),
+    relation: input.intent.relation,
+    checkedAt: input.now.toISOString(),
+  };
+}
+
+async function recordAvailabilityAttemptRequired(input: {
+  repository: LeadRepository;
+  leadId: string;
+  intent: SchedulingAvailabilityIntent;
+  candidateDate: string;
+  result: StoredAvailabilityAttempt["result"];
+  now: Date;
+}): Promise<void> {
+  try {
+    await input.repository.recordAvailabilityAttempt(input.leadId, availabilityAttemptFromIntent(input));
+  } catch {
+    throw new AgentTurnTechnicalError("agent_tool_execution_failed");
+  }
+}
+
+async function recordAvailabilityAttemptBestEffort(input: {
+  repository: LeadRepository;
+  leadId: string;
+  intent: SchedulingAvailabilityIntent;
+  candidateDate: string;
+  result: Extract<StoredAvailabilityAttempt["result"], "exact_offer" | "fallback_offer">;
+  now: Date;
+}): Promise<void> {
+  try {
+    await input.repository.recordAvailabilityAttempt(input.leadId, availabilityAttemptFromIntent(input));
+  } catch {
+    // A valid offer is already protected by its authoritative lead save and
+    // deferred-token boundary. Activity evidence is intentionally best-effort.
+  }
 }
 
 function telegramProfile(from: { id: number; first_name?: string; last_name?: string; username?: string } | undefined) {
@@ -795,10 +1354,10 @@ export function resolveRelativePreferredDate(message: string, now: Date): string
   const weekdayDate = resolveWeekdayDate(normalized, now);
   if (weekdayDate) return weekdayDate;
   const aliases: Array<[RegExp, number]> = [
-    [/(?:^|\s)сегодня(?:$|\s|[,.!])/u, 0], [/(?:^|\s)завтра(?:$|\s|[,.!])/u, 1], [/(?:^|\s)послезавтра(?:$|\s|[,.!])/u, 2],
-    [/(?:^|\s)today(?:$|\s|[,.!])/u, 0], [/(?:^|\s)tomorrow(?:$|\s|[,.!])/u, 1], [/(?:^|\s)the day after tomorrow(?:$|\s|[,.!])/u, 2],
-    [/(?:^|\s)danas(?:$|\s|[,.!])/u, 0], [/(?:^|\s)sutra(?:$|\s|[,.!])/u, 1], [/(?:^|\s)prekosutra(?:$|\s|[,.!])/u, 2],
-    [/(?:^|\s)данас(?:$|\s|[,.!])/u, 0], [/(?:^|\s)сутра(?:$|\s|[,.!])/u, 1], [/(?:^|\s)прекосутра(?:$|\s|[,.!])/u, 2],
+    [/(?:^|\s)сегодня(?:$|\s|[,.!?])/u, 0], [/(?:^|\s)завтра(?:$|\s|[,.!?])/u, 1], [/(?:^|\s)послезавтра(?:$|\s|[,.!?])/u, 2],
+    [/(?:^|\s)today(?:$|\s|[,.!?])/u, 0], [/(?:^|\s)tomorrow(?:$|\s|[,.!?])/u, 1], [/(?:^|\s)the day after tomorrow(?:$|\s|[,.!?])/u, 2],
+    [/(?:^|\s)danas(?:$|\s|[,.!?])/u, 0], [/(?:^|\s)sutra(?:$|\s|[,.!?])/u, 1], [/(?:^|\s)prekosutra(?:$|\s|[,.!?])/u, 2],
+    [/(?:^|\s)данас(?:$|\s|[,.!?])/u, 0], [/(?:^|\s)сутра(?:$|\s|[,.!?])/u, 1], [/(?:^|\s)прекосутра(?:$|\s|[,.!?])/u, 2],
   ];
   const alias = aliases.find(([expression]) => expression.test(normalized));
   const match = normalized.match(/(?:через\s+(\d+|один|одну|два|две|три)\s+(?:день|дня|дней)|in\s+(\d+|one|two|three)\s+days?|za\s+(\d+|jedan|dva|tri)\s+dana|за\s+(\d+|један|два|три)\s+дана)/u);
@@ -809,6 +1368,76 @@ export function resolveRelativePreferredDate(message: string, now: Date): string
   const part = (type: string) => Number(parts.find((item) => item.type === type)?.value);
   const base = new Date(Date.UTC(part("year"), part("month") - 1, part("day") + days));
   return base.toISOString().slice(0, 10);
+}
+
+/**
+ * Resolve only an explicit date stated in this message into a transient
+ * availability coordinate. Unlike intake date parsing it intentionally does
+ * not include weekdays or inferred proposals, and callers must not persist it.
+ */
+export function resolveCurrentTurnDateCoordinate(message: string, now: Date): CurrentTurnDateCoordinate | undefined {
+  const normalized = message.normalize("NFKC").toLocaleLowerCase().replace(/\s+/g, " ").trim();
+  const coordinate = (date: string, recommendedDateReference: CurrentTurnDateCoordinate["recommendedDateReference"], source: CurrentTurnDateCoordinate["source"]): CurrentTurnDateCoordinate => ({ date, recommendedDateReference, source, timezone: "Europe/Belgrade" });
+  // A phrase such as "not tomorrow, but in two days" is not a single
+  // coordinate. The agent must clarify rather than silently selecting one of
+  // the competing dates. This deliberately covers RU, EN and both Serbian
+  // scripts before candidate collection.
+  const dateScopedNegation = /(?:^|[^\p{L}])(?:не|not|nije|није)\s+(?:(?:на|for|za)\s+)?(?:сегодня|today|danas|данас|завтра|tomorrow|sutra|сутра|послезавтра|the\s+day\s+after\s+tomorrow|prekosutra|прекосутра|через\s+[^\s]+\s+дн\p{L}*|in\s+[^\s]+\s+days?|za\s+[^\s]+\s+dana|за\s+[^\s]+\s+дана|\d{4}-\d{2}-\d{2}|\d{1,2}\.\d{1,2}\.\d{2,4}|\d{1,2}\.?\s+\p{L}+|\p{L}+\s+\d{1,2})(?=$|[^\p{L}\d])/u;
+  if (dateScopedNegation.test(normalized)) return undefined;
+
+  const candidates: CurrentTurnDateCoordinate[] = [];
+  const spans: Array<{ start: number; end: number }> = [];
+  const add = (candidate: CurrentTurnDateCoordinate, start?: number, end?: number) => {
+    if (start !== undefined && end !== undefined) {
+      if (spans.some((span) => start < span.end && end > span.start)) return;
+      spans.push({ start, end });
+    }
+    candidates.push(candidate);
+  };
+  // ISO is deliberately stricter than localized intake parsing. A stated ISO
+  // date is either one valid current/future coordinate or no coordinate at
+  // all; never reinterpret a malformed/past/multiple ISO message through a
+  // looser date parser.
+  const isoMatches = [...normalized.matchAll(/\b\d{4}-\d{2}-\d{2}\b/gu)];
+  if (isoMatches.length > 1) return undefined;
+  if (isoMatches.length === 1) {
+    const match = isoMatches[0]!;
+    const date = match[0];
+    if (!isValidIsoDate(date) || date < belgradeDate(now)) return undefined;
+    add(coordinate(date, "exact_date", "absolute"), match.index, (match.index ?? 0) + date.length);
+  }
+  const aliases: Array<[RegExp, number, CurrentTurnDateCoordinate["source"]]> = [
+    [/(?:^|[^\p{L}])the day after tomorrow(?=$|[^\p{L}])/gu, 2, "relative_day_after"], [/(?:^|[^\p{L}])послезавтра(?=$|[^\p{L}])/gu, 2, "relative_day_after"], [/(?:^|[^\p{L}])prekosutra(?=$|[^\p{L}])/gu, 2, "relative_day_after"], [/(?:^|[^\p{L}])прекосутра(?=$|[^\p{L}])/gu, 2, "relative_day_after"],
+    [/(?:^|[^\p{L}])сегодня(?=$|[^\p{L}])/gu, 0, "relative_today"], [/(?:^|[^\p{L}])today(?=$|[^\p{L}])/gu, 0, "relative_today"], [/(?:^|[^\p{L}])danas(?=$|[^\p{L}])/gu, 0, "relative_today"], [/(?:^|[^\p{L}])данас(?=$|[^\p{L}])/gu, 0, "relative_today"],
+    [/(?:^|[^\p{L}])завтра(?=$|[^\p{L}])/gu, 1, "relative_tomorrow"], [/(?:^|[^\p{L}])tomorrow(?=$|[^\p{L}])/gu, 1, "relative_tomorrow"], [/(?:^|[^\p{L}])sutra(?=$|[^\p{L}])/gu, 1, "relative_tomorrow"], [/(?:^|[^\p{L}])сутра(?=$|[^\p{L}])/gu, 1, "relative_tomorrow"],
+  ];
+  for (const [pattern, days, source] of aliases) {
+    for (const match of normalized.matchAll(pattern)) {
+      const start = match.index ?? 0;
+      add(coordinate(addBelgradeDays(belgradeDate(now), days), days === 0 ? "today" : days === 1 ? "tomorrow" : "exact_date", source), start, start + match[0].length);
+    }
+  }
+  const relative = /(?:через\s+(\d+|один|одну|два|две|три)\s+(?:день|дня|дней)|in\s+(\d+|one|two|three)\s+days?|za\s+(\d+|jedan|dva|tri)\s+dana|за\s+(\d+|један|два|три)\s+дана)/gu;
+  for (const match of normalized.matchAll(relative)) {
+    const days = relativeDayCount(match.slice(1).find(Boolean) ?? "");
+    if (days !== undefined) add(coordinate(addBelgradeDays(belgradeDate(now), days), days === 0 ? "today" : days === 1 ? "tomorrow" : "exact_date", "relative_in_days"), match.index, (match.index ?? 0) + match[0].length);
+  }
+  for (const match of normalized.matchAll(/\b(\d{1,2})\.(\d{1,2})\.(\d{2}|\d{4})\b/gu)) {
+    const [, day, month, yearText] = match;
+    const year = yearText.length === 2 ? 2000 + Number(yearText) : Number(yearText);
+    const date = `${year.toString().padStart(4, "0")}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`;
+    if (isValidIsoDate(date) && date >= belgradeDate(now)) add(coordinate(date, "exact_date", "absolute"), match.index, (match.index ?? 0) + match[0].length);
+  }
+  // resolveNamedDate retains its established locale/year behavior. Multiple
+  // named date phrases are ambiguity, even if one parser branch would happen
+  // to return the first one.
+  const namedMentions = normalized.match(/(?:\d{1,2}\.?\s+[\p{L}]+|[\p{L}]+\s+\d{1,2})/gu) ?? [];
+  if (namedMentions.filter((mention) => /\d/u.test(mention)).length > 1) return undefined;
+  const named = resolveNamedDate(normalized, now);
+  if (named) add(coordinate(named, "exact_date", "absolute"));
+
+  const distinctDates = [...new Map(candidates.map((candidate) => [candidate.date, candidate])).values()];
+  return distinctDates.length === 1 ? distinctDates[0] : undefined;
 }
 
 /** Resolve a named weekday to its next occurrence in Belgrade. */
@@ -971,88 +1600,171 @@ function resolveTimeWindow(message: string): "morning" | "midday" | "evening" | 
   return undefined;
 }
 
-type ScheduleRecoveryRequest = {
-  kind: "later" | "time_window" | "next_day";
-  clientData: ClientData;
-  clientDataChanged: boolean;
-  offerOptions: SlotOfferOptions;
-};
+/**
+ * Recognise only an answer to the already due pet-hair question. Mentioning a
+ * dog before the rest of the cleaning profile is known is not a pricing fact;
+ * neither is wool/carpet vocabulary without an actual pet and hair context.
+ */
+function resolveActivePetHairAnswer(message: string, clientData: ClientData): boolean | undefined {
+  if (clientData.heavyPetHair !== undefined || !clientData.cleaningType || !clientData.areaM2 || !clientData.rooms || !clientData.bathrooms) return undefined;
+  const text = message.normalize("NFKC").toLocaleLowerCase().replace(/\s+/gu, " ").trim();
+  // A wool carpet is not evidence of pet hair, even when a customer happens
+  // to mention an animal elsewhere in the same sentence.
+  if (/(?:ков[её]?р|carpet|wool)/u.test(text)) return undefined;
+  const pet = "(?:собак|кошк|животн|питомц|dog|cat|pet|pas|mačk|mack|kućn(?:i|og) ljubim)";
+  const hair = "(?:шерст|линя|волос(?:ы|ами)?|pet hair|fur|dlak)";
+  const petLinkedHair = new RegExp(`${pet}.{0,80}${hair}|${hair}.{0,80}${pet}`, "u");
+  if (!petLinkedHair.test(text)) return undefined;
+  // JavaScript `\\b` is ASCII-only, so use Unicode letter delimiters. A
+  // Cyrillic `нет`/`без` must be authoritative over any affirmative words.
+  const negation = /(?:^|[^\p{L}])(?:нет|без|не|no|without|bez|ne)(?=$|[^\p{L}])/u;
+  if (negation.test(text)) return false;
+  if (/(?:^|[^\p{L}])(?:да|есть|сильн|много|hairy|shed)(?=$|[^\p{L}])|лин(?:яет|яют)|шерстян|dlak/u.test(text)) return true;
+  return undefined;
+}
+
+/** Build the privacy-safe, durable scheduling coordinate system for the agent. */
+async function buildSchedulingSnapshot(input: { lead: StoredLead; now: Date; repository: LeadRepository; currentTurnDateCoordinate?: CurrentTurnDateCoordinate }): Promise<SchedulingSnapshot> {
+  const activeTokens = input.lead.calendarEventId || input.lead.humanNeeded
+    ? []
+    : await input.repository.listActiveCalendarSlotTokens({ leadId: input.lead.id, now: input.now.toISOString() });
+  const state: SchedulingSnapshot["state"] = input.lead.humanNeeded
+    ? "human_needed"
+    : input.lead.status === "booked"
+    ? "booked"
+    : input.lead.calendarEventId
+    ? "reserved_pending_trello"
+    : activeTokens.length > 0
+    ? "offered"
+    : input.lead.quoteValidity === "active" && input.lead.quote
+    ? "quoted"
+    : "intake";
+  // Availability attempts influence only the active quote/offer protocol.
+  // An activity-log outage or malformed historical diagnostic must never
+  // block intake, an already-booked lead, or an established Human Needed
+  // handoff from receiving ordinary customer support.
+  const lastAvailabilityAttempt = state === "quoted" || state === "offered"
+    ? await input.repository.getLastAvailabilityAttempt(input.lead.id)
+    : null;
+  return {
+    state,
+    currentDate: belgradeDate(input.now),
+    preferredDate: input.lead.clientData.preferredDate,
+    preferredTimeWindow: input.lead.clientData.preferredTimeWindow,
+    ...(input.currentTurnDateCoordinate ? { currentTurnDateCoordinate: input.currentTurnDateCoordinate } : {}),
+    ...(input.lead.quoteValidity === "active" && input.lead.quote
+      ? { activeQuoteAmountRsd: input.lead.quote.amountRsd }
+      : {}),
+    ...(activeTokens.length > 0 ? {
+      lastOffer: {
+        dates: [...new Set(activeTokens.map((token) => belgradeDate(new Date(token.start))))],
+        labels: activeTokens.map((token) => token.label),
+      },
+    } : {}),
+    ...(lastAvailabilityAttempt ? { lastAvailabilityAttempt } : {}),
+    policy: { timezone: "Europe/Belgrade", workingHours: "Mon-Sat 08:00-20:00; Sunday closed", searchHorizonDays: 14 },
+  };
+}
+
+/** The dynamic provider schema is the first fence; this executor check makes
+ * direct/injected gateway calls equally unable to read Calendar on a stale or
+ * invented current-message coordinate. */
+function availabilityIntentMatchesCurrentTurnCoordinate(intent: SchedulingAvailabilityIntent, snapshot: SchedulingSnapshot): boolean {
+  const coordinate = snapshot.currentTurnDateCoordinate;
+  if (coordinate) {
+    if (intent.dateReference === "today") return coordinate.recommendedDateReference === "today";
+    if (intent.dateReference === "tomorrow") return coordinate.recommendedDateReference === "tomorrow";
+    return intent.dateReference === "exact_date" && coordinate.recommendedDateReference === "exact_date" && intent.exactDate === coordinate.date;
+  }
+  if (intent.dateReference === "current_preferred_date") return Boolean(snapshot.preferredDate);
+  if (intent.dateReference === "same_day_as_last_offer" || intent.dateReference === "day_after_last_offer") return Boolean(snapshot.lastOffer);
+  return intent.dateReference === "exact_date" &&
+    intent.exactDate === snapshot.lastAvailabilityAttempt?.candidateDate;
+}
+
+type SemanticAvailabilityResolution =
+  | {
+      ok: true;
+      /** A private copy used for Calendar reads. It is persisted only after a
+       * safe offer result has been aligned with the actual offered date. */
+      candidateLead: StoredLead;
+      candidateDate: string;
+      offerOptions: SlotOfferOptions;
+    }
+  | { ok: false; error: string };
 
 /**
- * A compact scheduling follow-up is resolved entirely by typed backend state.
- * It is intentionally available only after a qualified active quote; a model
- * cannot turn a conversational acknowledgement into a booking instruction.
+ * Convert the agent's canonical intent into a private candidate and bounded
+ * Calendar-search options. This boundary intentionally performs no lead save:
+ * an unavailable/failed search is evidence about availability, not a durable
+ * change of the customer's requested date, window, urgency or quote.
  */
-async function resolveScheduleRecoveryRequest(input: {
-  message: string;
+async function resolveSemanticAvailabilityIntent(input: {
+  intent: SchedulingAvailabilityIntent;
   lead: StoredLead;
   now: Date;
   repository: LeadRepository;
-}): Promise<ScheduleRecoveryRequest | undefined> {
-  const text = input.message.normalize("NFKC").toLocaleLowerCase().replace(/\s+/gu, " ").trim();
-  // This fast path deliberately accepts only a whole, compact scheduling
-  // follow-up. It must never try to prove the absence of every possible order
-  // detail: any added fact belongs to the normal agent/data-validation path.
-  if (!isSchedulingOnlyRecoveryMessage(text)) return undefined;
-  const isLater = /(?:^|\s)(?:позже|попозже|later|kasnije)(?:$|\s|[?!.,])/u.test(text);
-  const isNextDay = /(?:на\s+следующ(?:ий|его)\s+день|следующ(?:ий|его)\s+день|next day)/u.test(text);
-  const window = resolveTimeWindow(text);
-  const afterMinutes = resolveAfterLocalMinutes(text);
-  const hasRecoveryPhrase = isLater || isNextDay || window !== undefined || afterMinutes !== undefined;
-  if (!hasRecoveryPhrase) return undefined;
-
-  const nowIso = input.now.toISOString();
-  const activeTokens = await input.repository.listActiveCalendarSlotTokens({ leadId: input.lead.id, now: nowIso });
-  // "Later" is relative to a displayed offer, so it must retain a durable
-  // token. A standalone time window or "next day" is safe from the persisted
-  // preferred date after an active quote, even if an old offer has expired.
-  if (isLater && activeTokens.length === 0) return undefined;
-
-  const offeredDate = activeTokens.length > 0 ? earliestOfferedDate(activeTokens) : undefined;
-  const baseDate = offeredDate ?? input.lead.clientData.preferredDate;
-  if (!baseDate) return undefined;
-  const preferredDate = isNextDay ? addBelgradeDays(baseDate, 1) : (isLater ? offeredDate! : baseDate);
-  const nextClientData = mergeClientData(input.lead.clientData, {
-    preferredDate,
-    ...(window ? { preferredTimeWindow: window } : {}),
-  }, input.now);
-  const minimumStartOnPreferredDate = isLater ? nextGridAfterLastOfferedStart(activeTokens, preferredDate) : undefined;
+}): Promise<SemanticAvailabilityResolution> {
+  const activeTokens = await input.repository.listActiveCalendarSlotTokens({ leadId: input.lead.id, now: input.now.toISOString() });
+  const lastOfferDate = activeTokens.length > 0 ? earliestOfferedDate(activeTokens) : undefined;
+  const hasActiveOffer = activeTokens.length > 0;
+  const existingOfferDisposition = input.intent.existingOfferDisposition ??
+    (hasActiveOffer ? "retain_until_replacement" : "none");
+  if ((hasActiveOffer && existingOfferDisposition === "none") ||
+    (!hasActiveOffer && existingOfferDisposition !== "none")) {
+    return { ok: false, error: "availability_offer_disposition_invalid" };
+  }
+  let preferredDate: string | undefined;
+  switch (input.intent.dateReference) {
+    case "current_preferred_date": preferredDate = input.lead.clientData.preferredDate; break;
+    case "today": preferredDate = belgradeDate(input.now); break;
+    case "tomorrow": preferredDate = addBelgradeDays(belgradeDate(input.now), 1); break;
+    case "same_day_as_last_offer": preferredDate = lastOfferDate; break;
+    // This semantic reference is only meaningful relative to an actual,
+    // still-active offer. A failed Calendar query never becomes a fake offer.
+    case "day_after_last_offer": preferredDate = lastOfferDate ? addBelgradeDays(lastOfferDate, 1) : undefined; break;
+    case "exact_date": preferredDate = input.intent.exactDate; break;
+  }
+  if (!preferredDate) return { ok: false, error: "availability_date_required" };
+  if (preferredDate < belgradeDate(input.now)) return { ok: false, error: "availability_date_in_past" };
+  if (input.intent.relation === "later_than_last_offer" && (!lastOfferDate || activeTokens.length === 0)) {
+    return { ok: false, error: "later_than_last_offer_requires_active_offer" };
+  }
+  const timePatch: Partial<ClientData> = {};
+  if (input.intent.timePreferenceMode !== "preserve") {
+    if (input.intent.timePreference === "morning" || input.intent.timePreference === "midday" || input.intent.timePreference === "evening") {
+      timePatch.preferredTimeWindow = input.intent.timePreference;
+    } else {
+      // Explicit `any` removes an earlier window. A date-only follow-up uses
+      // `preserve` instead, so it does not silently widen the search.
+      timePatch.preferredTimeWindow = undefined;
+    }
+  }
+  const candidateLead = structuredClone(input.lead);
+  candidateLead.clientData = mergeClientData(candidateLead.clientData, { preferredDate, ...timePatch }, input.now);
+  clearDateProposal(candidateLead);
+  const minimumLocalStartMinutes = input.intent.afterLocalTime ? localTimeMinutes(input.intent.afterLocalTime) : undefined;
+  const maximumLocalStartMinutes = input.intent.beforeLocalTime ? localTimeMinutes(input.intent.beforeLocalTime) : undefined;
+  const minimumStartOnPreferredDate = input.intent.relation === "later_than_last_offer"
+    ? nextGridAfterLastOfferedStart(activeTokens, preferredDate)
+    : undefined;
   return {
-    kind: isLater ? "later" : isNextDay ? "next_day" : "time_window",
-    clientData: nextClientData,
-    clientDataChanged: JSON.stringify(nextClientData) !== JSON.stringify(input.lead.clientData),
+    ok: true,
+    candidateLead,
+    candidateDate: preferredDate,
     offerOptions: {
-      ...(afterMinutes !== undefined ? { minimumLocalStartMinutes: afterMinutes } : {}),
+      ...(minimumLocalStartMinutes !== undefined ? { minimumLocalStartMinutes } : {}),
+      ...(maximumLocalStartMinutes !== undefined ? { maximumLocalStartMinutes } : {}),
       ...(minimumStartOnPreferredDate ? { minimumStartOnPreferredDate } : {}),
-      supersedeExisting: true,
+      existingOfferDisposition,
+      singleOfferDate: true,
     },
   };
 }
 
-function isSchedulingOnlyRecoveryMessage(message: string): boolean {
-  const text = message.replace(/[?!.,;]+$/gu, "").trim();
-  return [
-    // Russian: these are the customer phrases supported by the typed recovery
-    // contract. Keep every expression bounded from ^ to $ so appended facts
-    // such as "вечером, две комнаты" never reach Calendar directly.
-    /^(?:а\s+)?(?:позже|попозже)(?:\s+(?:нет\s+)?слотов)?$/u,
-    /^(?:(?:а|а как насч[её]т|есть ли|будет ли)\s+)?после\s+(?:19(?::00)?|семи)(?:\s+(?:есть|слоты|есть\s+слоты))?$/u,
-    /^(?:(?:а|а как насч[её]т|есть ли|будет ли)\s+)?(?:утром|вечером|в середине дня|ближе к обеду)(?:\s+есть)?$/u,
-    /^(?:тогда\s+)?на\s+следующ(?:ий|его)\s+день(?:\s+(?:утром|вечером|в середине дня|ближе к обеду))?$/u,
-    // Equivalent compact English and Serbian time-only asks remain safe. They
-    // share the same typed active-offer precondition below.
-    /^(?:what about\s+)?later(?:\s+(?:slots?|times?))?$/u,
-    /^(?:(?:what about|is there|any)\s+)?after\s+(?:7|19(?::00)?)(?:\s*(?:pm))?$/u,
-    /^(?:(?:what about|is there|any)\s+)?(?:morning|midday|afternoon|evening|near noon)(?:\s+available)?$/u,
-    /^(?:then\s+)?next day(?:\s+(?:morning|midday|afternoon|evening|near noon))?$/u,
-    /^(?:a\s+)?kasnije(?:\s+(?:termini|vreme))?$/u,
-    /^(?:(?:a šta je sa|ima li|da li ima)\s+)?(?:ujutru|popodne|oko podne|uveče|uvece)(?:\s+ima)?$/u,
-  ].some((pattern) => pattern.test(text));
-}
-
-function resolveAfterLocalMinutes(text: string): number | undefined {
-  if (/(?:после\s+семи|после\s+19(?::00)?|after\s+(?:7|19(?::00)?)(?:\s*pm)?)/u.test(text)) return 19 * 60;
-  return undefined;
+function localTimeMinutes(value: string): number {
+  const [hours, minutes] = value.split(":").map(Number);
+  return hours! * 60 + minutes!;
 }
 
 function earliestOfferedDate(tokens: StoredCalendarSlotToken[]): string {
@@ -1075,46 +1787,6 @@ function addBelgradeDays(date: string, days: number): string {
   return value.toISOString().slice(0, 10);
 }
 
-function isStrictTimeWindowRequest(message: string): boolean {
-  const text = message.normalize("NFKC").trim().toLocaleLowerCase().replace(/[!?.,]+/gu, " ").replace(/\s+/gu, " ").trim();
-  // This is intentionally a whole-message recognizer. Natural short follow-up
-  // questions may use a small conversational wrapper, but cleaning details
-  // (for example, "вечером, 2 санузла") remain on the normal agent path.
-  if (!text || /\d|\bm\s*²?\b|комнат|сануз|квадрат|kupatil|soba|bathroom|rooms?/iu.test(text)) return false;
-  return [
-    /^(?:(?:and|what about|how about|is there(?: anything)?(?: available)?|any(?:thing)?) )?(?:morning|noon|afternoon|evening|in the morning|at noon|in the afternoon|in the evening)$/u,
-    /^(?:(?:а|а как насч[её]т|есть ли(?: что[- ]?то)?|будет ли(?: что[- ]?то)?) )?(?:утром|дн[её]м|в середине дня|вечером)(?: есть)?$/u,
-    /^(?:(?:a|a šta je sa|ima li(?: nešto)?|da li ima(?: nešto)?) )?(?:ujutru|popodne|oko podne|uveče|uvece)(?: ima)?$/u,
-    /^(?:(?:а|а шта је са|има ли(?: нешто)?|да ли има(?: нешто)?) )?(?:ујутру|поподне|око подне|увече)(?: има)?$/u,
-  ].some((pattern) => pattern.test(text));
-}
-
-/**
- * Fast-path only a standalone request to see availability. Messages that
- * include booking/pricing details deliberately stay on the normal agent path
- * so data collection remains deterministic.
- */
-function isStrictAvailabilityRequest(message: string): boolean {
-  const text = message.normalize("NFKC").trim().toLocaleLowerCase().replace(/[!?.,]+/gu, " ").replace(/\s+/gu, " ").trim();
-  if (!text || /\d|\bm\s*²?\b|комнат|сануз|квадрат|kupatil|soba|bathroom|rooms?/iu.test(text)) return false;
-  return [
-    // A brief "yes" is a natural acceptance of the immediately preceding
-    // quote. Keep it in the backend-only path when the rest is an otherwise
-    // standalone availability request, so a customer does not need to repeat
-    // their booking details just to proceed.
-    /^(?:(?:yes|sure),? )?(?:please )?(?:show|see|check|find|what are|any|available|free|nearest)(?: me)? (?:the )?(?:available |free |nearest )?(?:slots?|times?|availability)(?: again)?$/iu,
-    /^(?:покажи|покажите|провер[ья]й|какие|есть|свободн(?:ое|ые)|ближайш(?:ее|ие))(?: мне)? (?:свободн(?:ое|ые) |ближайш(?:ее|ие) )?(?:слоты|время|термины)$/iu,
-    /^(?:pokaži|pokazite|proveri|koji su|ima li|slobodn(?:i|e)|najbliži) (?:mi )?(?:slobodn(?:i|e) |najbliži )?(?:termin(?:i|e|a)?|slotovi|vreme)$/iu,
-    /^(?:покажи|покажите|провери|који су|има ли|слободн(?:и|е)|најближи) (?:ми )?(?:слободн(?:и|е) |најближи )?(?:термин(?:и|е|а)?|слотови|време)$/iu,
-  ].some((pattern) => pattern.test(text));
-}
-
-/** A clear scheduling request may use a natural phrase that is too rich for the fast path. */
-function hasExplicitSchedulingIntent(message: string): boolean {
-  const text = message.normalize("NFKC").toLocaleLowerCase();
-  return /(?:\b(?:slot|slots|availability|available time|free time|show .*time|schedule|book(?:ing)?|term(?:in|ini|ine|ina)?|termin|slobodno vreme|zakaz)\b|время|термин|слот|заброн|расписан)/iu.test(text)
-    || /(?:утром|дн[её]м|вечером|morning|midday|afternoon|evening|ujutru|popodne|uveče|увече|поподне)/iu.test(text);
-}
 
 function normalIntakeReply(
   agentReply: string,
@@ -1624,6 +2296,20 @@ function pricingInputsChanged(current: ClientData, next: ClientData): boolean {
     !sameExtras(current.extras, next.extras);
 }
 
+function hasActiveQualifiedQuote(lead: StoredLead): boolean {
+  return lead.status === "qualified" && lead.quoteValidity === "active" && lead.quote !== undefined && !lead.humanNeeded;
+}
+
+function activateQuote(lead: StoredLead, quote: Quote, pricingRules: PricingRules, now: Date): void {
+  lead.quote = quote;
+  lead.quoteValidity = "active";
+  lead.quoteInvalidatedAt = undefined;
+  lead.quotedAt = now.toISOString();
+  lead.pricingRulesSnapshot = pricingRules;
+  lead.humanNeeded = false;
+  lead.humanNeededReason = undefined;
+}
+
 /** A date-less quote is a standard-price estimate, not a scheduling offer. */
 function quoteReplyOptions(clientData: ClientData, pricingRules: PricingRules): { sameDayAmountRsd?: number } {
   if (clientData.preferredDate) return {};
@@ -1679,6 +2365,43 @@ async function recoverTechnicalConversationFailure(input: {
   return { kind: "failed", failureCode: "telegram_delivery_failed" };
 }
 
+/**
+ * A deferred offer is never customer-visible until its token write and the
+ * agent-turn operation acknowledgement complete. If either boundary fails we
+ * have already superseded the offer, restore the prior lead projection and
+ * make the operationally meaningful Calendar handoff durable.
+ */
+async function recoverDeferredSlotOfferBoundaryFailure(input: {
+  updateId: number;
+  lead: StoredLead;
+  replyLanguage: ReplyLanguage;
+  dependencies: Stage2Dependencies;
+  now: Date;
+  errorCode: DeferredSlotOfferBoundaryError["code"];
+}): Promise<TelegramWebhookResult> {
+  const { updateId, lead, replyLanguage, dependencies, now, errorCode } = input;
+  lead.humanNeeded = true;
+  lead.humanNeededReason = "calendar_unavailable";
+  clearPendingSchedulingConsent(lead);
+  await dependencies.repository.saveLead(lead);
+  await dependencies.repository.appendActivity(lead.id, "calendar_availability_failed", { error_code: errorCode });
+  const delivered = await deliverReply({
+    updateId,
+    lead,
+    reply: renderCalendarAvailabilityFailedReply(replyLanguage),
+    dependencies,
+  });
+  if (delivered !== "succeeded") {
+    await dependencies.repository.markTelegramUpdateFailed(updateId, "telegram_delivery_failed");
+    return { kind: "failed", failureCode: "telegram_delivery_failed" };
+  }
+  if (lead.status === "qualified") {
+    await enqueueQualifiedTrelloProjection(lead, replyLanguage, now, dependencies);
+  }
+  await dependencies.repository.markTelegramUpdateProcessed(updateId);
+  return { kind: "processed" };
+}
+
 function isConversationTechnicalFailure(error: unknown): boolean {
   return error instanceof AgentTurnTechnicalError ||
     (error instanceof Error && /(?:max_turns|customer_turn_deadline|scenario_deadline|agent_turn_aborted)/iu.test(error.message));
@@ -1708,6 +2431,21 @@ function supersedeQuote(lead: StoredLead, now: Date = new Date()): void {
   lead.quoteValidity = "superseded";
   lead.quoteInvalidatedAt = now.toISOString();
   clearPendingSchedulingConsent(lead);
+}
+
+/** Revert only the schedule-defining facts after an unavailable Calendar. */
+function restoreSchedulingSnapshot(lead: StoredLead, snapshot: StoredLead): void {
+  lead.clientData = {
+    ...lead.clientData,
+    preferredDate: snapshot.clientData.preferredDate,
+    preferredTimeWindow: snapshot.clientData.preferredTimeWindow,
+    urgency: snapshot.clientData.urgency,
+  };
+  lead.quote = snapshot.quote ? structuredClone(snapshot.quote) : undefined;
+  lead.quoteValidity = snapshot.quoteValidity;
+  lead.quoteInvalidatedAt = snapshot.quoteInvalidatedAt;
+  lead.quotedAt = snapshot.quotedAt;
+  lead.pendingSchedulingConsentQuotedAt = snapshot.pendingSchedulingConsentQuotedAt;
 }
 
 function hasActivePendingSchedulingConsent(lead: StoredLead): boolean {

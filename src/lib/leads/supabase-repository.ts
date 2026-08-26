@@ -9,9 +9,11 @@ import {
   quoteSchema,
   type Quote,
 } from "@/lib/contracts/domain";
+import { storedAvailabilityAttemptSchema } from "@/lib/leads/repository";
 import type {
   LeadRepository,
   StoredAgentConfig,
+  StoredAvailabilityAttempt,
   StoredCalendarSlotToken,
   StoredConversation,
   StoredIntegrationOperation,
@@ -190,6 +192,23 @@ export class SupabaseLeadRepository implements LeadRepository {
 
   async appendActivity(leadId: string, eventType: string, payload: Record<string, unknown> = {}): Promise<void> {
     await this.postRows("activity_log", { lead_id: leadId, event_type: eventType, payload });
+  }
+
+  async recordAvailabilityAttempt(leadId: string, attempt: StoredAvailabilityAttempt): Promise<void> {
+    const parsed = storedAvailabilityAttemptSchema.safeParse(attempt);
+    if (!parsed.success) throw new Error("Invalid availability attempt");
+    await this.appendActivity(leadId, "calendar_availability_attempted", parsed.data);
+  }
+
+  async getLastAvailabilityAttempt(leadId: string): Promise<StoredAvailabilityAttempt | null> {
+    const rows = await this.getRows(
+      `activity_log?lead_id=eq.${encodeURIComponent(leadId)}&event_type=eq.calendar_availability_attempted&order=created_at.desc&limit=20&select=payload`,
+    );
+    for (const row of rows) {
+      const parsed = storedAvailabilityAttemptSchema.safeParse(row.payload);
+      if (parsed.success) return parsed.data;
+    }
+    return null;
   }
 
   async createIntegrationOperation(input: {

@@ -5,6 +5,8 @@ import {
   renderAgentReply,
   renderBookingConfirmedReply,
   renderCalendarAvailabilityFailedReply,
+  renderRetainedOfferConstraintUnavailableReply,
+  renderRetainedOfferRefreshFailedReply,
   renderCalendarReservationFailedReply,
   renderHumanNeededReply,
   renderNewAddressDivider,
@@ -28,6 +30,43 @@ describe("Telegram renderer", () => {
 
   it("marks backend-owned recovery copy as template transport", () => {
     expect(renderTechnicalResendReply("ru")).toMatchObject({ provenance: "template", text: expect.stringContaining("Последнее сообщение") });
+  });
+
+  it("explains a retained-offer refresh failure without promising manual follow-up", () => {
+    expect(renderRetainedOfferRefreshFailedReply("en")).toMatchObject({
+      provenance: "template", text: expect.stringContaining("options already shown are still available"),
+    });
+    expect(renderRetainedOfferRefreshFailedReply("en").text).not.toMatch(/team|contact|manual/i);
+    expect(renderRetainedOfferRefreshFailedReply("ru")).toMatchObject({
+      provenance: "template", text: expect.stringContaining("варианты всё ещё доступны"),
+    });
+    expect(renderRetainedOfferRefreshFailedReply("ru").text).not.toMatch(/команд|свяж/i);
+    expect(renderRetainedOfferRefreshFailedReply("sr-Latn")).toMatchObject({
+      provenance: "template", text: expect.stringContaining("i dalje dostupni"),
+    });
+    expect(renderRetainedOfferRefreshFailedReply("sr-Cyrl").text).toContain("и даље доступни");
+  });
+
+  it("keeps a retained offer selectable when an explicit clock constraint has no slots", () => {
+    expect(renderRetainedOfferConstraintUnavailableReply("en")).toMatchObject({
+      provenance: "template", text: expect.stringContaining("options already shown are still available"),
+    });
+    expect(renderRetainedOfferConstraintUnavailableReply("en").text).toContain("earlier time or another day");
+    expect(renderRetainedOfferConstraintUnavailableReply("en", "before").text).toContain("later time or another day");
+    expect(renderRetainedOfferConstraintUnavailableReply("en", "before").text).not.toContain("earlier time");
+    expect(renderRetainedOfferConstraintUnavailableReply("en", "range").text).toContain("widen that time range or choose another day");
+    expect(renderRetainedOfferConstraintUnavailableReply("ru").text).toContain("Ранее предложенные варианты всё ещё доступны");
+    expect(renderRetainedOfferConstraintUnavailableReply("ru", "before").text).toContain("более позднее время или другой день");
+    expect(renderRetainedOfferConstraintUnavailableReply("ru", "range").text).toContain("расширить этот диапазон времени или выбрать другой день");
+    expect(renderRetainedOfferConstraintUnavailableReply("sr-Latn").text).toContain("Ranije ponuđeni termini su i dalje dostupni");
+    expect(renderRetainedOfferConstraintUnavailableReply("sr-Latn", "before").text).toContain("kasniji termin ili drugi dan");
+    expect(renderRetainedOfferConstraintUnavailableReply("sr-Latn", "range").text).toContain("proširiti taj vremenski raspon ili izabrati drugi dan");
+    expect(renderRetainedOfferConstraintUnavailableReply("sr-Cyrl").text).toContain("Раније понуђени термини су и даље доступни");
+    expect(renderRetainedOfferConstraintUnavailableReply("sr-Cyrl", "before").text).toContain("каснији термин или други дан");
+    expect(renderRetainedOfferConstraintUnavailableReply("sr-Cyrl", "range").text).toContain("проширити тај временски распон или изабрати други дан");
+    for (const language of ["en", "ru", "sr-Latn", "sr-Cyrl"]) {
+      expect(renderRetainedOfferConstraintUnavailableReply(language).text).not.toMatch(/team will contact|команд.*свяж|tim.*jav/i);
+    }
   });
 
   it("falls back when ordinary agent prose is in a different script from the reply locale", () => {

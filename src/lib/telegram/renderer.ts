@@ -46,18 +46,40 @@ export function renderSchedulingConsentNeedsDateReply(language: string): Telegra
     : { text: "Great. Which date and time would suit you best? For example, 29 August in the evening.", provenance: "template" };
 }
 
-export function renderSlotOfferReply(language: string, slots: AvailabilitySlot[]): TelegramRenderedReply {
+/** A terminal availability tool result still needs backend-owned customer copy. */
+export function renderAvailabilityDateRequiredReply(language: string): TelegramRenderedReply {
+  if (isSerbianLanguage(language)) return { text: serbianText(language,
+    "Navedite konkretan budući datum pa ću proveriti stvarne slobodne termine.",
+    "Наведите конкретан будући датум па ћу проверити стварне слободне термине.",
+  ), provenance: "template" };
+  return isRussianLanguage(language)
+    ? { text: "Назовите конкретную будущую дату, и я проверю реальные свободные слоты.", provenance: "template" }
+    : { text: "Please share a specific future date, and I’ll check the real available times.", provenance: "template" };
+}
+
+/** Do not expose internal tool failures or stale lifecycle details to a customer. */
+export function renderAvailabilityRequestUnavailableReply(language: string): TelegramRenderedReply {
+  if (isSerbianLanguage(language)) return { text: serbianText(language,
+    "Pre provere slobodnih termina moramo prvo potvrditi trenutne detalje zahteva.",
+    "Пре провере слободних термина морамо прво потврдити тренутне детаље захтева.",
+  ), provenance: "template" };
+  return isRussianLanguage(language)
+    ? { text: "Перед проверкой свободного времени нужно сначала подтвердить текущие детали заявки.", provenance: "template" }
+    : { text: "Before checking live availability, we need to confirm the current request details first.", provenance: "template" };
+}
+
+export function renderSlotOfferReply(language: string, slots: AvailabilitySlot[], amountRsd?: number): TelegramRenderedReply {
   const header = isSerbianLanguage(language)
     ? serbianText(language, "<b>Najbliži slobodni termini</b>\nIzaberite dugme ispod ili odgovorite brojem opcije.", "<b>Најближи слободни термини</b>\nИзаберите дугме испод или одговорите бројем опције.")
     : isRussianLanguage(language)
     ? "<b>Ближайшее свободное время</b>\nВыберите кнопку ниже или ответьте номером варианта."
     : "<b>Nearest available times</b>\nChoose a button below, or reply with an option number.";
   const options = slots.map((slot) => `${slot.displayOrder}. ${escapePlainText(slot.label)}.`).join("\n");
-  return { text: `${header}\n\n${options}`, replyMarkup: slotKeyboard(slots, replyLocaleForKeyboard(language)), provenance: "template" };
+  return { text: `${availabilityPriceNotice(language, amountRsd)}${header}\n\n${options}`, replyMarkup: slotKeyboard(slots, replyLocaleForKeyboard(language)), provenance: "template" };
 }
 
 /** The requested range was checked first; these are real, explicitly relaxed alternatives. */
-export function renderNearestSlotAlternativesReply(language: string, slots: AvailabilitySlot[], reason: "nonworking_day" | "requested_date_unavailable" | "requested_time_unavailable" = "requested_time_unavailable"): TelegramRenderedReply {
+export function renderNearestSlotAlternativesReply(language: string, slots: AvailabilitySlot[], reason: "nonworking_day" | "requested_date_unavailable" | "requested_time_unavailable" = "requested_time_unavailable", amountRsd?: number): TelegramRenderedReply {
   const dateUnavailable = reason === "requested_date_unavailable";
   const nonworkingDay = reason === "nonworking_day";
   const header = isSerbianLanguage(language)
@@ -69,7 +91,17 @@ export function renderNearestSlotAlternativesReply(language: string, slots: Avai
     ? nonworkingDay ? "<b>По воскресеньям мы не работаем.</b>\nВот ближайшие реальные варианты:" : dateUnavailable ? "<b>На выбранную дату свободных слотов нет.</b>\nВот ближайшие реальные варианты:" : "<b>В указанное время свободных слотов нет.</b>\nВот ближайшие реальные варианты:"
     : nonworkingDay ? "<b>We do not work on Sundays.</b>\nHere are the nearest real alternatives:" : dateUnavailable ? "<b>There are no free slots on that requested date.</b>\nHere are the nearest real alternatives:" : "<b>There are no free slots in that requested time.</b>\nHere are the nearest real alternatives:";
   const options = slots.map((slot) => `${slot.displayOrder}. ${escapePlainText(slot.label)}.`).join("\n");
-  return { text: `${header}\n\n${options}`, replyMarkup: slotKeyboard(slots, replyLocaleForKeyboard(language)), provenance: "template" };
+  return { text: `${availabilityPriceNotice(language, amountRsd)}${header}\n\n${options}`, replyMarkup: slotKeyboard(slots, replyLocaleForKeyboard(language)), provenance: "template" };
+}
+
+/** Quote changes caused by the actual offered day must be visible before a customer can select a token. */
+function availabilityPriceNotice(language: string, amountRsd: number | undefined): string {
+  if (amountRsd === undefined) return "";
+  const amount = formatRsdAmount(language, amountRsd);
+  if (isSerbianLanguage(language)) return `${serbianText(language, `Cena za ove termine: <b>${amount}</b>\n\n`, `Цена за ове термине: <b>${amount}</b>\n\n`)}`;
+  return isRussianLanguage(language)
+    ? `Стоимость для этих вариантов: <b>${amount}</b>\n\n`
+    : `Price for these times: <b>${amount}</b>\n\n`;
 }
 
 export function renderReservationPendingReply(language: string, booking?: { team: "team_a" | "team_b"; start: string; quoteAmountRsd: number }): TelegramRenderedReply {
@@ -137,7 +169,64 @@ export function renderCalendarAvailabilityFailedReply(language: string): Telegra
     : { text: "We could not safely check free times right now. Your request details are saved, and we will check them with the team.", provenance: "template" };
 }
 
-export function renderHumanNeededReply(language: string): TelegramRenderedReply {
+/** A previous customer-visible offer remains valid; do not imply a handoff or
+ * promise a later manual check merely because the replacement read failed. */
+export function renderRetainedOfferRefreshFailedReply(language: string): TelegramRenderedReply {
+  if (isSerbianLanguage(language)) return { text: serbianText(language,
+    "Trenutno nismo mogli da osvežimo raspored. Ranije ponuđeni termini su i dalje dostupni — izaberite onaj koji vam odgovara.",
+    "Тренутно нисмо могли да освежимо распоред. Раније понуђени термини су и даље доступни — изаберите онај који вам одговара.",
+  ), provenance: "template" };
+  return isRussianLanguage(language)
+    ? { text: "Сейчас не удалось обновить расписание. Ранее предложенные варианты всё ещё доступны — выберите подходящий, когда будете готовы.", provenance: "template" }
+    : { text: "We could not refresh the schedule right now. The options already shown are still available — choose one when you are ready.", provenance: "template" };
+}
+
+/** The Calendar read completed, but no slot honours the new hard clock
+ * constraint. The old offer remains selectable until the customer consents
+ * to an earlier period or another day. */
+export function renderRetainedOfferConstraintUnavailableReply(
+  language: string,
+  constraint: "after" | "before" | "range" = "after",
+): TelegramRenderedReply {
+  const next = constraint === "before"
+    ? {
+        en: "If a later time or another day works, tell me separately and I’ll check new options.",
+        ru: "Если подойдёт более позднее время или другой день, напишите об этом отдельно — я проверю новые варианты.",
+        srLatn: "Ako vam odgovara kasniji termin ili drugi dan, napišite to posebno pa ću proveriti nove opcije.",
+        srCyrl: "Ако вам одговара каснији термин или други дан, напишите то посебно па ћу проверити нове опције.",
+      }
+    : constraint === "range"
+    ? {
+        en: "If you can widen that time range or choose another day, tell me separately and I’ll check new options.",
+        ru: "Если можно расширить этот диапазон времени или выбрать другой день, напишите об этом отдельно — я проверю новые варианты.",
+        srLatn: "Ako možete proširiti taj vremenski raspon ili izabrati drugi dan, napišite to posebno pa ću proveriti nove opcije.",
+        srCyrl: "Ако можете проширити тај временски распон или изабрати други дан, напишите то посебно па ћу проверити нове опције.",
+      }
+    : {
+        en: "If an earlier time or another day works, tell me separately and I’ll check new options.",
+        ru: "Если подойдёт более раннее время или другой день, напишите об этом отдельно — я проверю новые варианты.",
+        srLatn: "Ako vam odgovara raniji period ili drugi dan, napišite to posebno pa ću proveriti nove opcije.",
+        srCyrl: "Ако вам одговара ранији период или други дан, напишите то посебно па ћу проверити нове опције.",
+      };
+  if (isSerbianLanguage(language)) return { text: serbianText(language,
+    `U traženom vremenskom okviru nema slobodnog termina u naredne dve nedelje. Ranije ponuđeni termini su i dalje dostupni. ${next.srLatn}`,
+    `У траженом временском оквиру нема слободног термина у наредне две недеље. Раније понуђени термини су и даље доступни. ${next.srCyrl}`,
+  ), provenance: "template" };
+  return isRussianLanguage(language)
+    ? { text: `В заданный промежуток в ближайшие две недели свободных слотов нет. Ранее предложенные варианты всё ещё доступны. ${next.ru}`, provenance: "template" }
+    : { text: `There are no free slots in that requested time over the next two weeks. The options already shown are still available. ${next.en}`, provenance: "template" };
+}
+
+export function renderHumanNeededReply(language: string, reason?: "duration_exceeds_workday" | string): TelegramRenderedReply {
+  if (reason === "duration_exceeds_workday") {
+    if (isSerbianLanguage(language)) return { text: serbianText(language,
+      "Ovaj obim čišćenja ne može bezbedno da stane u jedan radni termin. Tim će proveriti najbolji plan i uskoro vam se javiti.",
+      "Овај обим чишћења не може безбедно да стане у један радни термин. Тим ће проверити најбољи план и ускоро вам се јавити.",
+    ), provenance: "template" };
+    return isRussianLanguage(language)
+      ? { text: "Такой объём уборки не получится безопасно выполнить за один рабочий слот. Команда уточнит лучший вариант и скоро свяжется с вами.", provenance: "template" }
+      : { text: "This amount of cleaning cannot safely fit into one working slot. Our team will check the best plan and contact you shortly.", provenance: "template" };
+  }
   if (isSerbianLanguage(language)) return { text: serbianText(language,
     "Treba da proverimo još nekoliko detalja sa timom. Sačuvaću zahtev i proslediti ga kolegi; javićemo vam se nakon provere.",
     "Треба да проверимо још неколико детаља са тимом. Сачуваћу захтев и проследити га колеги; јавићемо вам се после провере.",

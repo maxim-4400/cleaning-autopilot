@@ -1,9 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 
 import { defaultPricingRules, type HumanNeededReason } from "@/lib/contracts/domain";
+import { storedAvailabilityAttemptSchema } from "@/lib/leads/repository";
 import type {
   LeadRepository,
   StoredAgentConfig,
+  StoredAvailabilityAttempt,
   StoredCalendarSlotToken,
   StoredConversation,
   StoredIntegrationOperation,
@@ -193,6 +195,21 @@ export class InMemoryLeadRepository implements LeadRepository {
 
   async appendActivity(leadId: string, eventType: string, payload: Record<string, unknown> = {}): Promise<void> {
     this.activities.push({ leadId, eventType, payload });
+  }
+
+  async recordAvailabilityAttempt(leadId: string, attempt: StoredAvailabilityAttempt): Promise<void> {
+    const parsed = storedAvailabilityAttemptSchema.safeParse(attempt);
+    if (!parsed.success) throw new Error("Invalid availability attempt");
+    await this.appendActivity(leadId, "calendar_availability_attempted", parsed.data);
+  }
+
+  async getLastAvailabilityAttempt(leadId: string): Promise<StoredAvailabilityAttempt | null> {
+    for (const activity of [...this.activities].reverse()) {
+      if (activity.leadId !== leadId || activity.eventType !== "calendar_availability_attempted") continue;
+      const parsed = storedAvailabilityAttemptSchema.safeParse(activity.payload);
+      if (parsed.success) return parsed.data;
+    }
+    return null;
   }
 
   async createIntegrationOperation(input: {

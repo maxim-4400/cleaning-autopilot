@@ -54,8 +54,8 @@ test("shows current evidence before confirmed same-lead history", async ({ page 
   for (const lifecycle of ["New Lead", "Qualified", "Booked", "Done", "Lost"]) await expect(trelloProjection).toContainText(lifecycle);
   await expect(page.getByTitle("Team A public calendar")).toHaveAttribute("src", /calendar\.google\.com\/calendar\/embed/);
   await expect(page.getByTitle("Team B public calendar")).toHaveAttribute("src", /calendar\.google\.com\/calendar\/embed/);
-  await expect(page.getByTitle("Sherlock Cleaning project Miro board")).toHaveAttribute("src", /miro\.com\/app\/board\/uXdemo\/\?share_link_id=104117806222&embed=1/);
-  await expect(page.getByRole("link", { name: "Open Miro ↗" })).toHaveAttribute("href", "https://miro.com/app/board/uXdemo/?share_link_id=104117806222");
+  await expect(page.getByTitle("Sherlock Cleaning project Miro board")).toHaveAttribute("src", /miro\.com\/app\/live-embed\/uXdemo\/\?embedMode=view_only_without_ui&moveToViewport=0%2C0%2C100%2C100/);
+  await expect(page.getByRole("link", { name: "Open Miro ↗" })).toHaveAttribute("href", "https://miro.com/app/board/uXdemo/");
 });
 
 test("does not label a pending booked lifecycle as a confirmed booking", async ({ page }) => {
